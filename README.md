@@ -92,10 +92,10 @@ For full HMST system with memory/routing (research), use `hmst.inference.HMSTInf
 ## Training Quickstart
 
 ```bash
-# Basic training
-python train.py data/train.txt
+# Convenience mode (quick iteration with auto-split validation)
+python train.py data/train.txt --val-split 0.1
 
-# Production training
+# Production mode (reproducible with pre-split validation)
 python train.py data/train.txt \
     --val-file data/val.txt \
     --output-dir checkpoints/prod \
@@ -107,8 +107,14 @@ python train.py data/train.txt \
 
 **Pre-tokenization (recommended, 5-10x faster)**:
 ```bash
+# Convenience mode with pre-tokenized data
 python scripts/preprocess_data.py --input data/train.txt --output data/tokenized/train
-python train.py data/tokenized/train --pretokenized
+python train.py data/tokenized/train --pretokenized --val-split 0.1
+
+# Production mode with pre-tokenized AND pre-split data
+python scripts/preprocess_data.py --input data/train.txt --output data/tokenized/train
+python scripts/split_dataset.py  # creates train_split and val directories
+python train.py data/tokenized/train_split --pretokenized --val-file data/tokenized/val
 ```
 
 **Note**: Base 12B model requires ~500K-1M A100 GPU-hours ($750K-$1.5M) for competitive performance.
@@ -120,10 +126,10 @@ python train.py data/tokenized/train --pretokenized
 The unified training script supports single-GPU and multi-GPU training with comprehensive options:
 
 ```bash
-# Basic training
-python train.py data/train.txt
+# Basic training with auto-split validation (convenience mode)
+python train.py data/train.txt --val-split 0.1
 
-# With validation and custom output directory
+# With pre-split validation and custom output directory (production mode)
 python train.py data/train.txt \
     --val-file data/val.txt \
     --output-dir checkpoints/my_run
@@ -131,6 +137,11 @@ python train.py data/train.txt \
 # View all options
 python train.py --help
 ```
+
+**Validation Split Options**:
+- **`--val-split 0.1`**: Auto-split 10% for validation (quick iteration, reshuffles each run)
+- **`--val-file data/val.txt`**: Use pre-split validation file (reproducible, production)
+- Cannot use both options together
 
 ### Tokenizer Management
 
@@ -167,21 +178,21 @@ python train.py data/train.txt --model-size base --multi-gpu
 
 ```bash
 # Control steps per epoch (useful for large datasets)
-python train.py data/train.txt --steps-per-epoch 1000 --epochs 50
+python train.py data/train.txt --steps-per-epoch 1000 --epochs 50 --val-split 0.1
 
 # Multi-GPU training with DDP
-python train.py data/train.txt --multi-gpu --batch-size 4
+python train.py data/train.txt --multi-gpu --batch-size 4 --val-split 0.1
 
 # Mixed precision for faster training
-python train.py data/train.txt --mixed-precision
+python train.py data/train.txt --mixed-precision --val-split 0.1
 
-# Early stopping and validation
+# Early stopping and validation (convenience mode)
 python train.py data/train.txt \
-    --val-file data/val.txt \
+    --val-split 0.1 \
     --eval-every 500 \
     --patience 5
 
-# Full production training
+# Full production training with pre-split validation
 python train.py data/train.txt \
     --val-file data/val.txt \
     --output-dir checkpoints/production \
@@ -208,7 +219,9 @@ python train.py data/train.txt \
 | `--learning-rate` | Peak learning rate | 3e-4 |
 | `--steps-per-epoch` | Max steps per epoch | Full dataset |
 | `--tokenizer-path` | Path to existing tokenizer | Create new |
-| `--val-file` | Validation text file | None |
+| `--val-file` | Validation text file (production mode) | None |
+| `--val-split` | Auto-split validation fraction 0.0-1.0 (convenience mode) | None |
+| `--pretokenized` | Use pre-tokenized HuggingFace datasets | False |
 | `--eval-every` | Evaluate every N steps | Off |
 | `--patience` | Early stopping patience (epochs) | Off |
 | `--save-every` | Save checkpoint every N epochs | Off |
@@ -281,6 +294,14 @@ hmst/
 - **Out of memory**: Reduce `--batch-size`, use `--mixed-precision`, or switch to smaller model size
 - **Multi-GPU not working**: Ensure NCCL is installed and GPUs are visible with `nvidia-smi`
 - **Slow data loading**: Increase `--num-workers` (typically 4-8 works well)
+- **Slow tokenization**: Use `scripts/preprocess_data.py` to pre-tokenize data (5-10x faster training)
+
+### Validation & Data Splitting
+
+- **Quick iteration**: Use `--val-split 0.1` for automatic validation split (reshuffles each run)
+- **Reproducible results**: Use `scripts/split_dataset.py` + `--val-file` for consistent validation splits
+- **Cannot use both**: `--val-split` and `--val-file` are mutually exclusive
+- **Dataset coverage**: With `--steps-per-epoch`, ensure you see all data (steps × epochs ≥ total batches)
 
 ### Tokenizer Issues
 
