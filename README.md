@@ -1,21 +1,42 @@
 # HMST: Hierarchical Memory-State Transformer
 
-A novel LLM architecture that addresses hallucination and long-context memory limitations through intelligent memory management and integrated self-verification.
+> **⚠️ Research Prototype**: This repository contains a proof-of-concept implementation of a novel LLM architecture. The system has **not been trained to completion** and performance claims are **theoretical design goals**, not validated results. This is an architectural exploration and research prototype, not a production-ready model.
+
+A novel LLM architecture design exploring hallucination mitigation and long-context memory through intelligent memory management and integrated self-verification.
+
+## Project Status
+
+**What This Repository Contains:**
+- ✅ Complete implementation of the proposed architecture components
+- ✅ Training scripts for pre-training and RL optimization
+- ✅ Inference engine with dynamic routing
+- ✅ Unit tests for core functionality
+
+**What This Repository Does NOT Contain:**
+- ❌ Trained model weights or checkpoints
+- ❌ Evaluation framework or benchmark results
+- ❌ Validated performance metrics
+- ❌ Production-ready tokenizers (uses placeholder implementation)
+
+**Current State**: The architecture is implemented but requires large-scale training (estimated $750K-$1.5M in compute costs for 12B parameter variant) to validate its design hypotheses.
 
 ## Architecture Overview
 
-HMST combines:
-- **Three-tier memory system**: Working (Attention), Episodic (SSM), Semantic (FAISS)
-- **RL-trained meta-controller**: Dynamic routing with 5 decision gates
-- **Mixture-of-Experts base model**: 12B total, 2B active parameters
-- **Integrated critic model**: Hallucination detection and verification
+HMST proposes a novel architecture combining:
+- **Three-tier memory system**: Working memory (Attention), Episodic memory (SSM), Semantic memory (FAISS)
+- **RL-trainable meta-controller**: Dynamic routing with 5 decision gates
+- **Mixture-of-Experts base model**: Designed for ~12B total, ~2B active parameters
+- **Integrated critic model**: Hallucination detection and verification component
 
-## Key Features
+### Design Goals (Unvalidated)
 
-- 90-96% reduction in factual errors
-- Effective handling of 1M+ token contexts
-- 40-60% reduction in compute per token
-- 20-30% latency reduction through dynamic routing
+The architecture is designed to achieve:
+- Reduced factual errors through critic-based verification
+- Extended context handling via hierarchical memory (attention: 8K tokens + RAG-style retrieval)
+- Improved compute efficiency through sparse expert activation
+- Lower latency via early-exit mechanisms
+
+**Note**: These are architectural design targets, not measured results. Validation would require full-scale training and comprehensive evaluation.
 
 ## Installation
 
@@ -31,7 +52,7 @@ pip install -e .
 # Verify installation
 python -m pytest tests/ -v
 
-# Run demo
+# Run demo (uses untrained model with random weights)
 python demo.py
 ```
 
@@ -40,9 +61,11 @@ python demo.py
 ### Running the Demo
 
 ```bash
-# Run interactive demo
+# Run interactive demo (untrained model)
 python demo.py
 ```
+
+**Note**: The demo uses an untrained model and will not produce meaningful outputs. It demonstrates the architecture's data flow and routing decisions.
 
 ### Using the Inference Engine
 
@@ -54,7 +77,7 @@ from hmst.memory import EpisodicMemory, SemanticMemory
 # Load configuration
 config = get_base_config()
 
-# Initialize models
+# Initialize models (untrained)
 base_model = BaseMoEModel(**config.base_moe.__dict__)
 meta_controller = MetaController(**config.meta_controller.__dict__)
 critic = CriticModel(**config.critic.__dict__)
@@ -74,7 +97,7 @@ engine = HMSTInferenceEngine(
     state_encoder=None  # Initialize separately
 )
 
-# Generate
+# Generate (will not produce meaningful results without training)
 result = engine.generate("What is the capital of France?")
 print(result['response'])
 ```
@@ -109,6 +132,14 @@ python train.py data/train.txt \
     --eval-every 500 \
     --patience 3
 ```
+
+**Important**: For the base 12B parameter model to achieve competitive performance, training would require:
+- Dataset: 2-5 trillion tokens
+- Compute: ~500K-1M A100 GPU-hours
+- Cost: $750K-$1.5M (compute only)
+- Timeline: Several months
+
+This is feasible only for well-funded research labs or industry teams.
 
 ## Training
 
@@ -156,7 +187,7 @@ python train.py data/train.txt --model-size tiny
 # Small (~1B params) - experimentation
 python train.py data/train.txt --model-size small
 
-# Base (~12B params) - production
+# Base (~12B params) - full-scale training
 python train.py data/train.txt --model-size base --multi-gpu
 ```
 
@@ -225,7 +256,7 @@ python -m training.rl_train \
     --episodes 50000
 ```
 
-**Note**: Stage 2 (memory fine-tuning) is not yet implemented.
+**Note**: Stage 2 (memory fine-tuning) is not yet implemented. RL training requires a pre-trained base model to generate meaningful reward signals.
 
 ## Testing
 
@@ -248,7 +279,7 @@ python -m pytest tests/ --cov=hmst --cov-report=html
 hmst/
 ├── models/           # Core model implementations
 │   ├── base_moe.py          # Sparse MoE transformer
-│   ├── meta_controller.py   # RL-trained routing controller
+│   ├── meta_controller.py   # RL-trainable routing controller
 │   ├── critic.py            # Hallucination detection
 │   └── ssm.py               # State space model (Mamba)
 ├── memory/           # Memory hierarchy
@@ -260,10 +291,7 @@ hmst/
 │   └── rl_train.py          # RL meta-controller training
 ├── inference/        # Inference engine
 │   └── engine.py            # Main orchestration
-├── evaluation/       # Benchmarks and metrics
-│   ├── benchmarks.py
-│   ├── hallucination.py
-│   └── efficiency.py
+├── evaluation/       # Benchmarks and metrics (TODO)
 ├── configs/          # Model configurations
 │   └── model_config.py      # Tiny/Small/Base presets
 ├── tokenizer/        # Tokenization
@@ -300,34 +328,122 @@ hmst/
 - **SSM dimension mismatch**: Ensure `d_model` → `d_state` projection is configured correctly
 - **Memory consolidation**: Background process is placeholder; needs base model integration
 
-## Performance Metrics
+## What Would Be Needed for Validation
 
-| Benchmark | HMST | GPT-4 | Llama-2-70B |
-|-----------|------|-------|-------------|
-| MMLU | 75.2% | 86.4% | 68.9% |
-| TruthfulQA | 71.3% | 58.8% | 54.0% |
-| HumanEval | 66.1% | 67.0% | 53.7% |
-| GSM8K | 81.5% | 92.0% | 56.8% |
+To validate the architectural design goals, the following would be required:
 
-## Citation
+### 1. Large-Scale Training
+- Multi-trillion token dataset (e.g., The Pile, RedPajama, proprietary data)
+- 500K-1M A100 GPU-hours for 12B parameter model
+- Distributed training infrastructure (100+ GPUs)
+- ~$1M budget for compute resources
 
-```bibtex
-@article{hmst2026,
-  title={HMST: Hierarchical Memory-State Transformer for Mitigating Hallucination in Large Language Models},
-  author={Claude and Gemini},
-  year={2026}
-}
-```
+### 2. Evaluation Framework
+Implementation needed for:
+- **Standard Benchmarks**: MMLU, TruthfulQA, HumanEval, GSM8K
+- **Hallucination Metrics**: Factual consistency evaluation
+- **Efficiency Metrics**: FLOPs per token, throughput measurements
+- **Long-Context Tests**: "Needle in a haystack" evaluations
+- **Comparison Baselines**: Run same tests on Llama-2, Mistral, etc.
+
+### 3. RL Training Pipeline
+- Train base model to convergence first
+- Collect trajectory data for meta-controller optimization
+- Reward model for accuracy/efficiency trade-offs
+- ~50K episodes of RL training
+
+### 4. Production Infrastructure
+- Proper tokenizer training (BPE/SentencePiece)
+- Model quantization and optimization
+- Serving infrastructure
+- Safety and alignment testing
+
+## Architecture Details
+
+### Component Specifications
+
+**BaseMoEModel** (`models/base_moe.py`):
+- 8 experts with top-2 routing (configurable)
+- Standard transformer attention
+- Load balancing loss for expert utilization
+- Parameter count scales with config (tiny: ~100M, small: ~1B, base: ~12B)
+
+**MetaController** (`models/meta_controller.py`):
+- 6-layer lightweight transformer
+- 5 routing decisions per query:
+  - Early exit gate (skip deep processing)
+  - Episodic memory access (recent context)
+  - Semantic memory retrieval (long-term facts)
+  - Expert selection (MoE routing weights)
+  - Verification trigger (critic activation)
+
+**Memory Systems** (`memory/`):
+- **Episodic**: SSM-based compression of recent 8K token windows
+- **Semantic**: FAISS vector database for retrieval (RAG-style)
+- **Note**: "1M+ context" claim refers to retrieval database size, not attention window
+
+**CriticModel** (`models/critic.py`):
+- Verification model for hallucination detection
+- Checks consistency between query, response, and retrieved facts
+- Outputs confidence score
+
+## Known Limitations
+
+1. **Untrained weights**: All models use random initialization
+2. **Placeholder tokenizer**: Falls back to random tokens when no tokenizer provided
+3. **No evaluation code**: `evaluation/` directory is empty
+4. **Memory consolidation**: Importance scoring is placeholder
+5. **Stage 2 training**: Memory fine-tuning not implemented
+6. **Context window**: True attention context is 8K tokens, not 1M (semantic memory uses RAG pattern)
+
+## Comparison to Production LLM Projects
+
+Production-ready open-source LLM projects typically include:
+- ✅ Trained model weights (HuggingFace model hub)
+- ✅ Training datasets and recipes
+- ✅ Evaluation frameworks and benchmark results
+- ✅ Tokenizers (trained BPE/SentencePiece)
+- ✅ Inference optimization (quantization, serving)
+
+This project currently provides:
+- ✅ Architecture implementation
+- ✅ Training scripts (untested at scale)
+- ❌ Everything else listed above
+
+Examples of complete projects: LLaMA, Mistral, Pythia, Falcon, GPT-NeoX
+
+## Contributing
+
+Contributions are welcome, especially:
+- Evaluation framework implementation
+- Training runs and results sharing
+- Benchmark integration (lm-evaluation-harness)
+- Optimization improvements
+- Bug fixes and tests
+
+## Future Work
+
+- [ ] Implement evaluation framework
+- [ ] Complete memory consolidation logic
+- [ ] Add Stage 2 (memory fine-tuning) training
+- [ ] Optimize expert routing (vectorize nested loops)
+- [ ] Parallelize SSM sequential scan
+- [ ] Integrate proper tokenizer training
+- [ ] Conduct small-scale validation experiments
+- [ ] Full-scale training (requires funding)
 
 ## License
 
 MIT License - See LICENSE file for details.
 
-## Authors
+## Acknowledgments
 
-- Claude (Anthropic)
-- Gemini (Google)
+This architecture was developed with assistance from Claude (Anthropic) and Gemini (Google DeepMind) AI assistants during the design and implementation phases.
 
 ## Contact
 
-For questions or collaboration: [Contact Information]
+For questions, collaboration, or discussions about the architecture: [Contact Information]
+
+---
+
+**Disclaimer**: This is a research prototype exploring novel architectural ideas for LLM development. All performance claims are theoretical design goals, not validated measurements. Large-scale training and comprehensive evaluation would be required to assess the architecture's actual capabilities.
