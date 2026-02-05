@@ -107,7 +107,8 @@ class HMSTInferenceEngine:
                 'path': 'early_exit',
                 'uncertainty': uncertainty,
                 'verified': False,
-                'latency': time.time() - start_time
+                'latency': time.time() - start_time,
+                'memory_used': {'episodic': False, 'semantic': False}
             }
 
             self._update_stats(result)
@@ -193,7 +194,8 @@ class HMSTInferenceEngine:
             (1, seq_len) token ids
         """
         if self.tokenizer:
-            tokens = self.tokenizer.encode(text, return_tensors='pt')
+            token_ids = self.tokenizer.encode(text, add_special_tokens=True)
+            tokens = torch.tensor([token_ids], dtype=torch.long)
         else:
             # Placeholder: random tokens
             tokens = torch.randint(0, 128000, (1, min(len(text.split()), 100)))
