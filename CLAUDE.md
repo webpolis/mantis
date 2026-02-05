@@ -33,7 +33,28 @@ python demo.py
 
 ### Training
 
-**Unified Training Script** (`train.py`):
+**RECOMMENDED: Pre-tokenize First (Industry Best Practice)**
+
+Pre-tokenization is 5-10x faster and used by all major LLM projects (GPT, LLaMA, etc.):
+
+```bash
+# Step 1: Pre-tokenize your data (do this once)
+python scripts/preprocess_data.py \
+    --input /path/to/train.txt \
+    --output data/tokenized/train \
+    --val-input /path/to/val.txt \
+    --val-output data/tokenized/val \
+    --tokenizer-path checkpoints/improved_train/tokenizer
+
+# Step 2: Train with pre-tokenized data (much faster!)
+python train.py data/tokenized/train \
+    --pretokenized \
+    --val-file data/tokenized/val \
+    --output-dir checkpoints/my_run
+```
+
+**Alternative: On-the-Fly Tokenization** (slower, for small datasets):
+
 ```bash
 # Basic single-GPU training
 python train.py data/train.txt

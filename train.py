@@ -4,10 +4,18 @@ Unified Training Script for HMST
 Supports:
 - Single-GPU and multi-GPU (DDP) training
 - Proper tokenization (HuggingFace BPE or custom)
+- Pre-tokenized datasets (recommended for large-scale training)
 - Validation metrics and early stopping
 - Steps per epoch control
 - Learning rate scheduling
 - Mixed precision training
+
+Best Practice:
+1. Pre-tokenize your data first:
+   python scripts/preprocess_data.py --input data/train.txt --output data/tokenized/train
+
+2. Train with pre-tokenized data:
+   python train.py data/tokenized/train --pretokenized
 """
 
 import torch
@@ -27,6 +35,12 @@ from tqdm import tqdm
 from hmst.models import BaseMoEModel
 from hmst.configs.model_config import get_tiny_config, get_small_config, get_base_config
 from hmst.tokenizer import HMSTTokenizer
+
+try:
+    from datasets import load_from_disk
+    DATASETS_AVAILABLE = True
+except ImportError:
+    DATASETS_AVAILABLE = False
 
 
 class TextDataset(Dataset):
@@ -84,6 +98,40 @@ class TextDataset(Dataset):
         labels = torch.tensor(sequence[1:], dtype=torch.long)
 
         return {'input_ids': input_ids, 'labels': labels}
+
+
+class PreTokenizedDataset(Dataset):
+    """
+    Dataset that loads pre-tokenized data from HuggingFace datasets cache.
+
+    MUCH faster than TextDataset - recommended for production training.
+    Use scripts/preprocess_data.py to create pre-tokenized datasets.
+    """
+
+    def __init__(self, dataset_path):
+        """
+        Args:
+            dataset_path: Path to pre-tokenized dataset directory
+        """
+        if not DATASETS_AVAILABLE:
+            raise ImportError(
+                "datasets library required for pre-tokenized datasets. "
+                "Install with: pip install datasets"
+            )
+
+        print(f"Loading pre-tokenized dataset from {dataset_path}...")
+        self.dataset = load_from_disk(dataset_path)
+        print(f"Loaded {len(self.dataset):,} sequences")
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        return {
+            'input_ids': torch.tensor(item['input_ids'], dtype=torch.long),
+            'labels': torch.tensor(item['labels'], dtype=torch.long)
+        }
 
 
 def compute_perplexity(loss):
@@ -168,8 +216,18 @@ def train_single_gpu(args):
     tokenizer = load_or_create_tokenizer(args.tokenizer_path)
 
     # Datasets
-    print("\nCreating datasets...")
-    train_dataset = TextDataset(args.train_file, tokenizer, args.seq_len, args.stride)
+    print("\nLoading datasets...")
+    if args.pretokenized:
+        # Fast path: load pre-tokenized data
+        print("Using pre-tokenized datasets (fast!)")
+        train_dataset = PreTokenizedDataset(args.train_file)
+        val_dataset = PreTokenizedDataset(args.val_file) if args.val_file else None
+    else:
+        # Slow path: tokenize on-the-fly
+        print("Tokenizing on-the-fly (consider using --pretokenized for faster training)")
+        train_dataset = TextDataset(args.train_file, tokenizer, args.seq_len, args.stride)
+        val_dataset = TextDataset(args.val_file, tokenizer, args.seq_len) if args.val_file else None
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -179,8 +237,7 @@ def train_single_gpu(args):
     )
 
     val_loader = None
-    if args.val_file:
-        val_dataset = TextDataset(args.val_file, tokenizer, args.seq_len)
+    if val_dataset:
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
@@ -390,9 +447,21 @@ def train_ddp_worker(rank, world_size, args):
 
     # Datasets
     if is_main:
-        print("\nCreating datasets...")
+        print("\nLoading datasets...")
 
-    train_dataset = TextDataset(args.train_file, tokenizer, args.seq_len, args.stride)
+    if args.pretokenized:
+        # Fast path: load pre-tokenized data
+        if is_main:
+            print("Using pre-tokenized datasets (fast!)")
+        train_dataset = PreTokenizedDataset(args.train_file)
+        val_dataset = PreTokenizedDataset(args.val_file) if args.val_file else None
+    else:
+        # Slow path: tokenize on-the-fly
+        if is_main:
+            print("Tokenizing on-the-fly (consider using --pretokenized for faster training)")
+        train_dataset = TextDataset(args.train_file, tokenizer, args.seq_len, args.stride)
+        val_dataset = TextDataset(args.val_file, tokenizer, args.seq_len) if args.val_file else None
+
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     train_loader = DataLoader(
         train_dataset,
@@ -403,8 +472,7 @@ def train_ddp_worker(rank, world_size, args):
     )
 
     val_loader = None
-    if args.val_file:
-        val_dataset = TextDataset(args.val_file, tokenizer, args.seq_len)
+    if val_dataset:
         val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
         val_loader = DataLoader(
             val_dataset,
@@ -590,11 +658,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Single GPU training
+  # RECOMMENDED: Pre-tokenize first, then train (MUCH faster!)
+  python scripts/preprocess_data.py --input data/train.txt --output data/tokenized/train
+  python train.py data/tokenized/train --pretokenized
+
+  # Single GPU training (raw text, slower)
   python train.py data/train.txt --val-file data/val.txt
 
-  # Multi-GPU training
-  python train.py data/train.txt --multi-gpu
+  # Multi-GPU training with pre-tokenized data
+  python train.py data/tokenized/train --pretokenized --multi-gpu
 
   # Use existing tokenizer from checkpoint
   python train.py data/train.txt --tokenizer-path checkpoints/improved_train/tokenizer
@@ -608,10 +680,14 @@ Examples:
     )
 
     # Data
-    parser.add_argument('train_file', type=str, help='Training text file')
-    parser.add_argument('--val-file', type=str, help='Validation text file')
+    parser.add_argument('train_file', type=str,
+                       help='Training data: text file or pre-tokenized dataset directory')
+    parser.add_argument('--val-file', type=str,
+                       help='Validation data: text file or pre-tokenized dataset directory')
     parser.add_argument('--output-dir', type=str, default='./checkpoints/train',
                         help='Output directory (default: ./checkpoints/train)')
+    parser.add_argument('--pretokenized', action='store_true',
+                        help='Use pre-tokenized datasets (MUCH faster, recommended for large-scale training)')
 
     # Tokenizer
     parser.add_argument('--tokenizer-path', type=str,
@@ -649,12 +725,17 @@ Examples:
 
     args = parser.parse_args()
 
-    # Validate input files exist
+    # Validate inputs exist
     if not os.path.exists(args.train_file):
-        print(f"Error: Training file not found: {args.train_file}")
+        print(f"Error: Training {'dataset' if args.pretokenized else 'file'} not found: {args.train_file}")
         return
     if args.val_file and not os.path.exists(args.val_file):
-        print(f"Error: Validation file not found: {args.val_file}")
+        print(f"Error: Validation {'dataset' if args.pretokenized else 'file'} not found: {args.val_file}")
+        return
+
+    # Validate pretokenized mode
+    if args.pretokenized and not DATASETS_AVAILABLE:
+        print("Error: --pretokenized requires 'datasets' library. Install with: pip install datasets")
         return
 
     # Multi-GPU training
