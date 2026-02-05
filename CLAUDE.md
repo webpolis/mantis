@@ -37,7 +37,12 @@ python demo.py
 
 ### Training
 
-**RECOMMENDED: Pre-tokenize First (Industry Best Practice)**
+**Two Training Modes:**
+
+1. **Convenience Mode** (quick iteration): Auto-split validation from training data
+2. **Production Mode** (reproducible): Pre-split datasets for consistent evaluation
+
+#### RECOMMENDED: Pre-tokenize + Production Mode
 
 Pre-tokenization is 5-10x faster and used by all major LLM projects (GPT, LLaMA, etc.):
 
@@ -45,42 +50,48 @@ Pre-tokenization is 5-10x faster and used by all major LLM projects (GPT, LLaMA,
 # Step 1: Pre-tokenize your data (do this once)
 python scripts/preprocess_data.py \
     --input /path/to/train.txt \
-    --output data/tokenized/train \
-    --val-input /path/to/val.txt \
-    --val-output data/tokenized/val \
-    --tokenizer-path checkpoints/improved_train/tokenizer
+    --output data/tokenized/train
 
-# Step 2: Train with pre-tokenized data (much faster!)
-python train.py data/tokenized/train \
+# Step 2A: PRODUCTION MODE - Pre-split for reproducibility
+python scripts/split_dataset.py  # creates train_split and val directories
+python train.py data/tokenized/train_split \
     --pretokenized \
     --val-file data/tokenized/val \
+    --output-dir checkpoints/my_run
+
+# Step 2B: CONVENIENCE MODE - Auto-split during training
+python train.py data/tokenized/train \
+    --pretokenized \
+    --val-split 0.1 \
     --output-dir checkpoints/my_run
 ```
 
 **Alternative: On-the-Fly Tokenization** (slower, for small datasets):
 
 ```bash
-# Basic single-GPU training
-python train.py data/train.txt
+# Basic single-GPU training with auto-split validation
+python train.py data/train.txt --val-split 0.1
 
-# With validation and output directory
+# Production mode with pre-split validation
 python train.py data/train.txt --val-file data/val.txt --output-dir checkpoints/my_run
 
 # Use existing tokenizer from previous checkpoint
-python train.py data/train.txt --tokenizer-path checkpoints/improved_train/tokenizer
+python train.py data/train.txt \
+    --tokenizer-path checkpoints/improved_train/tokenizer \
+    --val-split 0.1
 
 # Control steps per epoch (useful for large datasets or quick iterations)
-python train.py data/train.txt --steps-per-epoch 1000 --epochs 50
+python train.py data/train.txt --steps-per-epoch 1000 --epochs 50 --val-split 0.1
 
 # Multi-GPU training (DDP)
-python train.py data/train.txt --multi-gpu --batch-size 4
+python train.py data/train.txt --multi-gpu --batch-size 4 --val-split 0.1
 
 # Train larger model with mixed precision
-python train.py data/train.txt --model-size small --mixed-precision
+python train.py data/train.txt --model-size small --mixed-precision --val-split 0.1
 
-# Full example with all features
+# Full example with all features (convenience mode)
 python train.py data/train.txt \
-    --val-file data/val.txt \
+    --val-split 0.1 \
     --output-dir checkpoints/full_run \
     --tokenizer-path checkpoints/improved_train/tokenizer \
     --model-size tiny \
@@ -93,6 +104,11 @@ python train.py data/train.txt \
     --save-every 5 \
     --mixed-precision
 ```
+
+**Validation Split Options**:
+- `--val-split 0.1`: Auto-split 10% for validation (convenience, reshuffles each run)
+- `--val-file data/val.txt`: Use pre-split validation (production, reproducible)
+- Cannot use both `--val-split` and `--val-file` together
 
 **Tokenizer Management**:
 - First run creates new tokenizer, saved to `<output-dir>/tokenizer`

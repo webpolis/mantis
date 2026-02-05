@@ -5,17 +5,21 @@ Supports:
 - Single-GPU and multi-GPU (DDP) training
 - Proper tokenization (HuggingFace BPE or custom)
 - Pre-tokenized datasets (recommended for large-scale training)
+- Auto-split validation (convenience mode) or pre-split validation (production mode)
 - Validation metrics and early stopping
 - Steps per epoch control
 - Learning rate scheduling
 - Mixed precision training
 
-Best Practice:
-1. Pre-tokenize your data first:
-   python scripts/preprocess_data.py --input data/train.txt --output data/tokenized/train
+Usage:
 
-2. Train with pre-tokenized data:
-   python train.py data/tokenized/train --pretokenized
+Convenience Mode (quick iteration):
+   python train.py data/tokenized/train --pretokenized --val-split 0.1
+
+Production Mode (reproducible):
+   python scripts/preprocess_data.py --input data/train.txt --output data/tokenized/train
+   python scripts/split_dataset.py  # creates train_split and val
+   python train.py data/tokenized/train_split --pretokenized --val-file data/tokenized/val
 """
 
 import torch
@@ -221,12 +225,49 @@ def train_single_gpu(args):
         # Fast path: load pre-tokenized data
         print("Using pre-tokenized datasets (fast!)")
         train_dataset = PreTokenizedDataset(args.train_file)
-        val_dataset = PreTokenizedDataset(args.val_file) if args.val_file else None
+
+        # Auto-split if requested
+        if args.val_split and not args.val_file:
+            print(f"Auto-splitting dataset: {args.val_split*100:.0f}% for validation")
+            full_dataset = train_dataset.dataset
+            split = full_dataset.train_test_split(test_size=args.val_split, seed=42)
+
+            # Create new datasets from splits
+            train_dataset.dataset = split['train']
+            val_dataset = PreTokenizedDataset.__new__(PreTokenizedDataset)
+            val_dataset.dataset = split['test']
+
+            print(f"Train sequences: {len(train_dataset):,}")
+            print(f"Val sequences: {len(val_dataset):,}")
+        else:
+            val_dataset = PreTokenizedDataset(args.val_file) if args.val_file else None
     else:
         # Slow path: tokenize on-the-fly
         print("Tokenizing on-the-fly (consider using --pretokenized for faster training)")
         train_dataset = TextDataset(args.train_file, tokenizer, args.seq_len, args.stride)
-        val_dataset = TextDataset(args.val_file, tokenizer, args.seq_len) if args.val_file else None
+
+        # Auto-split if requested
+        if args.val_split and not args.val_file:
+            print(f"Auto-splitting dataset: {args.val_split*100:.0f}% for validation")
+            total_sequences = len(train_dataset.sequences)
+            val_count = int(total_sequences * args.val_split)
+            train_count = total_sequences - val_count
+
+            # Split sequences
+            val_sequences = train_dataset.sequences[-val_count:]
+            train_dataset.sequences = train_dataset.sequences[:train_count]
+
+            # Create validation dataset (shares tokens)
+            val_dataset = TextDataset.__new__(TextDataset)
+            val_dataset.tokenizer = tokenizer
+            val_dataset.seq_len = args.seq_len
+            val_dataset.tokens = train_dataset.tokens
+            val_dataset.sequences = val_sequences
+
+            print(f"Train sequences: {len(train_dataset):,}")
+            print(f"Val sequences: {len(val_dataset):,}")
+        else:
+            val_dataset = TextDataset(args.val_file, tokenizer, args.seq_len) if args.val_file else None
 
     train_loader = DataLoader(
         train_dataset,
@@ -459,13 +500,54 @@ def train_ddp_worker(rank, world_size, args):
         if is_main:
             print("Using pre-tokenized datasets (fast!)")
         train_dataset = PreTokenizedDataset(args.train_file)
-        val_dataset = PreTokenizedDataset(args.val_file) if args.val_file else None
+
+        # Auto-split if requested
+        if args.val_split and not args.val_file:
+            if is_main:
+                print(f"Auto-splitting dataset: {args.val_split*100:.0f}% for validation")
+            full_dataset = train_dataset.dataset
+            split = full_dataset.train_test_split(test_size=args.val_split, seed=42)
+
+            # Create new datasets from splits
+            train_dataset.dataset = split['train']
+            val_dataset = PreTokenizedDataset.__new__(PreTokenizedDataset)
+            val_dataset.dataset = split['test']
+
+            if is_main:
+                print(f"Train sequences: {len(train_dataset):,}")
+                print(f"Val sequences: {len(val_dataset):,}")
+        else:
+            val_dataset = PreTokenizedDataset(args.val_file) if args.val_file else None
     else:
         # Slow path: tokenize on-the-fly
         if is_main:
             print("Tokenizing on-the-fly (consider using --pretokenized for faster training)")
         train_dataset = TextDataset(args.train_file, tokenizer, args.seq_len, args.stride)
-        val_dataset = TextDataset(args.val_file, tokenizer, args.seq_len) if args.val_file else None
+
+        # Auto-split if requested
+        if args.val_split and not args.val_file:
+            if is_main:
+                print(f"Auto-splitting dataset: {args.val_split*100:.0f}% for validation")
+            total_sequences = len(train_dataset.sequences)
+            val_count = int(total_sequences * args.val_split)
+            train_count = total_sequences - val_count
+
+            # Split sequences
+            val_sequences = train_dataset.sequences[-val_count:]
+            train_dataset.sequences = train_dataset.sequences[:train_count]
+
+            # Create validation dataset (shares tokens)
+            val_dataset = TextDataset.__new__(TextDataset)
+            val_dataset.tokenizer = tokenizer
+            val_dataset.seq_len = args.seq_len
+            val_dataset.tokens = train_dataset.tokens
+            val_dataset.sequences = val_sequences
+
+            if is_main:
+                print(f"Train sequences: {len(train_dataset):,}")
+                print(f"Val sequences: {len(val_dataset):,}")
+        else:
+            val_dataset = TextDataset(args.val_file, tokenizer, args.seq_len) if args.val_file else None
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     train_loader = DataLoader(
@@ -669,24 +751,28 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # RECOMMENDED: Pre-tokenize first, then train (MUCH faster!)
+  # CONVENIENCE MODE: Auto-split validation (quick iteration)
+  python train.py data/tokenized/train --pretokenized --val-split 0.1
+
+  # PRODUCTION MODE: Pre-tokenize AND pre-split (reproducible)
   python scripts/preprocess_data.py --input data/train.txt --output data/tokenized/train
-  python train.py data/tokenized/train --pretokenized
+  python scripts/split_dataset.py  # splits into train_split and val
+  python train.py data/tokenized/train_split --pretokenized --val-file data/tokenized/val
 
   # Single GPU training (raw text, slower)
-  python train.py data/train.txt --val-file data/val.txt
+  python train.py data/train.txt --val-split 0.1
 
-  # Multi-GPU training with pre-tokenized data
-  python train.py data/tokenized/train --pretokenized --multi-gpu
+  # Multi-GPU training with auto-split
+  python train.py data/tokenized/train --pretokenized --multi-gpu --val-split 0.1
 
   # Use existing tokenizer from checkpoint
-  python train.py data/train.txt --tokenizer-path checkpoints/improved_train/tokenizer
+  python train.py data/train.txt --tokenizer-path checkpoints/improved_train/tokenizer --val-split 0.1
 
   # Control steps per epoch (useful for large datasets)
-  python train.py data/train.txt --steps-per-epoch 1000
+  python train.py data/train.txt --steps-per-epoch 1000 --val-split 0.1
 
   # Train larger model
-  python train.py data/train.txt --model-size small --batch-size 4
+  python train.py data/train.txt --model-size small --batch-size 4 --val-split 0.1
         """
     )
 
@@ -695,6 +781,9 @@ Examples:
                        help='Training data: text file or pre-tokenized dataset directory')
     parser.add_argument('--val-file', type=str,
                        help='Validation data: text file or pre-tokenized dataset directory')
+    parser.add_argument('--val-split', type=float,
+                       help='Auto-split validation fraction (e.g., 0.1 for 10%%). '
+                            'Convenience mode - cannot be used with --val-file')
     parser.add_argument('--output-dir', type=str, default='./checkpoints/train',
                         help='Output directory (default: ./checkpoints/train)')
     parser.add_argument('--pretokenized', action='store_true',
@@ -742,6 +831,16 @@ Examples:
         return
     if args.val_file and not os.path.exists(args.val_file):
         print(f"Error: Validation {'dataset' if args.pretokenized else 'file'} not found: {args.val_file}")
+        return
+
+    # Validate val-split arguments
+    if args.val_split and args.val_file:
+        print("Error: Cannot use both --val-split and --val-file. Choose one:")
+        print("  --val-split: Auto-split from training data (convenience mode)")
+        print("  --val-file: Use pre-split validation data (production mode)")
+        return
+    if args.val_split and (args.val_split <= 0 or args.val_split >= 1):
+        print(f"Error: --val-split must be between 0 and 1, got {args.val_split}")
         return
 
     # Validate pretokenized mode
