@@ -1,0 +1,152 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+HMST (Hierarchical Memory-State Transformer) is a novel LLM architecture designed to mitigate hallucination and handle long-context memory through:
+- Three-tier memory hierarchy (Attention → SSM → FAISS)
+- RL-trained meta-controller for dynamic routing
+- Sparse MoE base model (12B total, 2B active parameters)
+- Integrated critic model for hallucination detection
+
+## Development Commands
+
+### Installation
+```bash
+pip install -r requirements.txt
+pip install -e .
+```
+
+### Testing
+```bash
+# Run all tests
+python -m pytest tests/ -v
+
+# Run specific test file
+python -m pytest tests/test_models.py -v
+python -m pytest tests/test_memory.py -v
+
+# Run demo
+python demo.py
+```
+
+### Training
+```bash
+# Stage 1: Pre-training (language modeling)
+python -m training.pretrain \
+    --config configs/base.json \
+    --data_path /path/to/corpus \
+    --steps 100000
+
+# Stage 3: RL training (meta-controller optimization)
+python -m training.rl_train \
+    --checkpoint checkpoints/pretrain/final.pt \
+    --episodes 50000
+```
+
+Note: Stage 2 (memory fine-tuning) is not yet implemented.
+
+### Code Quality
+```bash
+# Format code
+black .
+
+# Lint code
+flake8 .
+```
+
+## Architecture Overview
+
+### Core Components
+
+1. **BaseMoEModel** (`models/base_moe.py`): Sparse MoE transformer with 8 experts and top-2 routing. Each expert processes ~1/4 of the model capacity.
+
+2. **MetaController** (`models/meta_controller.py`): Lightweight 6-layer transformer that makes 5 routing decisions per query:
+   - Early exit (skip deep processing)
+   - Episodic memory access
+   - Semantic memory retrieval
+   - Expert selection for MoE
+   - Verification trigger for critic
+
+3. **CriticModel** (`models/critic.py`): 1-2B parameter verification model that detects hallucinations by checking logical consistency and factual accuracy.
+
+4. **EpisodicMemorySSM** (`models/ssm.py`): Mamba-based selective state space model that compresses 8K tokens into 256-dimensional state vectors.
+
+### Memory Systems
+
+1. **EpisodicMemory** (`memory/episodic.py`): Recent interaction buffer (L2 cache). Stores up to `max_entries` of recent context, compressed via SSM.
+
+2. **SemanticMemory** (`memory/semantic.py`): FAISS-based long-term storage (L3 cache). Uses IVF/PQ indexing for efficient nearest-neighbor search over 1M+ entries.
+
+3. **MemoryConsolidator** (`memory/consolidation.py`): Background process that transfers important memories from episodic to semantic storage based on importance scoring.
+
+### Inference
+
+**HMSTInferenceEngine** (`inference/engine.py`): Main orchestration system. For each query:
+1. Encodes query with base model
+2. Consults meta-controller for routing decisions
+3. Optionally retrieves from episodic/semantic memory
+4. Generates response through appropriate MoE experts
+5. Optionally verifies with critic model
+
+### Configuration
+
+**HMSTConfig** (`configs/model_config.py`): Centralized configuration with three presets:
+- `get_small_config()`: 1B parameters (demo/testing)
+- `get_base_config()`: 12B parameters (production)
+- `get_large_config()`: 30B parameters (research)
+
+## Important Implementation Details
+
+### Dimension Compatibility
+- Base model embeddings: `d_model` (typically 2048)
+- Episodic SSM state: `d_state` (typically 256)
+- Semantic memory: `dimension` (typically 1024)
+
+When querying episodic memory, embeddings must be projected from `d_model` to `d_state` space. This projection is handled in `episodic.py:retrieve()`.
+
+### FAISS Index Training
+Semantic memory uses IVF (Inverted File Index) which requires training on actual embeddings before use. The index is trained lazily on the first 10K+ additions. After training, all cached embeddings are re-added to the trained index.
+
+### RL Training
+The meta-controller is trained with PPO (Proximal Policy Optimization) using a multi-objective reward:
+```
+Reward = 1.0·Accuracy - 0.3·Latency - 0.2·Compute + 0.5·Calibration
+```
+
+State representation is created by encoding the query with the base model and computing a state summary via `StateSummaryEncoder`.
+
+### Tokenization
+Current implementation uses placeholder tokenization (splits on whitespace). For production, integrate a proper tokenizer from HuggingFace transformers.
+
+## Known Limitations
+
+1. **MoE expert routing**: Uses nested loops; needs vectorization for production speed
+2. **SSM sequential scan**: Python loop implementation; requires parallel scan for GPU efficiency
+3. **FAISS index rebuilding**: Full rebuild on deletion; consider using `remove_ids()`
+4. **Memory consolidation**: Placeholder summary/encoding functions need base model integration
+5. **Stage 2 training**: Memory fine-tuning script not implemented
+
+## Module Import Pattern
+
+```python
+from hmst import (
+    HMSTInferenceEngine,
+    get_base_config,
+    BaseMoEModel,
+    MetaController,
+    CriticModel,
+    EpisodicMemorySSM,
+    EpisodicMemory,
+    SemanticMemory
+)
+from hmst.models.meta_controller import StateSummaryEncoder
+```
+
+## Performance Targets
+
+- Hallucination reduction: 90-96% reduction in factual errors
+- Context scaling: Effective 1M+ token contexts
+- Efficiency: 40-60% compute reduction vs dense models
+- Latency: 20-30% reduction through early exits
