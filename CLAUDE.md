@@ -4,11 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-HMST (Hierarchical Memory-State Transformer) is a novel LLM architecture designed to mitigate hallucination and handle long-context memory through:
+**Status**: Research prototype with complete architecture implementation but no trained models.
+
+HMST (Hierarchical Memory-State Transformer) is a novel LLM architecture design exploring hallucination mitigation and long-context memory through:
 - Three-tier memory hierarchy (Attention → SSM → FAISS)
-- RL-trained meta-controller for dynamic routing
-- Sparse MoE base model (12B total, 2B active parameters)
+- RL-trainable meta-controller for dynamic routing
+- Sparse MoE base model (designed for 12B total, 2B active parameters)
 - Integrated critic model for hallucination detection
+
+**Note**: System requires large-scale training ($750K-$1.5M in compute) to validate design hypotheses. Current implementation uses untrained/random weights.
 
 ## Development Commands
 
@@ -180,15 +184,18 @@ Reward = 1.0·Accuracy - 0.3·Latency - 0.2·Compute + 0.5·Calibration
 State representation is created by encoding the query with the base model and computing a state summary via `StateSummaryEncoder`.
 
 ### Tokenization
-Current implementation uses placeholder tokenization (splits on whitespace). For production, integrate a proper tokenizer from HuggingFace transformers.
+Current implementation includes a BPE tokenizer but falls back to placeholder tokenization (random tokens) when no tokenizer is provided. The inference engine will generate meaningless outputs without a properly trained tokenizer. For production, ensure a tokenizer is trained during the initial training run or loaded from an existing checkpoint.
 
 ## Known Limitations
 
-1. **MoE expert routing**: Uses nested loops; needs vectorization for production speed
-2. **SSM sequential scan**: Python loop implementation; requires parallel scan for GPU efficiency
-3. **FAISS index rebuilding**: Full rebuild on deletion; consider using `remove_ids()`
-4. **Memory consolidation**: Placeholder summary/encoding functions need base model integration
-5. **Stage 2 training**: Memory fine-tuning script not implemented
+1. **No trained models**: All models use random initialization; requires large-scale training
+2. **No evaluation framework**: `evaluation/` directory is empty; no benchmark code exists
+3. **Placeholder tokenizer**: Falls back to random tokens when no tokenizer provided
+4. **MoE expert routing**: Uses nested loops; needs vectorization for production speed
+5. **SSM sequential scan**: Python loop implementation; requires parallel scan for GPU efficiency
+6. **FAISS index rebuilding**: Full rebuild on deletion; consider using `remove_ids()`
+7. **Memory consolidation**: Placeholder summary/encoding functions need base model integration
+8. **Stage 2 training**: Memory fine-tuning script not implemented
 
 ## Module Import Pattern
 
@@ -206,9 +213,17 @@ from hmst import (
 from hmst.models.meta_controller import StateSummaryEncoder
 ```
 
-## Performance Targets
+## Design Goals (Unvalidated)
 
-- Hallucination reduction: 90-96% reduction in factual errors
-- Context scaling: Effective 1M+ token contexts
-- Efficiency: 40-60% compute reduction vs dense models
-- Latency: 20-30% reduction through early exits
+The architecture is designed to achieve these theoretical targets (not yet measured):
+- Hallucination reduction through critic-based verification
+- Context scaling via hierarchical memory (8K attention + RAG-style retrieval from 1M+ entry database)
+- Efficiency improvements through sparse expert activation (top-2 of 8 experts)
+- Latency reduction via early-exit mechanisms
+
+**Validation Requirements**:
+- Large-scale training: 2-5T tokens, 500K-1M A100 GPU-hours, ~$1M cost
+- Evaluation framework: MMLU, TruthfulQA, HumanEval, GSM8K, custom hallucination metrics
+- Baseline comparisons: Run same tests on Llama-2, Mistral, etc.
+
+These are architectural design goals, not proven capabilities. The `evaluation/` directory is currently empty.
