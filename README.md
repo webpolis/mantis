@@ -67,79 +67,51 @@ python demo.py
 
 **Note**: The demo uses an untrained model and will not produce meaningful outputs. It demonstrates the architecture's data flow and routing decisions.
 
-### Using the Inference Engine
+### Inference
 
-```python
-from hmst import HMSTInferenceEngine, get_base_config
-from hmst.models import BaseMoEModel, MetaController, CriticModel, EpisodicMemorySSM
-from hmst.memory import EpisodicMemory, SemanticMemory
+After training, use `inference.py` for text generation:
 
-# Load configuration
-config = get_base_config()
+```bash
+# Interactive mode (default)
+python inference.py checkpoints/train/best_model.pt
 
-# Initialize models (untrained)
-base_model = BaseMoEModel(**config.base_moe.__dict__)
-meta_controller = MetaController(**config.meta_controller.__dict__)
-critic = CriticModel(**config.critic.__dict__)
-ssm = EpisodicMemorySSM(**config.episodic_memory.__dict__)
+# Single prompt
+python inference.py checkpoints/train/best_model.pt --prompt "Once upon a time"
 
-# Initialize memory systems
-episodic_memory = EpisodicMemory(ssm, max_entries=100)
-semantic_memory = SemanticMemory(**config.semantic_memory.__dict__)
+# Batch generation
+python inference.py checkpoints/train/best_model.pt --input prompts.txt --output results.txt
 
-# Create inference engine
-engine = HMSTInferenceEngine(
-    base_model=base_model,
-    meta_controller=meta_controller,
-    episodic_memory=episodic_memory,
-    semantic_memory=semantic_memory,
-    critic_model=critic,
-    state_encoder=None  # Initialize separately
-)
-
-# Generate (will not produce meaningful results without training)
-result = engine.generate("What is the capital of France?")
-print(result['response'])
+# Greedy decoding (deterministic)
+python inference.py checkpoints/train/best_model.pt --prompt "Hello" --temperature 0
 ```
+
+**Options**: `--max-length`, `--temperature`, `--top-p`, `--top-k`, `--output`
+
+For full HMST system with memory/routing (research), use `hmst.inference.HMSTInferenceEngine` (requires all components trained).
 
 ## Training Quickstart
 
-**Minimal Example**:
 ```bash
-# Download or prepare your training data
-# Format: plain text file (e.g., books, articles, code)
-
-# Start training
+# Basic training
 python train.py data/train.txt
 
-# Training will:
-# 1. Create a new tokenizer (saved to checkpoints/train/tokenizer)
-# 2. Train for 20 epochs (default)
-# 3. Save checkpoints to checkpoints/train/
-# 4. Save best model based on training loss
-```
-
-**Production Example**:
-```bash
-# Train with validation, early stopping, and multi-GPU
+# Production training
 python train.py data/train.txt \
     --val-file data/val.txt \
     --output-dir checkpoints/prod \
     --model-size small \
     --multi-gpu \
     --mixed-precision \
-    --steps-per-epoch 2000 \
-    --eval-every 500 \
     --patience 3
 ```
 
-**Important**: For the base 12B parameter model to achieve competitive performance, training would require:
-- Dataset: 2-5 trillion tokens
-- Compute: ~500K-1M A100 GPU-hours
-- Cost: $750K-$1.5M (compute only)
-- Timeline: Several months
+**Pre-tokenization (recommended, 5-10x faster)**:
+```bash
+python scripts/preprocess_data.py --input data/train.txt --output data/tokenized/train
+python train.py data/tokenized/train --pretokenized
+```
 
-This is feasible only for well-funded research labs or industry teams.
+**Note**: Base 12B model requires ~500K-1M A100 GPU-hours ($750K-$1.5M) for competitive performance.
 
 ## Training
 
@@ -290,21 +262,15 @@ hmst/
 │   ├── pretrain.py          # Pre-training trainer class
 │   └── rl_train.py          # RL meta-controller training
 ├── inference/        # Inference engine
-│   └── engine.py            # Main orchestration
-├── evaluation/       # Benchmarks and metrics (TODO)
+│   └── engine.py            # Full system orchestration
 ├── configs/          # Model configurations
 │   └── model_config.py      # Tiny/Small/Base presets
 ├── tokenizer/        # Tokenization
 │   └── hmst_tokenizer.py    # HuggingFace BPE wrapper
-└── utils/            # Utilities
-    ├── logging.py
-    └── checkpoints.py
-├── train.py          # Unified training script
+├── train.py          # Production training script
+├── inference.py      # Production inference script
 ├── demo.py           # Interactive demo
 └── tests/            # Unit tests
-    ├── test_models.py
-    ├── test_memory.py
-    └── test_inference.py
 ```
 
 ## Common Issues & Tips

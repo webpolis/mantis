@@ -113,6 +113,59 @@ python -m training.rl_train \
 
 Note: Stage 2 (memory fine-tuning) is not yet implemented.
 
+### Inference
+
+Use `inference.py` for production text generation with trained models. Supports interactive, single-prompt, and batch modes.
+
+```bash
+# Interactive mode (default)
+python inference.py checkpoints/train/best_model.pt
+
+# Single prompt
+python inference.py checkpoints/train/best_model.pt --prompt "Once upon a time"
+
+# Batch generation from file
+python inference.py checkpoints/train/best_model.pt \
+    --input prompts.txt \
+    --output results.txt
+
+# Greedy decoding (deterministic, temperature=0)
+python inference.py checkpoints/train/best_model.pt \
+    --prompt "The capital of France is" \
+    --temperature 0
+
+# More creative generation (higher temperature)
+python inference.py checkpoints/train/best_model.pt \
+    --prompt "Write a story:" \
+    --temperature 1.2 \
+    --max-length 200
+
+# Control sampling
+python inference.py checkpoints/train/best_model.pt \
+    --prompt "Hello world" \
+    --top-p 0.95 \
+    --top-k 40 \
+    --max-length 100
+```
+
+**Generation Parameters**:
+- `--max-length`: Maximum tokens to generate (default: 50)
+- `--temperature`: Sampling temperature, 0=greedy (default: 0.8)
+- `--top-p`: Nucleus sampling threshold (default: 0.9)
+- `--top-k`: Top-k sampling threshold (default: 50)
+- `--output`: Save results to file
+
+**Interactive Commands**:
+- Type a prompt to generate text
+- `set <param> <value>` - Change generation parameter (e.g., `set temperature 1.0`)
+- `stats` - Show performance statistics
+- `help` - Show current settings
+- `quit` or `exit` - Exit
+
+**Performance Metrics**: The script reports tokens/sec, latency, and time-to-first-token for each generation.
+
+**Note**: For full HMST system inference with memory and routing, use the `HMSTInferenceEngine` in `hmst/inference/engine.py` (research-oriented, requires all components trained).
+
 ### Code Quality
 ```bash
 # Format code
