@@ -25,6 +25,22 @@ class PreTrainer:
     - Load balancing loss
     - Mixed-precision training
     - Gradient checkpointing
+
+    Args:
+        model: The MoE model to train
+        train_loader: DataLoader for training data
+        val_loader: Optional DataLoader for validation
+        learning_rate: Initial learning rate (default: 3e-4)
+        weight_decay: AdamW weight decay (default: 0.01)
+        warmup_steps: Number of warmup steps (default: 2000)
+        total_steps: Total training steps (default: 100000)
+        steps_per_epoch: Maximum steps per epoch. If None, uses full dataset (default: None)
+        gradient_clip: Gradient clipping value (default: 1.0)
+        checkpoint_dir: Directory for saving checkpoints (default: './checkpoints/pretrain')
+        log_interval: Steps between logging (default: 100)
+        save_interval: Steps between checkpoints (default: 10000)
+        use_wandb: Enable W&B logging (default: False)
+        device: Training device (default: 'cuda' if available else 'cpu')
     """
 
     def __init__(
@@ -36,6 +52,7 @@ class PreTrainer:
         weight_decay: float = 0.01,
         warmup_steps: int = 2000,
         total_steps: int = 100000,
+        steps_per_epoch: Optional[int] = None,
         gradient_clip: float = 1.0,
         checkpoint_dir: str = './checkpoints/pretrain',
         log_interval: int = 100,
@@ -64,6 +81,7 @@ class PreTrainer:
 
         self.warmup_steps = warmup_steps
         self.total_steps = total_steps
+        self.steps_per_epoch = steps_per_epoch
         self.gradient_clip = gradient_clip
 
         # Logging
@@ -89,7 +107,8 @@ class PreTrainer:
             wandb.init(project='hmst-pretrain', config={
                 'learning_rate': self.optimizer.param_groups[0]['lr'],
                 'warmup_steps': self.warmup_steps,
-                'total_steps': self.total_steps
+                'total_steps': self.total_steps,
+                'steps_per_epoch': self.steps_per_epoch
             })
 
         self.model.train()
@@ -118,6 +137,7 @@ class PreTrainer:
         """Train for one epoch."""
         total_loss = 0.0
         num_batches = 0
+        epoch_steps = 0
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}")
 
@@ -125,9 +145,13 @@ class PreTrainer:
             if self.global_step >= self.total_steps:
                 break
 
+            if self.steps_per_epoch is not None and epoch_steps >= self.steps_per_epoch:
+                break
+
             loss = self._train_step(batch)
             total_loss += loss
             num_batches += 1
+            epoch_steps += 1
 
             # Logging
             if self.global_step % self.log_interval == 0:

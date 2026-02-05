@@ -132,6 +132,7 @@ def train_model(
     learning_rate=3e-4,
     seq_len=512,
     warmup_steps=1000,
+    steps_per_epoch=None,
     eval_every=500,
     patience=5,
     device=None
@@ -148,6 +149,7 @@ def train_model(
         learning_rate: Peak learning rate
         seq_len: Sequence length
         warmup_steps: Linear warmup steps
+        steps_per_epoch: Maximum steps per epoch. If None, uses full dataset (default: None)
         eval_every: Evaluate every N steps
         patience: Early stopping patience (epochs without improvement)
         device: Device ('cuda' or 'cpu')

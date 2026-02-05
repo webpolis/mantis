@@ -32,14 +32,55 @@ python demo.py
 ```
 
 ### Training
-```bash
-# Stage 1: Pre-training (language modeling)
-python -m training.pretrain \
-    --config configs/base.json \
-    --data_path /path/to/corpus \
-    --steps 100000
 
-# Stage 3: RL training (meta-controller optimization)
+**Unified Training Script** (`train.py`):
+```bash
+# Basic single-GPU training
+python train.py data/train.txt
+
+# With validation and output directory
+python train.py data/train.txt --val-file data/val.txt --output-dir checkpoints/my_run
+
+# Use existing tokenizer from previous checkpoint
+python train.py data/train.txt --tokenizer-path checkpoints/improved_train/tokenizer
+
+# Control steps per epoch (useful for large datasets or quick iterations)
+python train.py data/train.txt --steps-per-epoch 1000 --epochs 50
+
+# Multi-GPU training (DDP)
+python train.py data/train.txt --multi-gpu --batch-size 4
+
+# Train larger model with mixed precision
+python train.py data/train.txt --model-size small --mixed-precision
+
+# Full example with all features
+python train.py data/train.txt \
+    --val-file data/val.txt \
+    --output-dir checkpoints/full_run \
+    --tokenizer-path checkpoints/improved_train/tokenizer \
+    --model-size tiny \
+    --epochs 20 \
+    --batch-size 8 \
+    --learning-rate 3e-4 \
+    --steps-per-epoch 1000 \
+    --eval-every 500 \
+    --patience 5 \
+    --save-every 5 \
+    --mixed-precision
+```
+
+**Tokenizer Management**:
+- First run creates new tokenizer, saved to `<output-dir>/tokenizer`
+- Reuse existing tokenizer: `--tokenizer-path checkpoints/run1/tokenizer`
+- Ensures vocabulary consistency across training runs
+
+**Model Sizes**:
+- `tiny`: ~100M parameters (testing/development)
+- `small`: ~1B parameters (experimentation)
+- `base`: ~12B parameters (production)
+
+**Stage 3: RL Training** (meta-controller optimization):
+```bash
 python -m training.rl_train \
     --checkpoint checkpoints/pretrain/final.pt \
     --episodes 50000
