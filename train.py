@@ -320,7 +320,11 @@ def train_single_gpu(args):
         epoch_loss = 0.0
         epoch_steps = 0
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        pbar = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch+1}/{args.epochs}",
+            total=args.steps_per_epoch if args.steps_per_epoch else len(train_loader)
+        )
 
         for batch in pbar:
             if args.steps_per_epoch and epoch_steps >= args.steps_per_epoch:
@@ -563,7 +567,12 @@ def train_ddp_worker(rank, world_size, args):
         epoch_loss = 0.0
         epoch_steps = 0
 
-        pbar = tqdm(train_loader, desc=f"Rank {rank} Epoch {epoch+1}", disable=not is_main)
+        pbar = tqdm(
+            train_loader,
+            desc=f"Rank {rank} Epoch {epoch+1}",
+            total=args.steps_per_epoch if args.steps_per_epoch else len(train_loader),
+            disable=not is_main
+        )
 
         for batch in pbar:
             if args.steps_per_epoch and epoch_steps >= args.steps_per_epoch:
