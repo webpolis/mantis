@@ -161,6 +161,20 @@ class HMSTConfig:
 
 
 # Default configurations for different scales
+def get_micro_config() -> HMSTConfig:
+    """Micro model for TinyStories dataset (10-15M parameters, dense)."""
+    config = HMSTConfig()
+    config.base_moe.d_model = 256
+    config.base_moe.n_layers = 4
+    config.base_moe.n_heads = 4
+    config.base_moe.d_ff = 1024
+    config.base_moe.n_experts = 1  # Dense, not MoE
+    config.base_moe.top_k = 1
+    config.base_moe.dropout = 0.1
+    config.meta_controller.n_experts = 1  # Must match base_moe.n_experts
+    return config
+
+
 def get_tiny_config() -> HMSTConfig:
     """Tiny model for rapid testing (~100M parameters)."""
     config = HMSTConfig()
