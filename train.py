@@ -33,7 +33,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from hmst.models import BaseMoEModel
-from hmst.configs.model_config import get_tiny_config, get_small_config, get_base_config
+from hmst.configs.model_config import get_micro_config, get_tiny_config, get_small_config, get_base_config
 from hmst.tokenizer import HMSTTokenizer
 
 try:
@@ -249,6 +249,7 @@ def train_single_gpu(args):
     # Model
     print("\nInitializing model...")
     config = {
+        'micro': get_micro_config,
         'tiny': get_tiny_config,
         'small': get_small_config,
         'base': get_base_config
@@ -491,6 +492,7 @@ def train_ddp_worker(rank, world_size, args):
         print("\nInitializing model...")
 
     config = {
+        'micro': get_micro_config,
         'tiny': get_tiny_config,
         'small': get_small_config,
         'base': get_base_config
@@ -704,8 +706,8 @@ Examples:
                              'If not provided, creates new tokenizer')
 
     # Model
-    parser.add_argument('--model-size', type=str, choices=['tiny', 'small', 'base'], default='tiny',
-                        help='Model size: tiny (100M), small (1B), base (12B) (default: tiny)')
+    parser.add_argument('--model-size', type=str, choices=['micro', 'tiny', 'small', 'base'], default='tiny',
+                        help='Model size: micro (10M), tiny (100M), small (1B), base (12B) (default: tiny)')
 
     # Training
     parser.add_argument('--epochs', type=int, default=20, help='Training epochs (default: 20)')
