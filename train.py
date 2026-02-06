@@ -428,11 +428,6 @@ def train(args):
             print("\n⚠️  WARNING: Streaming mode without --steps-per-epoch will run indefinitely!")
             print("   Recommend: --steps-per-epoch 1000 (or appropriate value)")
 
-        # Warn about num_workers in streaming mode
-        if args.streaming and args.num_workers > 0:
-            print("\n⚠️  WARNING: Streaming with num_workers > 0 may cause issues.")
-            print("   If you encounter errors, try --num-workers 0")
-
     elif args.pretokenized:
         if accelerator.is_main_process:
             print("Using pre-tokenized datasets (fast!)")
@@ -1077,6 +1072,12 @@ Examples:
     if args.pretokenized and not DATASETS_AVAILABLE:
         print("Error: --pretokenized requires 'datasets' library. Install with: pip install datasets")
         return
+
+    # Auto-adjust num_workers for streaming mode
+    if args.streaming and args.num_workers > 0:
+        print(f"\n⚠️  Streaming mode detected: setting num_workers=0 (was {args.num_workers})")
+        print("   Streaming datasets require num_workers=0 to avoid shard distribution issues")
+        args.num_workers = 0
 
     # GPU configuration for Accelerate
     if args.gpu_ids:
