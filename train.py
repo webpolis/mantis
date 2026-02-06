@@ -70,10 +70,14 @@ import math
 import argparse
 from pathlib import Path
 from tqdm import tqdm
+import warnings
 
 # Disable TF32 for cross-architecture compatibility
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
+
+# Suppress cuBLAS recovery warnings (these are expected when workaround is applied)
+warnings.filterwarnings('ignore', message='.*gemm_and_bias error: CUBLAS_STATUS_NOT_INITIALIZED.*')
 
 from hmst.models import BaseMoEModel
 from hmst.configs.model_config import get_micro_config, get_tiny_config, get_small_config, get_base_config
