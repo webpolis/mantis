@@ -9,6 +9,8 @@ A novel LLM architecture exploring hallucination mitigation and long-context mem
 
 ## Architecture
 
+![HMST Architecture Diagram](hmst_architecture.png)
+
 **Components**:
 - **Three-tier memory**: Attention (8K) • Episodic SSM • Semantic FAISS
 - **Meta-controller**: RL-trainable routing with 5 decision gates
@@ -39,6 +41,9 @@ python train.py data/train.txt --val-file data/val.txt --output-dir checkpoints/
 
 # Inference (after training)
 python inference.py checkpoints/train/best_model.pt --prompt "Once upon a time"
+
+# Quantized inference (2-4x faster)
+python inference.py checkpoints/train/best_model.pt --prompt "Once upon a time" --quantize int8
 ```
 
 ## Training

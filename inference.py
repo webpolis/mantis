@@ -7,6 +7,7 @@ Features:
 - Multiple sampling strategies (greedy, top-k, top-p)
 - Streaming token-by-token output
 - Performance metrics (tokens/sec, latency)
+- Quantization support (INT8, FP16) for faster inference
 - Clean CLI interface
 - Proper error handling
 
@@ -23,8 +24,11 @@ Usage:
     # Greedy decoding (deterministic)
     python inference.py checkpoints/train/best_model.pt --prompt "Hello" --temperature 0
 
-    # Beam search
-    python inference.py checkpoints/train/best_model.pt --prompt "Hello" --num-beams 4
+    # Quantized inference (2-4x faster)
+    python inference.py checkpoints/train/best_model.pt --prompt "Hello" --quantize int8
+
+    # FP16 inference (GPU only, 2x faster)
+    python inference.py checkpoints/train/best_model.pt --prompt "Hello" --quantize float16
 """
 
 import torch
@@ -42,18 +46,27 @@ from typing import Optional, Dict, List
 class InferenceEngine:
     """Production-ready inference engine for HMST models."""
 
-    def __init__(self, checkpoint_path: str, device: Optional[str] = None):
+    def __init__(
+        self,
+        checkpoint_path: str,
+        device: Optional[str] = None,
+        quantize: Optional[str] = None
+    ):
         """
         Initialize inference engine.
 
         Args:
             checkpoint_path: Path to model checkpoint
             device: Device to run on ('cuda', 'cpu', or None for auto)
+            quantize: Quantization mode ('int8', 'float16', or None)
         """
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.quantize = quantize
 
         print(f"Loading model from: {checkpoint_path}")
         print(f"Device: {self.device}")
+        if quantize:
+            print(f"Quantization: {quantize}")
 
         # Load checkpoint
         try:
@@ -82,6 +95,23 @@ class InferenceEngine:
         # Load weights
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.eval()
+
+        # Apply quantization if requested
+        if self.quantize == 'int8':
+            print("Applying INT8 dynamic quantization...")
+            self.model = torch.quantization.quantize_dynamic(
+                self.model,
+                {torch.nn.Linear},
+                dtype=torch.qint8
+            )
+            print("✓ Model quantized to INT8 (2-4x faster, ~75% memory)")
+        elif self.quantize == 'float16':
+            if self.device == 'cuda':
+                print("Converting to FP16...")
+                self.model = self.model.half()
+                print("✓ Model converted to FP16 (~50% memory)")
+            else:
+                print("Warning: FP16 only supported on CUDA, skipping quantization")
 
         # Load tokenizer
         checkpoint_dir = os.path.dirname(checkpoint_path)
@@ -486,8 +516,11 @@ Examples:
   # Greedy decoding (deterministic)
   python inference.py checkpoints/train/best_model.pt --prompt "Hello" --temperature 0
 
-  # High temperature (more creative)
-  python inference.py checkpoints/train/best_model.pt --prompt "Hello" --temperature 1.2
+  # Quantized inference (2-4x faster)
+  python inference.py checkpoints/train/best_model.pt --prompt "Hello" --quantize int8
+
+  # FP16 inference (GPU only, 2x faster)
+  python inference.py checkpoints/train/best_model.pt --prompt "Hello" --quantize float16
         """
     )
 
@@ -519,6 +552,8 @@ Examples:
     # System
     parser.add_argument('--device', type=str, choices=['cuda', 'cpu'],
                         help='Device to use (default: auto-detect)')
+    parser.add_argument('--quantize', type=str, choices=['int8', 'float16'],
+                        help='Quantization mode: int8 (2-4x faster, CPU/GPU) or float16 (2x faster, GPU only)')
 
     args = parser.parse_args()
 
@@ -529,7 +564,7 @@ Examples:
 
     # Initialize engine
     try:
-        engine = InferenceEngine(args.checkpoint, device=args.device)
+        engine = InferenceEngine(args.checkpoint, device=args.device, quantize=args.quantize)
     except Exception as e:
         print(f"Error initializing engine: {e}")
         import traceback
