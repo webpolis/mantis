@@ -143,8 +143,27 @@ def compute_perplexity(loss):
     return math.exp(min(loss, 100))
 
 
+def get_gpu_device_count():
+    """Get number of available CUDA devices.
+
+    Note: This initializes CUDA context. Should not be called in main process
+    before mp.spawn().
+
+    Returns:
+        int: Number of CUDA devices
+    """
+    return torch.cuda.device_count() if torch.cuda.is_available() else 0
+
+
 def get_gpu_memory_info():
-    """Get available VRAM for each GPU in GB."""
+    """Get available VRAM for each GPU in GB.
+
+    Note: This initializes CUDA context. Should not be called in main process
+    before mp.spawn().
+
+    Returns:
+        list: List of dicts with GPU info (id, name, memory_gb)
+    """
     if not torch.cuda.is_available():
         return []
 
@@ -964,18 +983,30 @@ Examples:
 
     # Multi-GPU training
     if args.multi_gpu:
+        # Get GPU count WITHOUT initializing CUDA in main process
+        # Use subprocess to avoid corrupting worker contexts
+        ctx = mp.get_context('spawn')
+        queue = ctx.Queue()
+
+        def _get_count(q):
+            q.put(get_gpu_device_count())
+
+        p = ctx.Process(target=_get_count, args=(queue,))
+        p.start()
+        p.join()
+        available_gpus = queue.get()
+
         # Determine which GPUs to use
         if args.gpu_ids:
             gpu_ids = args.gpu_ids
             # Validate GPU IDs
-            available_gpus = torch.cuda.device_count()
             for gpu_id in gpu_ids:
                 if gpu_id >= available_gpus:
                     print(f"Error: GPU {gpu_id} not available. Only {available_gpus} GPU(s) detected.")
                     return
             world_size = len(gpu_ids)
         else:
-            world_size = torch.cuda.device_count()
+            world_size = available_gpus
             gpu_ids = list(range(world_size))
 
         # CRITICAL: Populate args.gpu_ids so workers can access it
@@ -986,7 +1017,12 @@ Examples:
             return
 
         # Check GPU homogeneity
-        check_gpu_homogeneity(gpu_ids)
+        # CRITICAL: Run in subprocess to avoid initializing CUDA in main process!
+        # PyTorch forbids CUDA initialization before mp.spawn - it corrupts worker contexts
+        ctx = mp.get_context('spawn')
+        p = ctx.Process(target=check_gpu_homogeneity, args=(gpu_ids,))
+        p.start()
+        p.join()
 
         # Warn about gradient accumulation
         if args.gradient_accumulation_steps > 1:

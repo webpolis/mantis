@@ -1,473 +1,167 @@
 # HMST: Hierarchical Memory-State Transformer
 
-> **⚠️ Research Prototype**: This repository contains a proof-of-concept implementation of a novel LLM architecture. The system has **not been trained to completion** and performance claims are **theoretical design goals**, not validated results. This is an architectural exploration and research prototype, not a production-ready model.
+> **⚠️ Research Prototype**: Architecture implementation only. No trained weights. Performance claims are unvalidated design goals. Requires $750K-$1.5M compute investment for validation.
 
-A novel LLM architecture design exploring hallucination mitigation and long-context memory through intelligent memory management and integrated self-verification.
+A novel LLM architecture exploring hallucination mitigation and long-context memory through hierarchical memory systems and integrated self-verification.
 
-## Project Status
+**Includes**: Architecture implementation • Training scripts • Inference engine • Tests
+**Missing**: Trained weights • Evaluation framework • Benchmark results
 
-**What This Repository Contains:**
-- ✅ Complete implementation of the proposed architecture components
-- ✅ Training scripts for pre-training and RL optimization
-- ✅ Inference engine with dynamic routing
-- ✅ Production-ready tokenizer (HuggingFace GPT-2 BPE)
-- ✅ Unit tests for core functionality
+## Architecture
 
-**What This Repository Does NOT Contain:**
-- ❌ Trained model weights or checkpoints
-- ❌ Evaluation framework or benchmark results
-- ❌ Validated performance metrics
+**Components**:
+- **Three-tier memory**: Attention (8K) • Episodic SSM • Semantic FAISS
+- **Meta-controller**: RL-trainable routing with 5 decision gates
+- **MoE base model**: ~12B total, ~2B active parameters
+- **Critic model**: Integrated hallucination detection
 
-**Current State**: The architecture is implemented but requires large-scale training (estimated $750K-$1.5M in compute costs for 12B parameter variant) to validate its design hypotheses.
-
-## Architecture Overview
-
-HMST proposes a novel architecture combining:
-- **Three-tier memory system**: Working memory (Attention), Episodic memory (SSM), Semantic memory (FAISS)
-- **RL-trainable meta-controller**: Dynamic routing with 5 decision gates
-- **Mixture-of-Experts base model**: Designed for ~12B total, ~2B active parameters
-- **Integrated critic model**: Hallucination detection and verification component
-
-### Design Goals (Unvalidated)
-
-The architecture is designed to achieve:
-- Reduced factual errors through critic-based verification
-- Extended context handling via hierarchical memory (attention: 8K tokens + RAG-style retrieval)
-- Improved compute efficiency through sparse expert activation
-- Lower latency via early-exit mechanisms
-
-**Note**: These are architectural design targets, not measured results. Validation would require full-scale training and comprehensive evaluation.
+**Design Goals** (unvalidated): Reduced errors via verification • Extended context via hierarchical memory • Efficiency via sparse experts • Lower latency via early-exit
 
 ## Installation
 
 ```bash
-# Clone repository
-git clone https://github.com/yourusername/hmst.git
-cd hmst
-
-# Install dependencies
-pip install -r requirements.txt
-pip install -e .
-
-# Verify installation
-python -m pytest tests/ -v
-
-# Run demo (uses untrained model with random weights)
-python demo.py
+pip install -r requirements.txt && pip install -e .
+python -m pytest tests/ -v  # Verify
+python demo.py              # Run demo (untrained model)
 ```
 
 ## Quick Start
 
-### Running the Demo
-
 ```bash
-# Run interactive demo (untrained model)
+# Demo (untrained, shows data flow only)
 python demo.py
-```
 
-**Note**: The demo uses an untrained model and will not produce meaningful outputs. It demonstrates the architecture's data flow and routing decisions.
-
-### Inference
-
-After training, use `inference.py` for text generation:
-
-```bash
-# Interactive mode (default)
-python inference.py checkpoints/train/best_model.pt
-
-# Single prompt
-python inference.py checkpoints/train/best_model.pt --prompt "Once upon a time"
-
-# Batch generation
-python inference.py checkpoints/train/best_model.pt --input prompts.txt --output results.txt
-
-# Greedy decoding (deterministic)
-python inference.py checkpoints/train/best_model.pt --prompt "Hello" --temperature 0
-```
-
-**Options**: `--max-length`, `--temperature`, `--top-p`, `--top-k`, `--output`
-
-For full HMST system with memory/routing (research), use `hmst.inference.HMSTInferenceEngine` (requires all components trained).
-
-## Training Quickstart
-
-```bash
-# Convenience mode (quick iteration with auto-split validation)
+# Training (convenience mode with auto-split validation)
 python train.py data/train.txt --val-split 0.1
 
-# Production mode (reproducible with pre-split validation)
-python train.py data/train.txt \
-    --val-file data/val.txt \
-    --output-dir checkpoints/prod \
-    --model-size small \
-    --multi-gpu \
-    --mixed-precision \
-    --patience 3
+# Production training (pre-split validation)
+python train.py data/train.txt --val-file data/val.txt --output-dir checkpoints/prod
+
+# Inference (after training)
+python inference.py checkpoints/train/best_model.pt --prompt "Once upon a time"
 ```
 
-**Pre-tokenization (recommended, 5-10x faster)**:
-```bash
-# Convenience mode with pre-tokenized data
-python scripts/preprocess_data.py --input data/train.txt --output data/tokenized/train
-python train.py data/tokenized/train --pretokenized --val-split 0.1
+## Training
 
-# Production mode with pre-tokenized AND pre-split data
+### Pre-tokenization (Recommended, 5-10x faster)
+
+```bash
+# Preprocess once, train many times
 python scripts/preprocess_data.py --input data/train.txt --output data/tokenized/train
 python scripts/split_dataset.py  # creates train_split and val directories
 python train.py data/tokenized/train_split --pretokenized --val-file data/tokenized/val
 ```
 
-**Note**: Base 12B model requires ~500K-1M A100 GPU-hours ($750K-$1.5M) for competitive performance.
-
-## Training
-
-### Basic Training
-
-The unified training script supports single-GPU and multi-GPU training with comprehensive options:
-
-```bash
-# Basic training with auto-split validation (convenience mode)
-python train.py data/train.txt --val-split 0.1
-
-# With pre-split validation and custom output directory (production mode)
-python train.py data/train.txt \
-    --val-file data/val.txt \
-    --output-dir checkpoints/my_run
-
-# View all options
-python train.py --help
-```
-
-**Validation Split Options**:
-- **`--val-split 0.1`**: Auto-split 10% for validation (quick iteration, reshuffles each run)
-- **`--val-file data/val.txt`**: Use pre-split validation file (reproducible, production)
-- Cannot use both options together
+### Validation Options
+- `--val-split 0.1`: Auto-split for quick iteration (reshuffles each run)
+- `--val-file data/val.txt`: Pre-split for reproducible results (production)
 
 ### Tokenizer Management
-
-The script automatically manages tokenization:
-
-```bash
-# First run - creates new tokenizer (saved to output-dir/tokenizer)
-python train.py data/train.txt --output-dir checkpoints/run1
-
-# Subsequent runs - reuse existing tokenizer for consistency
-python train.py data/new_train.txt \
-    --tokenizer-path checkpoints/run1/tokenizer \
-    --output-dir checkpoints/run2
-```
-
-**Important**: Always use the same tokenizer when continuing training or fine-tuning a model to ensure vocabulary consistency.
+First run creates tokenizer at `<output-dir>/tokenizer`. Reuse with `--tokenizer-path` for consistency.
 
 ### Model Sizes
+`micro` (~10M) • `tiny` (~100M) • `small` (~1B) • `base` (~12B)
 
-Choose from four preset configurations:
-
-```bash
-# Micro (~10M params) - ultra-fast testing, TinyStories dataset
-python train.py data/train.txt --model-size micro
-
-# Tiny (~100M params) - fast training, testing
-python train.py data/train.txt --model-size tiny
-
-# Small (~1B params) - experimentation
-python train.py data/train.txt --model-size small
-
-# Base (~12B params) - full-scale training
-python train.py data/train.txt --model-size base --multi-gpu
-```
-
-### Advanced Training Options
+### Common Training Patterns
 
 ```bash
-# Control steps per epoch (useful for large datasets)
-python train.py data/train.txt --steps-per-epoch 1000 --epochs 50 --val-split 0.1
+# Multi-GPU with mixed precision
+python train.py data/train.txt --multi-gpu --mixed-precision --val-split 0.1
 
-# Multi-GPU training with DDP (all GPUs)
-python train.py data/train.txt --multi-gpu --batch-size 4 --val-split 0.1
+# Specific GPUs only
+python train.py data/train.txt --multi-gpu --gpu-ids 0 2 --val-split 0.1
 
-# Multi-GPU with specific GPUs only
-python train.py data/train.txt --multi-gpu --gpu-ids 0 2 --batch-size 4 --val-split 0.1
-
-# Mixed precision for faster training
-python train.py data/train.txt --mixed-precision --val-split 0.1
-
-# Early stopping and validation (convenience mode)
-python train.py data/train.txt \
-    --val-split 0.1 \
-    --eval-every 500 \
-    --patience 5
-
-# Full production training with pre-split validation
-python train.py data/train.txt \
-    --val-file data/val.txt \
-    --output-dir checkpoints/production \
-    --tokenizer-path checkpoints/run1/tokenizer \
-    --model-size small \
-    --epochs 20 \
-    --batch-size 8 \
-    --learning-rate 3e-4 \
-    --steps-per-epoch 2000 \
-    --eval-every 500 \
-    --patience 3 \
-    --save-every 5 \
-    --multi-gpu \
-    --mixed-precision
-```
-
-### Mixed VRAM GPU Training
-
-For systems with heterogeneous GPUs (e.g., 12GB + 6GB), use gradient accumulation to efficiently utilize all GPUs:
-
-```bash
-# Gradient accumulation for mixed VRAM (recommended)
+# Mixed VRAM GPUs (e.g., 12GB + 6GB): use gradient accumulation
 python train.py data/train.txt \
     --multi-gpu \
     --batch-size 2 \
     --gradient-accumulation-steps 4 \
     --mixed-precision \
     --val-split 0.1
-# Effective batch size per GPU: 2 × 4 = 8
-# Total effective batch size: 8 × 2 GPUs = 16
+# Effective batch: 2 × 4 × 2 GPUs = 16
 
-# Or use only the GPU with more memory
-python train.py data/train.txt --gpu-ids 0 --batch-size 8 --val-split 0.1
+# Full production config
+python train.py data/train.txt \
+    --val-file data/val.txt \
+    --model-size small \
+    --multi-gpu \
+    --mixed-precision \
+    --eval-every 500 \
+    --patience 3
 ```
 
-**How it works**:
-- Small micro-batches fit on the smallest GPU
-- Gradients accumulate over N steps before optimizer update
-- Learning rate schedule automatically adjusts
-- Both GPUs fully utilized without OOM errors
+### Key Training Options
+`--model-size` • `--val-split` / `--val-file` • `--multi-gpu` • `--gpu-ids` • `--gradient-accumulation-steps` • `--mixed-precision` • `--eval-every` • `--patience` • `--tokenizer-path` • `--pretokenized`
 
-The script automatically detects GPU memory differences and provides recommendations.
+See `python train.py --help` for full options.
 
-### Training Options Reference
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--model-size` | Model size: micro/tiny/small/base | tiny |
-| `--epochs` | Number of training epochs | 20 |
-| `--batch-size` | Batch size per GPU (micro-batch if using accumulation) | 8 |
-| `--learning-rate` | Peak learning rate | 3e-4 |
-| `--steps-per-epoch` | Max steps per epoch | Full dataset |
-| `--tokenizer-path` | Path to existing tokenizer | Create new |
-| `--val-file` | Validation text file (production mode) | None |
-| `--val-split` | Auto-split validation fraction 0.0-1.0 (convenience mode) | None |
-| `--pretokenized` | Use pre-tokenized HuggingFace datasets | False |
-| `--eval-every` | Evaluate every N optimizer steps | Off |
-| `--patience` | Early stopping patience (epochs) | Off |
-| `--save-every` | Save checkpoint every N epochs | Off |
-| `--multi-gpu` | Enable multi-GPU DDP training | False |
-| `--gpu-ids` | Specific GPU IDs to use (e.g., `0 2`) | All GPUs |
-| `--gradient-accumulation-steps` | Accumulate gradients over N steps (effective_batch = batch × N) | 1 |
-| `--mixed-precision` | Enable FP16 training | False |
-| `--warmup-steps` | Learning rate warmup steps (based on optimizer steps) | 1000 |
-| `--seq-len` | Sequence length | 512 |
-| `--num-workers` | DataLoader workers | 4 |
-
-### Stage 3: RL Training (Meta-Controller)
-
-After pre-training, optimize the meta-controller with reinforcement learning:
-
+### RL Training (Stage 3)
+After pre-training, optimize meta-controller:
 ```bash
-python -m training.rl_train \
-    --checkpoint checkpoints/production/final.pt \
-    --episodes 50000
+python -m training.rl_train --checkpoint checkpoints/prod/final.pt --episodes 50000
 ```
-
-**Note**: Stage 2 (memory fine-tuning) is not yet implemented. RL training requires a pre-trained base model to generate meaningful reward signals.
 
 ## Testing
 
 ```bash
-# Run all tests
-python -m pytest tests/ -v
-
-# Run specific test suites
-python -m pytest tests/test_models.py -v
-python -m pytest tests/test_memory.py -v
-python -m pytest tests/test_inference.py -v
-
-# Run with coverage
-python -m pytest tests/ --cov=hmst --cov-report=html
+python -m pytest tests/ -v                    # All tests
+python -m pytest tests/test_models.py -v      # Specific suite
+python -m pytest tests/ --cov=hmst            # With coverage
 ```
 
 ## Project Structure
 
 ```
 hmst/
-├── models/           # Core model implementations
-│   ├── base_moe.py          # Sparse MoE transformer
-│   ├── meta_controller.py   # RL-trainable routing controller
-│   ├── critic.py            # Hallucination detection
-│   └── ssm.py               # State space model (Mamba)
-├── memory/           # Memory hierarchy
-│   ├── episodic.py          # L2 cache (SSM-compressed)
-│   ├── semantic.py          # L3 cache (FAISS vector store)
-│   └── consolidation.py     # Memory transfer logic
-├── training/         # Training modules
-│   ├── pretrain.py          # Pre-training trainer class
-│   └── rl_train.py          # RL meta-controller training
-├── inference/        # Inference engine
-│   └── engine.py            # Full system orchestration
-├── configs/          # Model configurations
-│   └── model_config.py      # Micro/Tiny/Small/Base/Large presets
-├── tokenizer.py      # Tokenization (HuggingFace BPE wrapper)
-├── train.py          # Production training script
-├── inference.py      # Production inference script
-├── demo.py           # Interactive demo
+├── models/           # base_moe, meta_controller, critic, ssm
+├── memory/           # episodic, semantic, consolidation
+├── training/         # pretrain, rl_train
+├── inference/        # engine
+├── configs/          # model_config (presets)
+├── train.py          # Training script
+├── inference.py      # Inference script
 └── tests/            # Unit tests
 ```
 
-## Common Issues & Tips
+## Troubleshooting
 
-### Training Performance
+**OOM**: Reduce `--batch-size`, add `--mixed-precision`, use `--gradient-accumulation-steps`
+**Mixed VRAM GPUs**: Use `--gradient-accumulation-steps 4 --batch-size 2`
+**Slow tokenization**: Pre-tokenize with `scripts/preprocess_data.py` (5-10x faster)
+**Tokenizer mismatch**: Reuse with `--tokenizer-path` when continuing training
+**Multi-GPU issues**: Check NCCL installation and `nvidia-smi`
+**FAISS errors**: Requires ~10K embeddings before index training
 
-- **Large datasets**: Use `--steps-per-epoch` to control epoch length and enable more frequent validation
-- **Out of memory**: Reduce `--batch-size`, use `--mixed-precision`, use `--gradient-accumulation-steps`, or switch to smaller model size
-- **Mixed VRAM GPUs**: Use `--gradient-accumulation-steps 4 --batch-size 2` to utilize heterogeneous GPUs efficiently
-- **Multi-GPU not working**: Ensure NCCL is installed and GPUs are visible with `nvidia-smi`
-- **GPU selection**: Use `--gpu-ids 0 2` to train on specific GPUs (useful for shared systems)
-- **Slow data loading**: Increase `--num-workers` (typically 4-8 works well)
-- **Slow tokenization**: Use `scripts/preprocess_data.py` to pre-tokenize data (5-10x faster training)
-- **Gradient accumulation**: Effective batch size = `batch_size × gradient_accumulation_steps × num_gpus`
+## Validation Requirements
 
-### Validation & Data Splitting
+**Training**: 2-5T tokens • 500K-1M A100 GPU-hours • ~$1M budget
+**Evaluation**: MMLU, TruthfulQA, HumanEval, GSM8K, hallucination metrics, baselines (Llama-2, Mistral)
+**RL Pipeline**: Pre-trained base model • 50K episodes • Reward model
+**Production**: Quantization • Serving infrastructure • Safety testing
 
-- **Quick iteration**: Use `--val-split 0.1` for automatic validation split (reshuffles each run)
-- **Reproducible results**: Use `scripts/split_dataset.py` + `--val-file` for consistent validation splits
-- **Cannot use both**: `--val-split` and `--val-file` are mutually exclusive
-- **Dataset coverage**: With `--steps-per-epoch`, ensure you see all data (steps × epochs ≥ total batches)
+## Component Details
 
-### Tokenizer Issues
+**BaseMoEModel**: 8 experts • Top-2 routing • Load balancing • Scales from 100M to 12B params
+**MetaController**: 6-layer transformer • 5 routing gates (early-exit, episodic/semantic memory, expert selection, verification)
+**Memory**: Episodic (SSM, 8K tokens) • Semantic (FAISS RAG, 1M+ entries)
+**Critic**: Hallucination detection via consistency checking
 
-- **Vocabulary mismatch**: Always use `--tokenizer-path` when continuing training or fine-tuning
-- **Token IDs out of range**: Ensure the same tokenizer is used for training and inference
-- **Find existing tokenizer**: Check `checkpoints/<run_name>/tokenizer` directory
+## Limitations
 
-### Memory Systems
+Untrained weights • No evaluation code • Placeholder memory consolidation • Stage 2 unimplemented • True attention: 8K (not 1M)
 
-- **FAISS index errors**: Semantic memory requires ~10K embeddings before index training
-- **SSM dimension mismatch**: Ensure `d_model` → `d_state` projection is configured correctly
-- **Memory consolidation**: Background process is placeholder; needs base model integration
+## Contributing & Future Work
 
-## What Would Be Needed for Validation
+**Contributions welcome**: Evaluation framework • Training runs • Benchmark integration • Optimizations • Bug fixes
 
-To validate the architectural design goals, the following would be required:
+**Roadmap**: Evaluation framework • Memory consolidation • Stage 2 training • Expert routing optimization • SSM parallelization • Custom tokenizer • Validation experiments • Full-scale training
 
-### 1. Large-Scale Training
-- Multi-trillion token dataset (e.g., The Pile, RedPajama, proprietary data)
-- 500K-1M A100 GPU-hours for 12B parameter model
-- Distributed training infrastructure (100+ GPUs)
-- ~$1M budget for compute resources
+**vs. Production LLMs** (LLaMA, Mistral, etc.): This project provides architecture + scripts but lacks trained weights, datasets, evaluation, and production optimization.
 
-### 2. Evaluation Framework
-Implementation needed for:
-- **Standard Benchmarks**: MMLU, TruthfulQA, HumanEval, GSM8K
-- **Hallucination Metrics**: Factual consistency evaluation
-- **Efficiency Metrics**: FLOPs per token, throughput measurements
-- **Long-Context Tests**: "Needle in a haystack" evaluations
-- **Comparison Baselines**: Run same tests on Llama-2, Mistral, etc.
+## License & Acknowledgments
 
-### 3. RL Training Pipeline
-- Train base model to convergence first
-- Collect trajectory data for meta-controller optimization
-- Reward model for accuracy/efficiency trade-offs
-- ~50K episodes of RL training
-
-### 4. Production Infrastructure
-- Proper tokenizer training (BPE/SentencePiece)
-- Model quantization and optimization
-- Serving infrastructure
-- Safety and alignment testing
-
-## Architecture Details
-
-### Component Specifications
-
-**BaseMoEModel** (`models/base_moe.py`):
-- 8 experts with top-2 routing (configurable)
-- Standard transformer attention
-- Load balancing loss for expert utilization
-- Parameter count scales with config (tiny: ~100M, small: ~1B, base: ~12B)
-
-**MetaController** (`models/meta_controller.py`):
-- 6-layer lightweight transformer
-- 5 routing decisions per query:
-  - Early exit gate (skip deep processing)
-  - Episodic memory access (recent context)
-  - Semantic memory retrieval (long-term facts)
-  - Expert selection (MoE routing weights)
-  - Verification trigger (critic activation)
-
-**Memory Systems** (`memory/`):
-- **Episodic**: SSM-based compression of recent 8K token windows
-- **Semantic**: FAISS vector database for retrieval (RAG-style)
-- **Note**: "1M+ context" claim refers to retrieval database size, not attention window
-
-**CriticModel** (`models/critic.py`):
-- Verification model for hallucination detection
-- Checks consistency between query, response, and retrieved facts
-- Outputs confidence score
-
-## Known Limitations
-
-1. **Untrained weights**: All models use random initialization
-2. **No evaluation code**: `evaluation/` directory is empty
-3. **Memory consolidation**: Importance scoring is placeholder
-4. **Stage 2 training**: Memory fine-tuning not implemented
-5. **Context window**: True attention context is 8K tokens, not 1M (semantic memory uses RAG pattern)
-
-## Comparison to Production LLM Projects
-
-Production-ready open-source LLM projects typically include:
-- ✅ Trained model weights (HuggingFace model hub)
-- ✅ Training datasets and recipes
-- ✅ Evaluation frameworks and benchmark results
-- ✅ Tokenizers (trained BPE/SentencePiece)
-- ✅ Inference optimization (quantization, serving)
-
-This project currently provides:
-- ✅ Architecture implementation
-- ✅ Training scripts (untested at scale)
-- ✅ Tokenizer (GPT-2 BPE wrapper)
-- ❌ Trained weights, datasets, evaluation framework, production optimization
-
-Examples of complete projects: LLaMA, Mistral, Pythia, Falcon, GPT-NeoX
-
-## Contributing
-
-Contributions are welcome, especially:
-- Evaluation framework implementation
-- Training runs and results sharing
-- Benchmark integration (lm-evaluation-harness)
-- Optimization improvements
-- Bug fixes and tests
-
-## Future Work
-
-- [ ] Implement evaluation framework
-- [ ] Complete memory consolidation logic
-- [ ] Add Stage 2 (memory fine-tuning) training
-- [ ] Optimize expert routing (vectorize nested loops)
-- [ ] Parallelize SSM sequential scan
-- [ ] Train custom tokenizer on domain-specific corpus (currently uses GPT-2 BPE)
-- [ ] Conduct small-scale validation experiments
-- [ ] Full-scale training (requires funding)
-
-## License
-
-MIT License - See LICENSE file for details.
-
-## Acknowledgments
-
-This architecture was developed with assistance from Claude (Anthropic) and Gemini (Google DeepMind) AI assistants during the design and implementation phases.
-
-## Contact
-
-For questions, collaboration, or discussions about the architecture: [Contact Information]
+MIT License. Developed with assistance from Claude (Anthropic) and Gemini (Google DeepMind).
 
 ---
 
-**Disclaimer**: This is a research prototype exploring novel architectural ideas for LLM development. All performance claims are theoretical design goals, not validated measurements. Large-scale training and comprehensive evaluation would be required to assess the architecture's actual capabilities.
+**Disclaimer**: Research prototype. Performance claims are unvalidated design goals requiring large-scale training for assessment.
