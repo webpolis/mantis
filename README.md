@@ -183,8 +183,11 @@ python train.py data/train.txt --model-size base --multi-gpu
 # Control steps per epoch (useful for large datasets)
 python train.py data/train.txt --steps-per-epoch 1000 --epochs 50 --val-split 0.1
 
-# Multi-GPU training with DDP
+# Multi-GPU training with DDP (all GPUs)
 python train.py data/train.txt --multi-gpu --batch-size 4 --val-split 0.1
+
+# Multi-GPU with specific GPUs only
+python train.py data/train.txt --multi-gpu --gpu-ids 0 2 --batch-size 4 --val-split 0.1
 
 # Mixed precision for faster training
 python train.py data/train.txt --mixed-precision --val-split 0.1
@@ -212,25 +215,54 @@ python train.py data/train.txt \
     --mixed-precision
 ```
 
+### Mixed VRAM GPU Training
+
+For systems with heterogeneous GPUs (e.g., 12GB + 6GB), use gradient accumulation to efficiently utilize all GPUs:
+
+```bash
+# Gradient accumulation for mixed VRAM (recommended)
+python train.py data/train.txt \
+    --multi-gpu \
+    --batch-size 2 \
+    --gradient-accumulation-steps 4 \
+    --mixed-precision \
+    --val-split 0.1
+# Effective batch size per GPU: 2 × 4 = 8
+# Total effective batch size: 8 × 2 GPUs = 16
+
+# Or use only the GPU with more memory
+python train.py data/train.txt --gpu-ids 0 --batch-size 8 --val-split 0.1
+```
+
+**How it works**:
+- Small micro-batches fit on the smallest GPU
+- Gradients accumulate over N steps before optimizer update
+- Learning rate schedule automatically adjusts
+- Both GPUs fully utilized without OOM errors
+
+The script automatically detects GPU memory differences and provides recommendations.
+
 ### Training Options Reference
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--model-size` | Model size: micro/tiny/small/base | tiny |
 | `--epochs` | Number of training epochs | 20 |
-| `--batch-size` | Batch size per GPU | 8 |
+| `--batch-size` | Batch size per GPU (micro-batch if using accumulation) | 8 |
 | `--learning-rate` | Peak learning rate | 3e-4 |
 | `--steps-per-epoch` | Max steps per epoch | Full dataset |
 | `--tokenizer-path` | Path to existing tokenizer | Create new |
 | `--val-file` | Validation text file (production mode) | None |
 | `--val-split` | Auto-split validation fraction 0.0-1.0 (convenience mode) | None |
 | `--pretokenized` | Use pre-tokenized HuggingFace datasets | False |
-| `--eval-every` | Evaluate every N steps | Off |
+| `--eval-every` | Evaluate every N optimizer steps | Off |
 | `--patience` | Early stopping patience (epochs) | Off |
 | `--save-every` | Save checkpoint every N epochs | Off |
 | `--multi-gpu` | Enable multi-GPU DDP training | False |
+| `--gpu-ids` | Specific GPU IDs to use (e.g., `0 2`) | All GPUs |
+| `--gradient-accumulation-steps` | Accumulate gradients over N steps (effective_batch = batch × N) | 1 |
 | `--mixed-precision` | Enable FP16 training | False |
-| `--warmup-steps` | Learning rate warmup steps | 1000 |
+| `--warmup-steps` | Learning rate warmup steps (based on optimizer steps) | 1000 |
 | `--seq-len` | Sequence length | 512 |
 | `--num-workers` | DataLoader workers | 4 |
 
@@ -293,10 +325,13 @@ hmst/
 ### Training Performance
 
 - **Large datasets**: Use `--steps-per-epoch` to control epoch length and enable more frequent validation
-- **Out of memory**: Reduce `--batch-size`, use `--mixed-precision`, or switch to smaller model size
+- **Out of memory**: Reduce `--batch-size`, use `--mixed-precision`, use `--gradient-accumulation-steps`, or switch to smaller model size
+- **Mixed VRAM GPUs**: Use `--gradient-accumulation-steps 4 --batch-size 2` to utilize heterogeneous GPUs efficiently
 - **Multi-GPU not working**: Ensure NCCL is installed and GPUs are visible with `nvidia-smi`
+- **GPU selection**: Use `--gpu-ids 0 2` to train on specific GPUs (useful for shared systems)
 - **Slow data loading**: Increase `--num-workers` (typically 4-8 works well)
 - **Slow tokenization**: Use `scripts/preprocess_data.py` to pre-tokenize data (5-10x faster training)
+- **Gradient accumulation**: Effective batch size = `batch_size × gradient_accumulation_steps × num_gpus`
 
 ### Validation & Data Splitting
 
