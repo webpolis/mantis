@@ -245,8 +245,36 @@ def setup_ddp(rank, world_size, device_id):
     """
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+    # -------------------------------------------------------------------------
+    # FIX: Mixed Architecture Compatibility (e.g., Turing + Ampere)
+    # -------------------------------------------------------------------------
+    # 1. Disable TF32: Newer GPUs (Ampere+) default to TF32, older ones don't.
+    #    This mismatch causes cuBLAS initialization errors in distributed training.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
+    # 2. Disable NCCL P2P/IB: Peer-to-peer access between different GPU
+    #    generations is often unstable or unsupported.
+    os.environ["NCCL_P2P_DISABLE"] = "1"
+    os.environ["NCCL_IB_DISABLE"] = "1"
+    # -------------------------------------------------------------------------
+
+    # CRITICAL: Set device BEFORE init_process_group!
+    # NCCL backend initializes CUDA contexts during init_process_group.
+    # Without set_device first, all ranks default to GPU 0, causing context mismatch.
     torch.cuda.set_device(device_id)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+    # CRITICAL: Initialize CUDA context and cuBLAS handles with dummy operations
+    # This ensures cuBLAS is properly initialized before actual training starts.
+    # Without this, mixed GPU architectures can have uninitialized cuBLAS handles.
+    with torch.cuda.device(device_id):
+        dummy = torch.randn(128, 128, device=f'cuda:{device_id}', requires_grad=True)
+        result = torch.matmul(dummy, dummy.t())
+        result.sum().backward()
+        torch.cuda.synchronize(device_id)
+        del dummy, result
 
 
 def cleanup_ddp():
@@ -715,6 +743,9 @@ def train_ddp_worker(rank, world_size, args):
     ).cuda(gpu_id)
 
     model = DDP(model, device_ids=[gpu_id])
+
+    # Synchronize all ranks after DDP initialization
+    dist.barrier()
 
     if is_main:
         param_counts = model.module.count_parameters()
