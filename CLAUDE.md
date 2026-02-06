@@ -101,6 +101,16 @@ python train.py data/train.txt \
 # Train larger model with mixed precision
 python train.py data/train.txt --model-size small --mixed-precision --val-split 0.1
 
+# Memory-optimized for small model (~1B) on limited VRAM (12GB)
+python train.py data/train.txt \
+    --model-size small \
+    --batch-size 1 \
+    --gradient-accumulation-steps 16 \
+    --mixed-precision \
+    --gradient-checkpointing \
+    --use-8bit-optimizer \
+    --val-split 0.1
+
 # Full example with all features (convenience mode)
 python train.py data/train.txt \
     --val-split 0.1 \
@@ -147,6 +157,12 @@ python train.py data/train.txt \
 - `--gpu-ids 0 2`: Use specific GPUs (e.g., GPU 0 and GPU 2)
 - Accelerate handles mixed architectures (e.g., Turing + Ampere) automatically
 - For mixed VRAM, use gradient accumulation
+
+**Memory Optimizations** (for large models on limited VRAM):
+- `--gradient-checkpointing`: Trades 30% compute for 40% memory savings
+- `--use-8bit-optimizer`: Cuts optimizer memory ~50% (requires `pip install bitsandbytes`)
+- Combine with `--mixed-precision`, small `--batch-size`, and `--gradient-accumulation-steps`
+- Example: Small model (~1B) fits in 12GB with all optimizations enabled
 
 **Stage 3: RL Training** (meta-controller optimization):
 ```bash
