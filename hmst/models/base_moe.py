@@ -229,12 +229,14 @@ class BaseMoEModel(nn.Module):
         n_experts: int = 8,
         top_k: int = 2,
         max_seq_len: int = 8192,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        load_balance_weight: float = 0.01
     ):
         super().__init__()
 
         self.d_model = d_model
         self.max_seq_len = max_seq_len
+        self.load_balance_weight = load_balance_weight
         self.gradient_checkpointing = False
 
         # Token embeddings
