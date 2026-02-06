@@ -143,6 +143,68 @@ def compute_perplexity(loss):
     return math.exp(min(loss, 100))
 
 
+def get_gpu_memory_info():
+    """Get available VRAM for each GPU in GB."""
+    if not torch.cuda.is_available():
+        return []
+
+    gpu_memory = []
+    for i in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(i)
+        total_memory_gb = props.total_memory / (1024 ** 3)
+        gpu_memory.append({
+            'id': i,
+            'name': props.name,
+            'memory_gb': total_memory_gb
+        })
+    return gpu_memory
+
+
+def check_gpu_homogeneity(gpu_ids=None):
+    """
+    Check if selected GPUs have similar VRAM and warn if heterogeneous.
+
+    Returns:
+        bool: True if GPUs are homogeneous (within 20% difference), False otherwise
+    """
+    gpu_info = get_gpu_memory_info()
+
+    if gpu_ids:
+        gpu_info = [gpu_info[i] for i in gpu_ids if i < len(gpu_info)]
+
+    if len(gpu_info) < 2:
+        return True
+
+    memories = [gpu['memory_gb'] for gpu in gpu_info]
+    min_mem = min(memories)
+    max_mem = max(memories)
+
+    print("\n" + "="*80)
+    print("GPU Configuration:")
+    for idx, gpu in enumerate(gpu_info):
+        if gpu_ids and len(gpu_ids) > 1:
+            print(f"  System GPU {gpu['id']} (DDP rank {idx}): {gpu['name']} - {gpu['memory_gb']:.1f} GB VRAM")
+        else:
+            print(f"  GPU {gpu['id']}: {gpu['name']} - {gpu['memory_gb']:.1f} GB VRAM")
+    print("="*80)
+
+    # Check if difference is significant (>20%)
+    if max_mem > min_mem * 1.2:
+        print("\n⚠️  WARNING: Heterogeneous GPU configuration detected!")
+        print(f"   GPU memory ranges from {min_mem:.1f} GB to {max_mem:.1f} GB")
+        print("\n   PyTorch DDP assumes homogeneous GPUs. Recommendations:")
+
+        # Find the GPU with most memory
+        largest_gpu = max(gpu_info, key=lambda g: g['memory_gb'])
+        print(f"   1. Use only the larger GPU: --gpu-ids {largest_gpu['id']}")
+        print(f"   2. Use gradient accumulation: --gradient-accumulation-steps 4 --batch-size N")
+        print(f"   3. Use smaller batch size that fits on {min_mem:.1f} GB GPU")
+        print("\n   Proceeding will use batch size that fits on smallest GPU.\n")
+        return False
+
+    return True
+
+
 def setup_ddp(rank, world_size):
     """Initialize DDP process group."""
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -321,8 +383,10 @@ def train_single_gpu(args):
         betas=(0.9, 0.95)
     )
 
-    # Scheduler
-    total_steps = (args.steps_per_epoch or len(train_loader)) * args.epochs
+    # Scheduler (adjusted for gradient accumulation)
+    steps_per_epoch = args.steps_per_epoch or len(train_loader)
+    effective_steps_per_epoch = steps_per_epoch // args.gradient_accumulation_steps
+    total_steps = effective_steps_per_epoch * args.epochs
 
     def lr_lambda(step):
         if step < args.warmup_steps:
@@ -354,6 +418,7 @@ def train_single_gpu(args):
     print(f"{'='*80}\n")
 
     global_step = 0
+    optimizer_step = 0  # Track actual optimizer updates (not batch count)
     best_val_loss = float('inf')
     epochs_without_improvement = 0
 
@@ -361,6 +426,7 @@ def train_single_gpu(args):
         model.train()
         epoch_loss = 0.0
         epoch_steps = 0
+        optimizer.zero_grad()  # Initialize gradients at start of each epoch
 
         pbar = tqdm(
             train_loader,
@@ -388,20 +454,35 @@ def train_single_gpu(args):
                 )
                 total_loss = lm_loss + load_balance_loss
 
-            # Backward
-            optimizer.zero_grad()
-            if scaler:
-                scaler.scale(total_loss).backward()
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                total_loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                optimizer.step()
+            # Scale loss for gradient accumulation
+            scaled_loss = total_loss / args.gradient_accumulation_steps
 
-            scheduler.step()
+            # Backward
+            if scaler:
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
+
+            # Gradient accumulation
+            if (epoch_steps + 1) % args.gradient_accumulation_steps == 0:
+                if scaler:
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    optimizer.step()
+
+                optimizer.zero_grad()
+                scheduler.step()
+                optimizer_step += 1
+
+                # Mid-epoch validation (based on optimizer steps, not batch count)
+                if val_loader and args.eval_every and optimizer_step % args.eval_every == 0:
+                    val_loss, val_ppl = validate(model, val_loader, tokenizer, device)
+                    print(f"\nOptimizer Step {optimizer_step} - Val Loss: {val_loss:.4f}, Val PPL: {val_ppl:.2f}")
+                    model.train()
 
             epoch_loss += lm_loss.item()
             epoch_steps += 1
@@ -414,12 +495,6 @@ def train_single_gpu(args):
                 'ppl': f'{compute_perplexity(lm_loss.item()):.1f}',
                 'lr': f'{current_lr:.2e}'
             })
-
-            # Mid-epoch validation
-            if val_loader and args.eval_every and global_step % args.eval_every == 0:
-                val_loss, val_ppl = validate(model, val_loader, tokenizer, device)
-                print(f"\nStep {global_step} - Val Loss: {val_loss:.4f}, Val PPL: {val_ppl:.2f}")
-                model.train()
 
         # Epoch summary
         avg_loss = epoch_loss / epoch_steps
@@ -608,8 +683,10 @@ def train_ddp_worker(rank, world_size, args):
         betas=(0.9, 0.95)
     )
 
-    # Scheduler
-    total_steps = (args.steps_per_epoch or len(train_loader)) * args.epochs
+    # Scheduler (adjusted for gradient accumulation)
+    steps_per_epoch = args.steps_per_epoch or len(train_loader)
+    effective_steps_per_epoch = steps_per_epoch // args.gradient_accumulation_steps
+    total_steps = effective_steps_per_epoch * args.epochs
 
     def lr_lambda(step):
         if step < args.warmup_steps:
@@ -643,6 +720,7 @@ def train_ddp_worker(rank, world_size, args):
         print(f"{'='*80}\n")
 
     global_step = 0
+    optimizer_step = 0  # Track actual optimizer updates (not batch count)
     best_val_loss = float('inf')
 
     for epoch in range(args.epochs):
@@ -650,6 +728,7 @@ def train_ddp_worker(rank, world_size, args):
         model.train()
         epoch_loss = 0.0
         epoch_steps = 0
+        optimizer.zero_grad()  # Initialize gradients at start of each epoch
 
         pbar = tqdm(
             train_loader,
@@ -677,19 +756,28 @@ def train_ddp_worker(rank, world_size, args):
                 )
                 total_loss = lm_loss + load_balance_loss
 
-            optimizer.zero_grad()
-            if scaler:
-                scaler.scale(total_loss).backward()
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                total_loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                optimizer.step()
+            # Scale loss for gradient accumulation
+            scaled_loss = total_loss / args.gradient_accumulation_steps
 
-            scheduler.step()
+            if scaler:
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
+
+            # Gradient accumulation
+            if (epoch_steps + 1) % args.gradient_accumulation_steps == 0:
+                if scaler:
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    optimizer.step()
+
+                optimizer.zero_grad()
+                scheduler.step()
+                optimizer_step += 1
 
             epoch_loss += lm_loss.item()
             epoch_steps += 1
@@ -762,8 +850,14 @@ Examples:
   # Single GPU training (raw text, slower)
   python train.py data/train.txt --val-split 0.1
 
-  # Multi-GPU training with auto-split
+  # Multi-GPU training with auto-split (all GPUs)
   python train.py data/tokenized/train --pretokenized --multi-gpu --val-split 0.1
+
+  # Multi-GPU with specific GPUs (e.g., only GPU 0 and 2)
+  python train.py data/tokenized/train --pretokenized --multi-gpu --gpu-ids 0 2 --val-split 0.1
+
+  # Mixed VRAM GPUs: Use gradient accumulation (effective batch: 2×4×2 = 16)
+  python train.py data/train.txt --multi-gpu --gradient-accumulation-steps 4 --batch-size 2 --val-split 0.1
 
   # Use existing tokenizer from checkpoint
   python train.py data/train.txt --tokenizer-path checkpoints/improved_train/tokenizer --val-split 0.1
@@ -821,6 +915,11 @@ Examples:
 
     # Performance
     parser.add_argument('--multi-gpu', action='store_true', help='Use multi-GPU DDP training')
+    parser.add_argument('--gpu-ids', type=int, nargs='+', help='Specific GPU IDs to use (e.g., --gpu-ids 0 2). Default: all available GPUs')
+    parser.add_argument('--gradient-accumulation-steps', type=int, default=1,
+                        help='Gradient accumulation steps. Effective batch per GPU = batch_size × accumulation_steps. '
+                             'Total effective batch = batch_size × accumulation_steps × num_gpus. '
+                             'Essential for mixed VRAM GPUs (e.g., 12GB + 6GB) (default: 1)')
     parser.add_argument('--mixed-precision', action='store_true', help='Use mixed precision (FP16)')
 
     args = parser.parse_args()
@@ -850,12 +949,40 @@ Examples:
 
     # Multi-GPU training
     if args.multi_gpu:
-        world_size = torch.cuda.device_count()
+        # Determine which GPUs to use
+        if args.gpu_ids:
+            gpu_ids = args.gpu_ids
+            # Validate GPU IDs
+            available_gpus = torch.cuda.device_count()
+            for gpu_id in gpu_ids:
+                if gpu_id >= available_gpus:
+                    print(f"Error: GPU {gpu_id} not available. Only {available_gpus} GPU(s) detected.")
+                    return
+            world_size = len(gpu_ids)
+        else:
+            world_size = torch.cuda.device_count()
+            gpu_ids = list(range(world_size))
+
         if world_size < 2:
             print("Error: --multi-gpu requires at least 2 GPUs")
             return
 
-        print(f"Launching DDP training on {world_size} GPUs...")
+        # Check GPU homogeneity
+        check_gpu_homogeneity(gpu_ids)
+
+        # Warn about gradient accumulation
+        if args.gradient_accumulation_steps > 1:
+            effective_batch = args.batch_size * args.gradient_accumulation_steps
+            print(f"\n💡 Gradient Accumulation: {args.gradient_accumulation_steps} steps")
+            print(f"   Effective batch size per GPU: {effective_batch}")
+            print(f"   Total effective batch size: {effective_batch * world_size}\n")
+
+        print(f"Launching DDP training on {world_size} GPU(s): {gpu_ids}...")
+
+        # Set visible devices before spawning
+        os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, gpu_ids))
+
+        # Spawn processes (ranks will be 0, 1, ... regardless of actual GPU IDs)
         mp.spawn(train_ddp_worker, args=(world_size, args), nprocs=world_size, join=True)
     else:
         train_single_gpu(args)

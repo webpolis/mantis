@@ -83,8 +83,21 @@ python train.py data/train.txt \
 # Control steps per epoch (useful for large datasets or quick iterations)
 python train.py data/train.txt --steps-per-epoch 1000 --epochs 50 --val-split 0.1
 
-# Multi-GPU training (DDP)
+# Multi-GPU training (DDP, all GPUs)
 python train.py data/train.txt --multi-gpu --batch-size 4 --val-split 0.1
+
+# Multi-GPU with specific GPUs only (useful for shared systems)
+python train.py data/train.txt --multi-gpu --gpu-ids 0 2 --val-split 0.1
+
+# Mixed VRAM GPUs (e.g., 12GB + 6GB): use gradient accumulation
+# Effective batch size per GPU: 2 × 4 = 8
+# Total effective batch size: 8 × 2 GPUs = 16
+python train.py data/train.txt \
+    --multi-gpu \
+    --gradient-accumulation-steps 4 \
+    --batch-size 2 \
+    --mixed-precision \
+    --val-split 0.1
 
 # Train larger model with mixed precision
 python train.py data/train.txt --model-size small --mixed-precision --val-split 0.1
@@ -120,6 +133,20 @@ python train.py data/train.txt \
 - `tiny`: ~100M parameters (testing/development)
 - `small`: ~1B parameters (experimentation)
 - `base`: ~12B parameters (production)
+
+**Gradient Accumulation & Mixed VRAM GPUs**:
+- Use `--gradient-accumulation-steps N` to accumulate gradients over N micro-batches before optimizer update
+- Effective batch size = `batch_size × gradient_accumulation_steps × num_gpus`
+- Essential for mixed VRAM setups (e.g., 12GB + 6GB GPUs)
+- Learning rate schedule automatically adjusts for accumulation steps
+- Validation timing based on optimizer steps (not batch count)
+- Example: `--batch-size 2 --gradient-accumulation-steps 4` → effective batch size of 8 per GPU
+
+**GPU Selection**:
+- `--multi-gpu`: Use all available GPUs
+- `--gpu-ids 0 2`: Use only specific GPUs (e.g., GPU 0 and GPU 2)
+- Script automatically detects heterogeneous VRAM and warns with recommendations
+- For mixed VRAM, use gradient accumulation or select only the larger GPU
 
 **Stage 3: RL Training** (meta-controller optimization):
 ```bash
