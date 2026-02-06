@@ -81,6 +81,24 @@ python train.py data/tokenized/train_split --pretokenized --val-file data/tokeni
 ### Tokenizer Management
 First run creates tokenizer at `<output-dir>/tokenizer`. Reuse with `--tokenizer-path` for consistency.
 
+### Checkpoint Resumption
+Resume from any checkpoint (`best_model.pt`, `epoch_N.pt`, `final_model.pt`):
+```bash
+# Resume training (continues from saved state)
+python train.py data/train.txt \
+    --resume checkpoints/train/best_model.pt \
+    --tokenizer-path checkpoints/train/tokenizer \
+    --val-split 0.1
+
+# Continue for more epochs (e.g., 20 → 50 total)
+python train.py data/train.txt \
+    --resume checkpoints/train/final_model.pt \
+    --tokenizer-path checkpoints/train/tokenizer \
+    --epochs 50 \
+    --val-split 0.1
+```
+**Note**: `--tokenizer-path` required when resuming. Restores model, optimizer, scheduler, and training state.
+
 ### Model Sizes
 `micro` (~10M) • `tiny` (~100M) • `small` (~1B) • `base` (~12B)
 
@@ -111,7 +129,7 @@ python train.py data/train.txt \
 ```
 
 ### Key Training Options
-`--hf-dataset` • `--hf-train-split` • `--hf-val-split` • `--streaming` • `--model-size` • `--val-split` / `--val-file` • `--gpu-ids` • `--gradient-accumulation-steps` • `--mixed-precision` • `--gradient-checkpointing` • `--use-8bit-optimizer` • `--eval-every` • `--patience` • `--tokenizer-path` • `--pretokenized`
+`--resume` • `--hf-dataset` • `--hf-train-split` • `--hf-val-split` • `--streaming` • `--model-size` • `--val-split` / `--val-file` • `--gpu-ids` • `--gradient-accumulation-steps` • `--mixed-precision` • `--gradient-checkpointing` • `--use-8bit-optimizer` • `--eval-every` • `--patience` • `--tokenizer-path` • `--pretokenized`
 
 See `python train.py --help` for full options.
 
@@ -149,6 +167,7 @@ hmst/
 **Mixed VRAM GPUs**: Use `--gradient-accumulation-steps 4 --batch-size 2`
 **Slow tokenization**: Pre-tokenize with `scripts/preprocess_data.py` (5-10x faster)
 **Tokenizer mismatch**: Reuse with `--tokenizer-path` when continuing training
+**Resume errors**: Must use `--tokenizer-path` and matching data source as original run
 **Multi-GPU issues**: Check `nvidia-smi` and available VRAM
 **FAISS errors**: Requires ~10K embeddings before index training
 
