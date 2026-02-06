@@ -21,7 +21,7 @@
 \usepackage{subcaption}
 
 % Title and Authors
-\title{HMST: Hierarchical Memory-State Transformer for Hallucination Mitigation in Long-Context Language Models}
+\title{HMST: A Proposed Hierarchical Memory-State Transformer Architecture for Hallucination Mitigation}
 
 \author{%
   Anonymous Authors \\
@@ -34,8 +34,8 @@
 \maketitle
 
 \begin{abstract}
-Large Language Models (LLMs) exhibit a fundamental trade-off between long-context retention, computational efficiency, and hallucination rates. Existing approaches either scale quadratically with context length (dense transformers), compress information lossy (state-space models), or lack contextual statefulness (retrieval-augmented generation). We introduce \textbf{HMST} (Hierarchical Memory-State Transformer), a novel hybrid architecture that integrates a sparse Mixture-of-Experts (MoE) backbone with a meta-controlled three-tier memory system. A lightweight \textit{Meta-Controller}, optimized via reinforcement learning (PPO), dynamically routes queries between: (1) immediate self-attention, (2) episodic state-space compression (Mamba-based SSM), and (3) semantic vector retrieval (FAISS). An optional critic model provides hallucination detection through output verification. On long-context benchmarks, HMST demonstrates superior hallucination resistance (15\% reduction in error rate on TruthfulQA) while maintaining sub-linear computational complexity. Our architecture achieves 2.3$\times$ faster inference than dense transformers on 16K-token contexts with 12B total parameters (2B active).
-\end{abstract}
+Large Language Models (LLMs) exhibit a fundamental trade-off between long-context retention, computational efficiency, and hallucination rates. Existing approaches either scale quadratically with context length (dense transformers), compress information lossy (state-space models), or lack contextual statefulness (retrieval-augmented generation). We propose \textbf{HMST} (Hierarchical Memory-State Transformer), a novel hybrid architecture design that integrates a sparse Mixture-of-Experts (MoE) backbone with a meta-controlled three-tier memory system. We present a complete reference implementation where a lightweight \textit{Meta-Controller}, designed to be optimized via reinforcement learning (PPO), dynamically routes queries between: (1) immediate self-attention, (2) episodic state-space compression (Mamba-based SSM), and (3) semantic vector retrieval (FAISS). An optional critic model is included to provide hallucination detection through output verification. This paper details the architectural design and implementation of HMST as a framework for future research into adaptive memory systems. We discuss the theoretical properties of the architecture, its expected computational advantages, and the proposed training methodology required to validate its performance on long-context benchmarks.
+\end{abstract>
 
 \section{Introduction}
 
@@ -51,21 +51,21 @@ Existing mitigation strategies exhibit complementary weaknesses. \textit{Retriev
 
 \subsection{Contributions}
 
-We propose HMST, a hierarchical architecture that synergistically combines three memory tiers under unified RL-based control:
+We propose HMST, a hierarchical architecture that integrates three memory tiers under unified RL-based control:
 
 \begin{enumerate}
-    \item \textbf{Sparse MoE Backbone:} A 12B-parameter base model with 8 experts and top-2 routing, activating only 2B parameters per token for efficient processing.
+    \item \textbf{Sparse MoE Backbone:} A 12B-parameter base model design with 8 experts and top-2 routing, activating only 2B parameters per token for efficient processing.
     \item \textbf{Three-Tier Memory Hierarchy:}
     \begin{itemize}
         \item \textit{L1 (Working Memory):} Standard self-attention over immediate context ($\sim$2K tokens).
         \item \textit{L2 (Episodic Memory):} Input-dependent Mamba SSM compressing recent interactions into 256D states (8K effective tokens).
-        \item \textit{L3 (Semantic Memory):} FAISS vector index enabling sub-logarithmic retrieval over 1M+ historical entries.
+        \item \textit{L3 (Semantic Memory):} FAISS vector index enabling sub-linear retrieval over 1M+ historical entries.
     \end{itemize}
-    \item \textbf{RL-Optimized Meta-Controller:} A lightweight 6-layer transformer trained via PPO to dynamically route queries based on complexity, uncertainty, and compute budget.
-    \item \textbf{Integrated Critic Model:} A 1B-parameter verification network that detects hallucinations through logical consistency checking.
+    \item \textbf{Meta-Controller Architecture:} A lightweight 6-layer transformer designed to be trained via PPO to dynamically route queries based on complexity, uncertainty, and compute budget.
+    \item \textbf{Integrated Critic Model:} A 1B-parameter verification network designed to detect hallucinations through logical consistency checking.
 \end{enumerate}
 
-Our experiments demonstrate 15\% hallucination reduction on TruthfulQA, 2.3$\times$ inference speedup on long contexts, and superior scaling properties compared to dense baselines.
+We provide a comprehensive description of the system architecture and its implementation, along with a theoretical analysis of its scaling properties and expected benefits over dense baselines.
 
 \section{Related Work}
 
@@ -110,7 +110,7 @@ Top-$K$ routing selects the expert subset $\mathcal{T} = \text{TopK}(\mathbf{p},
 \mathbf{y} = \sum_{i \in \mathcal{T}} \frac{p_i}{\sum_{j \in \mathcal{T}} p_j} \, E_i(\mathbf{x})
 \end{equation}
 
-\textbf{Load Balancing.} To prevent expert collapse, we minimize the auxiliary loss:
+\textbf{Load Balancing.} To prevent expert collapse, we propose minimizing the auxiliary loss:
 \begin{equation}
 \mathcal{L}_{bal} = \alpha \cdot N \sum_{i=1}^N f_i \cdot \bar{p}_i
 \end{equation}
@@ -140,7 +140,7 @@ g_{ver} &= \sigma(W_{ver} \mathbf{z}_t) \quad \text{(Verification)} \\
 \end{align}
 where $\mathbf{z}_t = \text{TransformerEncoder}([\mathbf{e}_q; \mathbf{s}_t])$ and $\sigma$ is the sigmoid function.
 
-Binary decisions are made via thresholding: $a_* = \mathbb{1}[g_* > \tau]$ with $\tau = 0.5$. During training, we use Gumbel-Softmax \cite{jang2017gumbel} for differentiability.
+Binary decisions are made via thresholding: $a_* = \mathbb{1}[g_* > \tau]$ with $\tau = 0.5$. The proposed training employs Gumbel-Softmax \cite{jang2017gumbel} for differentiability.
 
 \subsection{Episodic Memory: Selective State Space Model}
 
@@ -188,7 +188,7 @@ with sub-linear complexity $O(\sqrt{M})$ due to IVF clustering with $\approx\sqr
 \begin{equation}
 I(\mathbf{h}_t) = \alpha \cdot \text{novelty}(\mathbf{h}_t) + (1-\alpha) \cdot \text{frequency}(\mathbf{h}_t)
 \end{equation}
-High-importance states are transferred from L2 to L3 during idle cycles.
+High-importance states are intended to be transferred from L2 to L3 during idle cycles.
 
 \subsection{Critic Model for Hallucination Detection}
 
@@ -204,20 +204,20 @@ Training minimizes the calibrated loss:
 \end{equation}
 with $\lambda=0.5$ for balanced calibration.
 
-\section{Training Methodology}
+\section{Proposed Training Methodology}
 
 \subsection{Stage 1: Pre-training}
 
-The base MoE model and memory modules are jointly trained on language modeling:
+The base MoE model and memory modules are designed to be jointly trained on language modeling:
 \begin{equation}
 \mathcal{L}_{total} = \mathcal{L}_{LM} + \alpha \mathcal{L}_{bal}
 \end{equation}
 
-We use the AdamW optimizer \cite{loshchilov2019adamw} with learning rate $3 \times 10^{-4}$, batch size 512, and mixed-precision training (bf16). Training corpus consists of 2T tokens from diverse sources (web text, books, code).
+We propose using the AdamW optimizer \cite{loshchilov2019adamw} with learning rate $3 \times 10^{-4}$, batch size 512, and mixed-precision training (bf16). The target training corpus would consist of 2T tokens from diverse sources (web text, books, code).
 
 \subsection{Stage 2: Meta-Controller Reinforcement Learning}
 
-The Meta-Controller is optimized via Proximal Policy Optimization (PPO) \cite{schulman2017ppo} to maximize expected reward:
+The Meta-Controller is designed to be optimized via Proximal Policy Optimization (PPO) \cite{schulman2017ppo} to maximize expected reward:
 \begin{equation}
 J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=0}^T \gamma^t R_t \right]
 \end{equation}
@@ -245,17 +245,17 @@ where $r_t(\theta) = \frac{\pi_\theta(a_t|s_t)}{\pi_{\theta_{old}}(a_t|s_t)}$ is
 
 \subsection{Stage 3: Critic Fine-Tuning}
 
-The critic is fine-tuned on curated hallucination datasets (HaluEval \cite{li2023halueval}, FaithDial \cite{dziri2022faithdial}) with:
+The critic model is intended to be fine-tuned on curated hallucination datasets (HaluEval \cite{li2023halueval}, FaithDial \cite{dziri2022faithdial}) with:
 \begin{itemize}
     \item Positive examples: Factually correct responses with supporting evidence
     \item Negative examples: Plausible but incorrect outputs with contradictory evidence
 \end{itemize}
 
-\section{Experimental Setup}
+\section{Proposed Evaluation Protocol}
 
 \subsection{Baselines}
 
-We compare HMST against:
+We propose comparing HMST against the following baselines to validate its effectiveness:
 \begin{itemize}
     \item \textbf{Llama-3-8B} \cite{touvron2023llama}: Dense transformer baseline
     \item \textbf{Mixtral-8x7B} \cite{jiang2024mixtral}: Sparse MoE without memory augmentation
@@ -263,7 +263,7 @@ We compare HMST against:
     \item \textbf{Llama-3-8B + RAG}: Dense model with FAISS retrieval
 \end{itemize}
 
-\subsection{Datasets}
+\subsection{Proposed Datasets}
 
 \begin{itemize}
     \item \textbf{LongBench} \cite{bai2023longbench}: Long-context QA (16K-128K tokens)
@@ -272,7 +272,7 @@ We compare HMST against:
     \item \textbf{NarrativeQA} \cite{kocisky2018narrativeqa}: Book-length comprehension
 \end{itemize}
 
-\subsection{Metrics}
+\subsection{Proposed Metrics}
 
 \begin{enumerate}
     \item \textbf{Accuracy:} Exact match / F1 score on QA tasks
@@ -282,109 +282,43 @@ We compare HMST against:
     \item \textbf{Calibration Error:} Expected Calibration Error (ECE) \cite{guo2017calibration}
 \end{enumerate}
 
-\section{Results}
-
-\subsection{Long-Context Performance}
-
-Table~\ref{tab:longbench} shows results on LongBench. HMST achieves competitive accuracy while reducing compute by 58\% relative to dense baselines.
-
-\begin{table}[h]
-\centering
-\caption{Performance on LongBench (16K context)}
-\label{tab:longbench}
-\begin{tabular}{lccc}
-\toprule
-Model & Accuracy (\%) & Latency (s) & FLOPs (T) \\
-\midrule
-Llama-3-8B & 68.3 & 2.45 & 12.4 \\
-Mixtral-8x7B & 71.2 & 1.89 & 8.7 \\
-Mamba-2.8B & 63.8 & 0.52 & 3.1 \\
-Llama-3 + RAG & 69.7 & 2.91 & 13.2 \\
-\midrule
-\textbf{HMST-12B} & \textbf{72.8} & \textbf{1.06} & \textbf{5.2} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Hallucination Mitigation}
-
-On TruthfulQA, HMST reduces hallucination rate by 15\% compared to Llama-3 baseline (Table~\ref{tab:truthful}).
-
-\begin{table}[h]
-\centering
-\caption{TruthfulQA Results}
-\label{tab:truthful}
-\begin{tabular}{lcc}
-\toprule
-Model & Truthful (\%) & Informative (\%) \\
-\midrule
-Llama-3-8B & 42.1 & 58.3 \\
-Mixtral-8x7B & 46.8 & 61.2 \\
-Llama-3 + RAG & 49.3 & 62.7 \\
-\midrule
-\textbf{HMST-12B} & \textbf{57.2} & \textbf{65.4} \\
-\textbf{HMST + Critic} & \textbf{61.5} & \textbf{64.1} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Ablation Studies}
-
-Table~\ref{tab:ablation} demonstrates the contribution of each memory tier.
-
-\begin{table}[h]
-\centering
-\caption{Ablation Study on LongBench}
-\label{tab:ablation}
-\begin{tabular}{lcc}
-\toprule
-Configuration & Accuracy (\%) & Latency (s) \\
-\midrule
-HMST (Full) & 72.8 & 1.06 \\
-- L3 Semantic & 69.4 & 0.98 \\
-- L2 Episodic & 68.1 & 1.12 \\
-- Meta-Controller & 65.7 & 1.34 \\
-Base MoE only & 63.2 & 0.87 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Scaling Analysis}
-
-Figure~\ref{fig:scaling} shows that HMST maintains sub-quadratic complexity as context length increases, while dense baselines exhibit quadratic growth.
-
-\section{Discussion}
+\section{Expected Properties}
 
 \subsection{Computational Efficiency}
 
-The hierarchical memory design enables graceful degradation: simple queries bypass expensive retrieval (Gate 1), while complex reasoning activates full memory hierarchy. RL optimization learns query-specific routing policies, achieving 2.3$\times$ speedup on average.
+The hierarchical memory design is expected to enable graceful degradation: simple queries should bypass expensive retrieval (Gate 1), while complex reasoning activates the full memory hierarchy. We anticipate that RL optimization will learn query-specific routing policies, potentially achieving significant speedups compared to dense baselines by activating the minimal necessary parameters for each token.
 
-\subsection{Hallucination Mechanisms}
+\subsection{Scaling Analysis}
 
-The critic model demonstrates strong calibration (ECE = 0.08), effectively filtering 73\% of hallucinated outputs when verification gate $g_{ver} > 0.7$. Error analysis reveals remaining failures occur primarily in:
-\begin{enumerate}
-    \item Multi-hop reasoning requiring transitive fact composition
-    \item Temporal reasoning over evolving entity states
-    \item Commonsense inference beyond retrieved evidence
-\end{enumerate}
+Theoretically, HMST should maintain sub-quadratic complexity as context length increases, due to the $O(1)$ memory footprint of the episodic memory and $O(\sqrt{M})$ retrieval complexity of the semantic memory. This contrasts with dense baselines which exhibit quadratic growth.
+
+\section{Discussion}
+
+\subsection{Architectural Design Decisions}
+
+The decision to separate memory into three tiers is motivated by the distinct access patterns required for effective language modeling. Working memory handles immediate syntax and local coherence; episodic memory maintains a compressed narrative thread; and semantic memory provides access to long-term facts. The meta-controller serves as a learned arbitrator, aiming to balance the trade-off between retrieval cost and information gain.
+
+\subsection{Hallucination Mitigation Strategy}
+
+The critic model is designed to improve calibration by conditioning verification on retrieved evidence. By explicitly modeling the confidence of generated outputs against retrieved facts, the system aims to filter out ungrounded generation. The expected failure modes would likely involve multi-hop reasoning where the necessary evidence is distributed across different memory tiers, requiring complex routing decisions.
 
 \subsection{Limitations}
 
 \begin{itemize}
-    \item \textbf{Training Cost:} RL optimization requires 50K episodes ($\sim$200 A100 GPU-hours).
-    \item \textbf{Memory Maintenance:} L3 index rebuilding scales as $O(M \log M)$ for $M$ entries.
-    \item \textbf{Cold Start:} System requires warmup period to populate episodic memory.
+    \item \textbf{Training Complexity:} RL optimization of the meta-controller presents a non-trivial stability challenge and requires careful hyperparameter tuning.
+    \item \textbf{Memory Maintenance:} L3 index rebuilding scales as $O(M \log M)$ for $M$ entries, which may become a bottleneck for extremely large historical contexts.
+    \item \textbf{Cold Start:} The system requires a warmup period to populate the episodic memory before it can effectively leverage historical context.
 \end{itemize}
 
 \section{Conclusion}
 
-We introduced HMST, a hierarchical memory-augmented transformer that addresses fundamental trade-offs in long-context LLM design. By combining sparse MoE computation with multi-tier memory under RL-based meta-control, HMST achieves superior efficiency and factual accuracy compared to existing approaches. The architecture demonstrates that learned routing policies can dynamically balance compute allocation based on query complexity, opening new research directions in adaptive neural architectures.
+We have presented HMST, a proposed hierarchical memory-augmented transformer architecture designed to address fundamental trade-offs in long-context LLM design. By combining sparse MoE computation with multi-tier memory under RL-based meta-control, HMST offers a promising direction for achieving superior efficiency and factual accuracy. This paper details the complete architectural design and implementation, laying the groundwork for future training and evaluation. The proposed design suggests that learned routing policies could dynamically balance compute allocation based on query complexity.
 
-Future work will explore: (1) scaling memory capacity to 10M+ entries, (2) continual learning protocols for memory consolidation, and (3) integration with tool-augmented reasoning systems.
+Pending validation of the core architecture, future work could explore: (1) scaling memory capacity to 10M+ entries, (2) continual learning protocols for memory consolidation, and (3) integration with tool-augmented reasoning systems.
 
 \section*{Broader Impact}
 
-HMST's hallucination mitigation capabilities could improve reliability in high-stakes applications (medical QA, legal reasoning). However, the critic model may introduce brittleness if trained on biased datasets, potentially amplifying systemic biases. Deployment should include human-in-the-loop verification for critical decisions.
+The proposed HMST architecture aims to improve reliability in high-stakes applications (medical QA, legal reasoning). However, the critic model might introduce brittleness if trained on biased datasets, potentially amplifying systemic biases. Any future deployment should include human-in-the-loop verification for critical decisions.
 
 \begin{thebibliography}{99}
 
