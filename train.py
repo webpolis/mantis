@@ -1195,21 +1195,28 @@ Examples:
         train(args)
 
     elif args.stage == 2:
-        # Stage 2: Memory fine-tuning (not yet implemented)
+        # Stage 2: Memory fine-tuning
         print(f"\n{'='*80}")
         print("STAGE 2: Memory Fine-tuning")
         print(f"{'='*80}\n")
-        raise NotImplementedError(
-            "Stage 2 (Memory Fine-tuning) is not yet implemented.\n\n"
-            "This stage will train:\n"
-            "  - Episodic memory (SSM-based, 8K context)\n"
-            "  - Semantic memory (FAISS vector DB, 1M+ entries)\n"
-            "  - Memory consolidation (episodic → semantic)\n\n"
-            "For now, you can:\n"
-            "  - Complete Stage 1 pre-training\n"
-            "  - Move directly to Stage 3 (RL training) with --stage 3\n\n"
-            "Track implementation progress: https://github.com/anthropics/hmst/issues"
-        )
+
+        if not args.resume:
+            raise ValueError(
+                "Stage 2 requires a pre-trained model from Stage 1.\n"
+                "Use: --resume checkpoints/stage1/best_model.pt --tokenizer-path checkpoints/stage1/tokenizer"
+            )
+
+        # Import memory training components
+        try:
+            from hmst.training.memory_train import train_memory_stage
+        except ImportError as e:
+            raise ImportError(
+                f"Failed to import memory training module: {e}\n\n"
+                "Stage 2 requires memory training implementation in hmst/training/memory_train.py"
+            )
+
+        # Run memory fine-tuning
+        train_memory_stage(args)
 
     elif args.stage == 3:
         # Stage 3: RL training for meta-controller

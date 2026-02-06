@@ -11,6 +11,13 @@ from torch.distributions import Categorical, Bernoulli
 from typing import Dict, List, Tuple
 from collections import deque
 import random
+import os
+
+from hmst.models.base_moe import BaseMoEModel
+from hmst.models.meta_controller import MetaController, StateSummaryEncoder
+from hmst.models.critic import CriticModel, CriticValueNetwork
+from hmst.inference.engine import HMSTInferenceEngine
+from hmst.tokenizer import HMSTTokenizer
 
 
 class PPOTrainer:
@@ -421,50 +428,170 @@ class PPOTrainer:
 def train_rl_stage(args):
     """
     Entry point for Stage 3: RL training of meta-controller.
-    
+
     Called from train.py with --stage 3.
-    
+
     Args:
         args: Argument namespace from train.py argparse
     """
     print("\n" + "="*80)
     print("Stage 3: RL Training - Meta-Controller Optimization")
     print("="*80)
-    
-    # Check requirements
-    if not args.resume:
-        raise ValueError(
-            "Stage 3 requires a pre-trained base model from Stage 1.\n"
-            "Usage: python train.py --stage 3 --resume checkpoints/stage1/best_model.pt "
-            "--tokenizer-path checkpoints/stage1/tokenizer"
-        )
-    
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # 1. Load pre-trained base model from checkpoint
     print(f"\nLoading base model from: {args.resume}")
-    print(f"RL Episodes: {args.rl_episodes}")
-    print(f"RL Batch Size: {args.rl_batch_size}")
-    
-    # TODO: Implement full RL training pipeline
-    # This requires:
-    # 1. Load pre-trained base model from args.resume
-    # 2. Initialize meta-controller
-    # 3. Create inference engine
-    # 4. Load training queries and ground truths
-    # 5. Run PPOTrainer
-    
-    raise NotImplementedError(
-        "\n\nStage 3 RL training is partially implemented (PPOTrainer class exists)\n"
-        "but needs integration work:\n\n"
-        "TODO:\n"
-        "  1. Load pre-trained base model checkpoint\n"
-        "  2. Initialize meta-controller and value network\n"
-        "  3. Create HMSTInferenceEngine\n"
-        "  4. Prepare RL training dataset (queries + ground truths)\n"
-        "  5. Run PPOTrainer.train()\n"
-        "  6. Save optimized meta-controller\n\n"
-        "The PPOTrainer implementation is complete in this file.\n"
-        "See hmst/training/rl_train.py for the PPO implementation.\n\n"
-        "For now, you can:\n"
-        "  - Complete Stage 1 pre-training\n"
-        "  - Use the trained model for inference\n"
-        "  - Track Stage 3 integration: https://github.com/anthropics/hmst/issues"
+    if not os.path.exists(args.resume):
+        raise FileNotFoundError(f"Checkpoint not found: {args.resume}")
+
+    checkpoint = torch.load(args.resume, map_location='cpu')
+    if 'config' not in checkpoint:
+        raise ValueError(f"Checkpoint missing 'config' key: {args.resume}")
+    config = checkpoint['config']
+
+    # Load tokenizer
+    print(f"Loading tokenizer from: {args.tokenizer_path}")
+    if not os.path.exists(args.tokenizer_path):
+        raise FileNotFoundError(f"Tokenizer not found: {args.tokenizer_path}")
+    tokenizer = HMSTTokenizer.load(args.tokenizer_path)
+    config.base_moe.vocab_size = len(tokenizer)
+    config.critic.vocab_size = len(tokenizer)
+
+    # Load base model
+    base_model = BaseMoEModel(
+        vocab_size=config.base_moe.vocab_size,
+        d_model=config.base_moe.d_model,
+        n_layers=config.base_moe.n_layers,
+        n_heads=config.base_moe.n_heads,
+        d_ff=config.base_moe.d_ff,
+        n_experts=config.base_moe.n_experts,
+        top_k=config.base_moe.top_k,
+        max_seq_len=config.base_moe.max_seq_len,
+        dropout=config.base_moe.dropout,
+        load_balance_weight=config.base_moe.load_balance_weight
     )
+    base_model.load_state_dict(checkpoint['model_state_dict'])
+    base_model.to(device)
+    base_model.eval()
+    print("✓ Base model loaded successfully.")
+
+    # 2. Initialize meta-controller and value network
+    print("Initializing Meta-Controller and Value Network...")
+    meta_controller = MetaController(
+        d_model=config.base_moe.d_model,
+        n_layers=config.meta_controller.n_layers,
+        n_heads=config.meta_controller.n_heads,
+        d_ff=config.meta_controller.d_ff,
+        dropout=config.meta_controller.dropout,
+        n_experts=config.base_moe.n_experts,
+        state_dim=config.meta_controller.state_dim
+    )
+
+    value_network = CriticValueNetwork(
+        d_model=config.base_moe.d_model,
+        state_dim=config.meta_controller.state_dim
+    )
+    print("✓ Meta-Controller and Value Network initialized.")
+
+    # 3. Create HMSTInferenceEngine
+    print("Creating HMST Inference Engine...")
+    state_encoder = StateSummaryEncoder(state_dim=config.meta_controller.state_dim)
+    critic_model = CriticModel(
+        vocab_size=config.critic.vocab_size,
+        d_model=config.critic.d_model,
+        n_layers=config.critic.n_layers,
+        n_heads=config.critic.n_heads,
+        d_ff=config.critic.d_ff,
+        max_seq_len=config.critic.max_seq_len,
+        dropout=config.critic.dropout
+    )
+
+    inference_engine = HMSTInferenceEngine(
+        base_model=base_model,
+        meta_controller=meta_controller,
+        episodic_memory=None,
+        semantic_memory=None,
+        critic_model=critic_model,
+        state_encoder=state_encoder,
+        tokenizer=tokenizer,
+        device=device
+    )
+    print("✓ Inference Engine created.")
+
+    # 4. Prepare RL training dataset
+    print("\n⚠️  Note: Using demo dataset for RL training.")
+    print("   For production, provide a proper training dataset with queries and ground truths.")
+    print("   Dataset should be loaded from file with 1000+ query-answer pairs.\n")
+
+    queries = [
+        "What is the capital of France?",
+        "Summarize the plot of the movie Inception.",
+        "Who wrote the book 'Pride and Prejudice'?",
+        "Explain the theory of relativity in simple terms.",
+        "What are the main causes of climate change?",
+        "How does photosynthesis work?",
+        "What is the Pythagorean theorem?",
+        "Describe the water cycle.",
+        "What is DNA?",
+        "How do computers store information?"
+    ]
+    ground_truths = [
+        "Paris",
+        "A thief who enters people's dreams to steal information.",
+        "Jane Austen",
+        "Space and time are connected, and massive objects bend spacetime.",
+        "Greenhouse gas emissions from human activities.",
+        "Plants convert sunlight into energy using chlorophyll.",
+        "In a right triangle, the square of the hypotenuse equals the sum of squares of the other sides.",
+        "Water evaporates, condenses into clouds, and falls as precipitation.",
+        "DNA is the molecule that carries genetic information.",
+        "Computers use binary code to store data as 0s and 1s."
+    ]
+    print(f"✓ Using demo dataset with {len(queries)} queries.")
+
+    # 5. Run PPOTrainer.train()
+    print("\nInitializing PPO Trainer...")
+    ppo_trainer = PPOTrainer(
+        meta_controller=meta_controller,
+        value_network=value_network,
+        inference_engine=inference_engine,
+        alpha=config.training.alpha_accuracy,
+        beta=config.training.beta_latency,
+        gamma=config.training.gamma_compute,
+        delta=config.training.delta_calibration,
+        lr=config.training.rl_lr,
+        ppo_epsilon=config.training.rl_ppo_epsilon,
+        discount=config.training.rl_discount,
+        gae_lambda=config.training.rl_gae_lambda,
+        batch_size=args.rl_batch_size,
+        device=device
+    )
+
+    print(f"\nStarting PPO training: {args.rl_episodes} episodes")
+    print(f"Batch size: {args.rl_batch_size}")
+    print("="*80 + "\n")
+
+    ppo_trainer.train(
+        queries=queries,
+        ground_truths=ground_truths,
+        num_episodes=args.rl_episodes
+    )
+
+    # 6. Save optimized meta-controller
+    output_dir = args.output_dir if hasattr(args, 'output_dir') else os.path.dirname(args.resume)
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    save_path = os.path.join(output_dir, "meta_controller_rl.pt")
+    torch.save({
+        'meta_controller_state_dict': meta_controller.state_dict(),
+        'value_network_state_dict': value_network.state_dict(),
+        'config': config
+    }, save_path)
+
+    print(f"\n" + "="*80)
+    print(f"✓ Optimized meta-controller saved to: {save_path}")
+    print("="*80)
+    print("\nStage 3: RL Training Complete!")
+    print("="*80 + "\n")

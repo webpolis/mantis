@@ -307,21 +307,28 @@ python train.py --stage 1 \
 
 **When to use**: If you need context beyond the 8K attention window
 
-**Status**: ⚠️ **NOT YET IMPLEMENTED**
+**Status**: ✅ **IMPLEMENTED**
 
-### Planned Usage
+### Usage
 
 ```bash
-# Will fine-tune memory on top of Stage 1 model
+# Fine-tune memory on top of Stage 1 model
 python train.py --stage 2 \
     --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
-    --memory-dataset data/long_context_data.txt \
     --epochs 5 \
     --output-dir checkpoints/stage2
+
+# With custom dataset (recommended for production)
+python train.py --stage 2 \
+    --resume checkpoints/stage1/best_model.pt \
+    --tokenizer-path checkpoints/stage1/tokenizer \
+    --hf-dataset QuALITY \
+    --epochs 5 \
+    --steps-per-epoch 500
 ```
 
-**Note**: Currently returns error message with implementation status. Track progress at project issues.
+**Note**: Uses demo dataset by default. For production, provide long-context datasets (QuALITY, NarrativeQA, etc.).
 
 ---
 
@@ -339,7 +346,9 @@ python train.py --stage 2 \
 
 **When to use**: After Stage 1 (or Stage 2) to optimize dynamic routing and efficiency
 
-### Basic Usage
+**Status**: ✅ **IMPLEMENTED**
+
+### Usage
 
 ```bash
 # Optimize meta-controller on top of Stage 1 model
@@ -349,11 +358,16 @@ python train.py --stage 3 \
     --rl-episodes 50000 \
     --rl-batch-size 256 \
     --output-dir checkpoints/stage3
+
+# After Stage 2 (with memory systems)
+python train.py --stage 3 \
+    --resume checkpoints/stage2/memory_system_final.pt \
+    --tokenizer-path checkpoints/stage1/tokenizer \
+    --rl-episodes 100000 \
+    --output-dir checkpoints/stage3_full
 ```
 
-**Status**: ⚠️ **PARTIALLY IMPLEMENTED**
-- PPO trainer exists in `hmst/training/rl_train.py`
-- Integration with training script in progress
+**Note**: Uses demo dataset by default (10 Q&A pairs). For production, provide large Q&A datasets (1000+ examples).
 
 **Expected Results**:
 - Improved efficiency via adaptive routing
@@ -559,15 +573,18 @@ python -m pytest tests/ --cov=hmst --cov-report=html
 hmst/
 ├── models/           # base_moe, meta_controller, critic, ssm
 ├── memory/           # episodic, semantic, consolidation
-├── training/         # pretrain, rl_train
+├── training/         # pretrain, memory_train, rl_train
 ├── inference/        # engine
 ├── configs/          # model_config (presets: micro/tiny/small/base)
 ├── tokenizer.py      # HMSTTokenizer (GPT-2 BPE wrapper)
+evaluation/           # benchmarks, metrics, evaluation harness
+├── benchmarks.py     # MMLU, TruthfulQA, HumanEval, GSM8K
+├── metrics.py        # Accuracy, F1, hallucination rate, calibration
 train.py              # Main training script (--stage 1/2/3)
 inference.py          # Text generation script
 demo.py               # Architecture demo (untrained)
 tests/                # Unit tests
-scripts/              # preprocess_data.py, split_dataset.py
+scripts/              # preprocess_data.py, split_dataset.py, run_eval.py
 ```
 
 ---
@@ -582,15 +599,13 @@ scripts/              # preprocess_data.py, split_dataset.py
 - Time: Weeks-months for full training
 
 **Evaluation Requirements** (to validate design claims):
-- Benchmarks: MMLU, TruthfulQA, HumanEval, GSM8K
-- Hallucination metrics
-- Baseline comparisons (Llama-2, Mistral, etc.)
+- Benchmarks: MMLU, TruthfulQA, HumanEval, GSM8K ✅ **Implemented**
+- Hallucination metrics ✅ **Implemented**
+- Baseline comparisons: Use `scripts/run_eval.py`
 
 **Current Limitations**:
-- No trained weights
-- No evaluation framework (evaluation/ directory is empty)
-- Stage 2 (memory) not implemented
-- Stage 3 (RL) partially implemented
+- No trained weights (architecture only)
+- Evaluation uses demo datasets (download real benchmarks for production)
 - True attention limited to 8K (not 1M)
 
 ---
@@ -638,23 +653,54 @@ scripts/              # preprocess_data.py, split_dataset.py
 
 ---
 
+## Evaluation
+
+Run benchmarks on trained models:
+
+```bash
+# Test with demo dataset
+python scripts/run_eval.py checkpoints/stage1/best_model.pt \
+    --tokenizer checkpoints/stage1/tokenizer \
+    --all --demo
+
+# Run specific benchmarks
+python scripts/run_eval.py checkpoints/stage1/best_model.pt \
+    --tokenizer checkpoints/stage1/tokenizer \
+    --benchmarks mmlu truthfulqa \
+    --output results.json
+
+# After downloading real datasets
+python scripts/run_eval.py checkpoints/stage1/best_model.pt \
+    --tokenizer checkpoints/stage1/tokenizer \
+    --all \
+    --output full_results.json
+```
+
+**Available Benchmarks**:
+- MMLU (knowledge across 57 subjects)
+- TruthfulQA (hallucination detection)
+- HumanEval (code generation)
+- GSM8K (math reasoning)
+
+**Metrics**: Accuracy, F1, hallucination rate, calibration error, pass rate
+
+---
+
 ## Contributing & Roadmap
 
 **Contributions Welcome**:
-- Evaluation framework implementation
-- Stage 2 (memory) implementation
-- Stage 3 (RL) integration
-- Training runs and benchmarks
+- Training runs and benchmark results
+- Real dataset integration
 - Optimizations (SSM parallelization, memory scaling)
 - Bug fixes and documentation
 
 **Roadmap**:
-1. Complete Stage 2 and Stage 3 integration
-2. Implement evaluation framework
+1. ~~Complete Stage 2 and Stage 3 integration~~ ✅ Done
+2. ~~Implement evaluation framework~~ ✅ Done
 3. SSM optimization (parallel scan or CUDA kernel)
 4. Memory system scaling (disk-backed storage)
 5. Full-scale training runs
-6. Benchmark validation
+6. Benchmark validation with real data
 
 ---
 
