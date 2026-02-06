@@ -735,9 +735,6 @@ def train(args):
     global_step = start_global_step
     optimizer_step = start_step
 
-    if accelerator.is_main_process:
-        print("Starting training loop...")
-
     for epoch in range(start_epoch, args.epochs):
         model.train()
         epoch_loss = 0.0
@@ -754,18 +751,11 @@ def train(args):
             if args.steps_per_epoch and epoch_steps >= args.steps_per_epoch:
                 break
 
-            if epoch_steps == 0 and accelerator.is_main_process:
-                print("Got first batch, starting forward pass...")
-
             with accelerator.accumulate(model):
                 input_ids = batch['input_ids']
                 labels = batch['labels']
 
                 output = model(input_ids)
-
-                if epoch_steps == 0 and accelerator.is_main_process:
-                    print("Forward pass complete, computing loss...")
-
                 logits = output['logits']
                 load_balance_loss = output.get('load_balance_loss', 0.0)
 
