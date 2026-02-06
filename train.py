@@ -205,12 +205,18 @@ def check_gpu_homogeneity(gpu_ids=None):
     return True
 
 
-def setup_ddp(rank, world_size):
-    """Initialize DDP process group."""
+def setup_ddp(rank, world_size, device_id):
+    """Initialize DDP process group.
+
+    Args:
+        rank: Process rank (0, 1, 2, ...)
+        world_size: Total number of processes
+        device_id: Physical GPU ID to use for this process
+    """
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
+    torch.cuda.set_device(device_id)
 
 
 def cleanup_ddp():
@@ -442,7 +448,7 @@ def train_single_gpu(args):
             labels = batch['labels'].to(device)
 
             # Forward
-            with torch.cuda.amp.autocast(enabled=scaler is not None):
+            with torch.amp.autocast('cuda', enabled=scaler is not None):
                 output = model(input_ids)
                 logits = output['logits']
                 load_balance_loss = output.get('load_balance_loss', 0.0)
@@ -559,8 +565,17 @@ def train_single_gpu(args):
 
 
 def train_ddp_worker(rank, world_size, args):
-    """DDP worker function."""
-    setup_ddp(rank, world_size)
+    """DDP worker function.
+
+    Args:
+        rank: Process rank (0, 1, 2, ...)
+        world_size: Total number of processes
+        args: Training arguments
+    """
+    # Map rank to actual GPU ID from gpu_ids list
+    gpu_id = args.gpu_ids[rank] if args.gpu_ids else rank
+
+    setup_ddp(rank, world_size, gpu_id)
     is_main = (rank == 0)
 
     # Tokenizer
@@ -667,9 +682,9 @@ def train_ddp_worker(rank, world_size, args):
         top_k=config.base_moe.top_k,
         max_seq_len=config.base_moe.max_seq_len,
         dropout=config.base_moe.dropout
-    ).cuda(rank)
+    ).cuda(gpu_id)
 
-    model = DDP(model, device_ids=[rank])
+    model = DDP(model, device_ids=[gpu_id])
 
     if is_main:
         param_counts = model.module.count_parameters()
@@ -741,10 +756,10 @@ def train_ddp_worker(rank, world_size, args):
             if args.steps_per_epoch and epoch_steps >= args.steps_per_epoch:
                 break
 
-            input_ids = batch['input_ids'].cuda(rank)
-            labels = batch['labels'].cuda(rank)
+            input_ids = batch['input_ids'].cuda(gpu_id)
+            labels = batch['labels'].cuda(gpu_id)
 
-            with torch.cuda.amp.autocast(enabled=scaler is not None):
+            with torch.amp.autocast('cuda', enabled=scaler is not None):
                 output = model(input_ids)
                 logits = output['logits']
                 load_balance_loss = output.get('load_balance_loss', 0.0)
@@ -794,7 +809,7 @@ def train_ddp_worker(rank, world_size, args):
 
             # Validation
             if val_loader:
-                val_loss, val_ppl = validate(model, val_loader, tokenizer, f'cuda:{rank}', rank)
+                val_loss, val_ppl = validate(model, val_loader, tokenizer, f'cuda:{gpu_id}', rank)
                 print(f"Epoch {epoch+1} - Val Loss: {val_loss:.4f}, Val PPL: {val_ppl:.2f}")
 
                 if val_loss < best_val_loss:
@@ -963,6 +978,9 @@ Examples:
             world_size = torch.cuda.device_count()
             gpu_ids = list(range(world_size))
 
+        # CRITICAL: Populate args.gpu_ids so workers can access it
+        args.gpu_ids = gpu_ids
+
         if world_size < 2:
             print("Error: --multi-gpu requires at least 2 GPUs")
             return
@@ -979,10 +997,7 @@ Examples:
 
         print(f"Launching DDP training on {world_size} GPU(s): {gpu_ids}...")
 
-        # Set visible devices before spawning
-        os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, gpu_ids))
-
-        # Spawn processes (ranks will be 0, 1, ... regardless of actual GPU IDs)
+        # Spawn processes - each worker will use explicit GPU ID from gpu_ids list
         mp.spawn(train_ddp_worker, args=(world_size, args), nprocs=world_size, join=True)
     else:
         train_single_gpu(args)

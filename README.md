@@ -10,13 +10,13 @@ A novel LLM architecture design exploring hallucination mitigation and long-cont
 - ✅ Complete implementation of the proposed architecture components
 - ✅ Training scripts for pre-training and RL optimization
 - ✅ Inference engine with dynamic routing
+- ✅ Production-ready tokenizer (HuggingFace GPT-2 BPE)
 - ✅ Unit tests for core functionality
 
 **What This Repository Does NOT Contain:**
 - ❌ Trained model weights or checkpoints
 - ❌ Evaluation framework or benchmark results
 - ❌ Validated performance metrics
-- ❌ Production-ready tokenizers (uses placeholder implementation)
 
 **Current State**: The architecture is implemented but requires large-scale training (estimated $750K-$1.5M in compute costs for 12B parameter variant) to validate its design hypotheses.
 
@@ -414,11 +414,10 @@ Implementation needed for:
 ## Known Limitations
 
 1. **Untrained weights**: All models use random initialization
-2. **Placeholder tokenizer**: Falls back to random tokens when no tokenizer provided
-3. **No evaluation code**: `evaluation/` directory is empty
-4. **Memory consolidation**: Importance scoring is placeholder
-5. **Stage 2 training**: Memory fine-tuning not implemented
-6. **Context window**: True attention context is 8K tokens, not 1M (semantic memory uses RAG pattern)
+2. **No evaluation code**: `evaluation/` directory is empty
+3. **Memory consolidation**: Importance scoring is placeholder
+4. **Stage 2 training**: Memory fine-tuning not implemented
+5. **Context window**: True attention context is 8K tokens, not 1M (semantic memory uses RAG pattern)
 
 ## Comparison to Production LLM Projects
 
@@ -432,7 +431,8 @@ Production-ready open-source LLM projects typically include:
 This project currently provides:
 - ✅ Architecture implementation
 - ✅ Training scripts (untested at scale)
-- ❌ Everything else listed above
+- ✅ Tokenizer (GPT-2 BPE wrapper)
+- ❌ Trained weights, datasets, evaluation framework, production optimization
 
 Examples of complete projects: LLaMA, Mistral, Pythia, Falcon, GPT-NeoX
 
@@ -452,7 +452,7 @@ Contributions are welcome, especially:
 - [ ] Add Stage 2 (memory fine-tuning) training
 - [ ] Optimize expert routing (vectorize nested loops)
 - [ ] Parallelize SSM sequential scan
-- [ ] Integrate proper tokenizer training
+- [ ] Train custom tokenizer on domain-specific corpus (currently uses GPT-2 BPE)
 - [ ] Conduct small-scale validation experiments
 - [ ] Full-scale training (requires funding)
 
