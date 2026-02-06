@@ -161,9 +161,12 @@ python train.py data/new_train.txt \
 
 ### Model Sizes
 
-Choose from three preset configurations:
+Choose from four preset configurations:
 
 ```bash
+# Micro (~10M params) - ultra-fast testing, TinyStories dataset
+python train.py data/train.txt --model-size micro
+
 # Tiny (~100M params) - fast training, testing
 python train.py data/train.txt --model-size tiny
 
@@ -213,7 +216,7 @@ python train.py data/train.txt \
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--model-size` | Model size: tiny/small/base | tiny |
+| `--model-size` | Model size: micro/tiny/small/base | tiny |
 | `--epochs` | Number of training epochs | 20 |
 | `--batch-size` | Batch size per GPU | 8 |
 | `--learning-rate` | Peak learning rate | 3e-4 |
@@ -277,9 +280,8 @@ hmst/
 ├── inference/        # Inference engine
 │   └── engine.py            # Full system orchestration
 ├── configs/          # Model configurations
-│   └── model_config.py      # Tiny/Small/Base presets
-├── tokenizer/        # Tokenization
-│   └── hmst_tokenizer.py    # HuggingFace BPE wrapper
+│   └── model_config.py      # Micro/Tiny/Small/Base/Large presets
+├── tokenizer.py      # Tokenization (HuggingFace BPE wrapper)
 ├── train.py          # Production training script
 ├── inference.py      # Production inference script
 ├── demo.py           # Interactive demo
