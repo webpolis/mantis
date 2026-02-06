@@ -2,6 +2,25 @@
 State Space Model (SSM) implementation for Episodic Memory
 
 Based on Mamba architecture with selective mechanisms.
+
+⚠️ PERFORMANCE WARNING:
+This implementation uses a Python loop for the sequential scan operation,
+which is 100-1000x slower than optimized CUDA kernels.
+
+For production use, consider:
+1. Using the official mamba-ssm package (pip install mamba-ssm)
+2. Implementing a parallel scan algorithm
+3. Using a custom CUDA kernel
+4. Reducing sequence length during testing (e.g., 512 instead of 8192)
+
+Current implementation is functional but slow - suitable for:
+- Architecture validation with short sequences
+- Testing and debugging
+- Understanding the algorithm
+
+NOT suitable for:
+- Full-scale training with long sequences (>1024)
+- Production inference
 """
 
 import torch
@@ -69,6 +88,18 @@ class SelectiveSSM(nn.Module):
         """
         batch_size, seq_len, d_model = x.shape
 
+        # Warn about performance with long sequences
+        if seq_len > 1024 and not hasattr(self, '_warned_about_performance'):
+            import warnings
+            warnings.warn(
+                f"SelectiveSSM: Processing sequence length {seq_len} with unoptimized Python loop. "
+                f"Expect 100-1000x slowdown. Consider: (1) reducing sequence length, "
+                f"(2) using mamba-ssm package, or (3) implementing parallel scan.",
+                RuntimeWarning,
+                stacklevel=2
+            )
+            self._warned_about_performance = True
+
         # Input projection
         x_and_res = self.in_proj(x)  # (batch, seq_len, d_inner * 2)
         x_inner, res = x_and_res.split(self.d_inner, dim=-1)
@@ -109,6 +140,15 @@ class SelectiveSSM(nn.Module):
         """
         Core selective scan operation.
 
+        ⚠️ PERFORMANCE BOTTLENECK: This uses a Python loop over sequence length.
+        For seq_len=8192, this loop runs 8192 times per forward pass, causing
+        100-1000x slowdown compared to parallel scan or CUDA implementations.
+
+        Production alternatives:
+        - Parallel scan algorithm (associative scan)
+        - CUDA kernel (see mamba-ssm package)
+        - Reduce sequence length for testing
+
         Args:
             x: (batch, seq_len, d_inner)
             delta: (batch, seq_len, d_inner)
@@ -127,11 +167,12 @@ class SelectiveSSM(nn.Module):
         deltaA = torch.exp(delta.unsqueeze(-1) * A)  # (batch, seq_len, d_inner, d_state)
         deltaB = delta.unsqueeze(-1) * B.unsqueeze(2)  # (batch, seq_len, d_inner, d_state)
 
-        # Sequential scan (simplified - could use parallel scan for efficiency)
+        # Sequential scan (SLOW - Python loop over sequence length)
+        # TODO: Replace with parallel scan or CUDA kernel for production
         h = torch.zeros(batch_size, d_inner, self.d_state, device=x.device)
         outputs = []
 
-        for t in range(seq_len):
+        for t in range(seq_len):  # ⚠️ BOTTLENECK: O(seq_len) sequential iterations
             h = deltaA[:, t] * h + deltaB[:, t] * x[:, t].unsqueeze(-1)
             y_t = (h * C[:, t].unsqueeze(1)).sum(dim=-1) + self.D * x[:, t]
             outputs.append(y_t)

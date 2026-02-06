@@ -416,3 +416,55 @@ class PPOTrainer:
         """
         # Exact match or substring
         return ground_truth.lower() in response.lower()
+
+
+def train_rl_stage(args):
+    """
+    Entry point for Stage 3: RL training of meta-controller.
+    
+    Called from train.py with --stage 3.
+    
+    Args:
+        args: Argument namespace from train.py argparse
+    """
+    print("\n" + "="*80)
+    print("Stage 3: RL Training - Meta-Controller Optimization")
+    print("="*80)
+    
+    # Check requirements
+    if not args.resume:
+        raise ValueError(
+            "Stage 3 requires a pre-trained base model from Stage 1.\n"
+            "Usage: python train.py --stage 3 --resume checkpoints/stage1/best_model.pt "
+            "--tokenizer-path checkpoints/stage1/tokenizer"
+        )
+    
+    print(f"\nLoading base model from: {args.resume}")
+    print(f"RL Episodes: {args.rl_episodes}")
+    print(f"RL Batch Size: {args.rl_batch_size}")
+    
+    # TODO: Implement full RL training pipeline
+    # This requires:
+    # 1. Load pre-trained base model from args.resume
+    # 2. Initialize meta-controller
+    # 3. Create inference engine
+    # 4. Load training queries and ground truths
+    # 5. Run PPOTrainer
+    
+    raise NotImplementedError(
+        "\n\nStage 3 RL training is partially implemented (PPOTrainer class exists)\n"
+        "but needs integration work:\n\n"
+        "TODO:\n"
+        "  1. Load pre-trained base model checkpoint\n"
+        "  2. Initialize meta-controller and value network\n"
+        "  3. Create HMSTInferenceEngine\n"
+        "  4. Prepare RL training dataset (queries + ground truths)\n"
+        "  5. Run PPOTrainer.train()\n"
+        "  6. Save optimized meta-controller\n\n"
+        "The PPOTrainer implementation is complete in this file.\n"
+        "See hmst/training/rl_train.py for the PPO implementation.\n\n"
+        "For now, you can:\n"
+        "  - Complete Stage 1 pre-training\n"
+        "  - Use the trained model for inference\n"
+        "  - Track Stage 3 integration: https://github.com/anthropics/hmst/issues"
+    )
