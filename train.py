@@ -509,14 +509,30 @@ def train(args):
     if accelerator.is_main_process:
         print("\nInitializing model...")
 
-    config = {
-        'micro': get_micro_config,
-        'tiny': get_tiny_config,
-        'small': get_small_config,
-        'base': get_base_config
-    }[args.model_size]()
+    # Load config from checkpoint if resuming, otherwise create new config
+    if args.resume:
+        if not os.path.exists(args.resume):
+            raise FileNotFoundError(f"Checkpoint not found: {args.resume}")
 
-    config.base_moe.vocab_size = len(tokenizer)
+        checkpoint_for_config = torch.load(args.resume, map_location='cpu')
+        if 'config' not in checkpoint_for_config:
+            raise ValueError(f"Checkpoint missing 'config' key: {args.resume}")
+
+        config = checkpoint_for_config['config']
+        if accelerator.is_main_process:
+            print(f"✓ Loaded model config from checkpoint")
+
+        # Update vocab size in case tokenizer changed (though this would be unusual)
+        config.base_moe.vocab_size = len(tokenizer)
+    else:
+        config = {
+            'micro': get_micro_config,
+            'tiny': get_tiny_config,
+            'small': get_small_config,
+            'base': get_base_config
+        }[args.model_size]()
+
+        config.base_moe.vocab_size = len(tokenizer)
 
     model = BaseMoEModel(
         vocab_size=config.base_moe.vocab_size,
@@ -588,13 +604,56 @@ def train(args):
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Prepare everything with Accelerate
+    # Prepare everything with Accelerate FIRST (before loading checkpoint)
     model, optimizer, train_loader, scheduler = accelerator.prepare(
         model, optimizer, train_loader, scheduler
     )
 
     if val_loader:
         val_loader = accelerator.prepare(val_loader)
+
+    # Resume from checkpoint if specified (AFTER accelerator.prepare())
+    start_epoch = 0
+    start_step = 0
+    start_global_step = 0
+    best_val_loss = float('inf')
+    epochs_without_improvement = 0
+
+    if args.resume:
+        if accelerator.is_main_process:
+            print(f"\nResuming from checkpoint: {args.resume}")
+
+        checkpoint = torch.load(args.resume, map_location='cpu')
+
+        # Restore model state using unwrap_model to access actual model beneath Accelerate's wrapper
+        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model.load_state_dict(checkpoint['model_state_dict'])
+
+        # Restore optimizer state (Accelerate-wrapped optimizer can load state directly)
+        if 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        else:
+            if accelerator.is_main_process:
+                print("⚠️  Warning: No optimizer state in checkpoint, starting with fresh optimizer")
+
+        # Restore scheduler state
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        else:
+            if accelerator.is_main_process:
+                print("⚠️  Warning: No scheduler state in checkpoint, starting with fresh scheduler")
+
+        # Restore training state
+        start_epoch = checkpoint.get('epoch', 0)
+        start_step = checkpoint.get('step', 0)
+        start_global_step = checkpoint.get('global_step', 0)
+        best_val_loss = checkpoint.get('best_val_loss', checkpoint.get('val_loss', float('inf')))
+        epochs_without_improvement = checkpoint.get('epochs_without_improvement', 0)
+
+        if accelerator.is_main_process:
+            print(f"✓ Resumed from epoch {start_epoch}, step {start_step}")
+            if best_val_loss < float('inf'):
+                print(f"✓ Best validation loss: {best_val_loss:.4f}")
 
     # Save tokenizer (main process only)
     if accelerator.is_main_process:
@@ -606,17 +665,18 @@ def train(args):
     # Training loop
     if accelerator.is_main_process:
         print(f"\n{'='*80}")
-        print(f"Training on {accelerator.num_processes} GPU(s): {args.epochs} epochs")
+        if args.resume:
+            print(f"Resuming training on {accelerator.num_processes} GPU(s): epochs {start_epoch+1}-{args.epochs}")
+        else:
+            print(f"Training on {accelerator.num_processes} GPU(s): {args.epochs} epochs")
         if args.steps_per_epoch:
             print(f"Steps per epoch: {args.steps_per_epoch}")
         print(f"{'='*80}\n")
 
-    global_step = 0
-    optimizer_step = 0
-    best_val_loss = float('inf')
-    epochs_without_improvement = 0
+    global_step = start_global_step
+    optimizer_step = start_step
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         epoch_loss = 0.0
         epoch_steps = 0
@@ -693,9 +753,13 @@ def train(args):
                         torch.save({
                             'epoch': epoch + 1,
                             'step': optimizer_step,
+                            'global_step': global_step,
                             'model_state_dict': unwrapped_model.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'scheduler_state_dict': scheduler.state_dict(),
                             'config': config,
-                            'val_loss': val_loss
+                            'val_loss': val_loss,
+                            'best_val_loss': best_val_loss
                         }, best_path)
                         print(f"✓ Best model saved")
 
@@ -735,9 +799,15 @@ def train(args):
                     best_path = os.path.join(args.output_dir, 'best_model.pt')
                     torch.save({
                         'epoch': epoch + 1,
+                        'step': optimizer_step,
+                        'global_step': global_step,
                         'model_state_dict': unwrapped_model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
                         'config': config,
-                        'val_loss': val_loss
+                        'val_loss': val_loss,
+                        'best_val_loss': best_val_loss,
+                        'epochs_without_improvement': epochs_without_improvement
                     }, best_path)
                     print(f"✓ Best model saved")
             else:
@@ -755,8 +825,14 @@ def train(args):
                 ckpt_path = os.path.join(args.output_dir, f'epoch_{epoch+1}.pt')
                 torch.save({
                     'epoch': epoch + 1,
+                    'step': optimizer_step,
+                    'global_step': global_step,
                     'model_state_dict': unwrapped_model.state_dict(),
-                    'config': config
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'config': config,
+                    'best_val_loss': best_val_loss,
+                    'epochs_without_improvement': epochs_without_improvement
                 }, ckpt_path)
                 print(f"Checkpoint saved: {ckpt_path}")
 
@@ -766,10 +842,14 @@ def train(args):
         unwrapped_model = accelerator.unwrap_model(model)
         final_path = os.path.join(args.output_dir, 'final_model.pt')
         torch.save({
-            'epoch': args.epochs,
+            'epoch': epoch + 1,
+            'step': optimizer_step,
             'global_step': global_step,
             'model_state_dict': unwrapped_model.state_dict(),
-            'config': config
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'config': config,
+            'best_val_loss': best_val_loss
         }, final_path)
 
         print(f"\n{'='*80}")
@@ -830,6 +910,12 @@ Examples:
   # ADVANCED OPTIONS
   # ===============
 
+  # Resume from checkpoint (continues training)
+  python train.py data/train.txt --resume checkpoints/train/best_model.pt --val-split 0.1
+
+  # Resume and train for more epochs (e.g., was 20, now train to 50 total)
+  python train.py data/train.txt --resume checkpoints/train/final_model.pt --epochs 50 --val-split 0.1
+
   # Use specific GPUs (e.g., only GPU 0)
   python train.py data/tokenized/train --pretokenized --gpu-ids 0 --val-split 0.1
 
@@ -882,6 +968,10 @@ Examples:
     parser.add_argument('--tokenizer-path', type=str,
                         help='Path to existing tokenizer (e.g., checkpoints/improved_train/tokenizer). '
                              'If not provided, creates new tokenizer')
+
+    # Resumption
+    parser.add_argument('--resume', type=str,
+                        help='Resume training from checkpoint (e.g., checkpoints/train/best_model.pt)')
 
     # Model
     parser.add_argument('--model-size', type=str, choices=['micro', 'tiny', 'small', 'base'], default='tiny',
@@ -956,6 +1046,21 @@ Examples:
             return
         if args.hf_train_split or args.hf_val_split or args.hf_config or args.hf_text_column != 'text':
             print("Error: HuggingFace-specific arguments require --hf-dataset")
+            return
+
+    # Validate resumption arguments
+    if args.resume:
+        if not os.path.exists(args.resume):
+            print(f"Error: Checkpoint not found: {args.resume}")
+            return
+        if not args.tokenizer_path:
+            checkpoint_dir = os.path.dirname(args.resume)
+            tokenizer_dir = os.path.join(checkpoint_dir, 'tokenizer')
+            print("Error: --tokenizer-path required when resuming from checkpoint")
+            if os.path.exists(tokenizer_dir):
+                print(f"       Try: --tokenizer-path {tokenizer_dir}")
+            else:
+                print(f"       Use the tokenizer from the original training run")
             return
 
     # Validate val-split arguments

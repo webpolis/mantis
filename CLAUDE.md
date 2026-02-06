@@ -37,6 +37,31 @@ python demo.py
 
 ### Training
 
+**Checkpoint Resumption**: All training runs can be resumed from any saved checkpoint (best_model.pt, epoch_N.pt, or final_model.pt). Use `--resume <checkpoint_path>` to continue training from where you left off.
+
+```bash
+# Resume from best checkpoint (continues from best validation performance)
+python train.py data/train.txt \
+    --resume checkpoints/train/best_model.pt \
+    --tokenizer-path checkpoints/train/tokenizer \
+    --val-split 0.1
+
+# Resume from specific epoch checkpoint
+python train.py data/train.txt \
+    --resume checkpoints/train/epoch_10.pt \
+    --tokenizer-path checkpoints/train/tokenizer \
+    --val-split 0.1
+
+# Resume and train for more epochs (e.g., originally trained 20 epochs, now train to 50)
+python train.py data/train.txt \
+    --resume checkpoints/train/final_model.pt \
+    --tokenizer-path checkpoints/train/tokenizer \
+    --epochs 50 \
+    --val-split 0.1
+```
+
+**Important**: When resuming, you must provide `--tokenizer-path` pointing to the saved tokenizer from the original training run (saved in `<output-dir>/tokenizer`). The script restores model weights, optimizer state, scheduler state, epoch count, and best validation loss. Use the same data source and training arguments as the original run for best results.
+
 **Three Data Source Options:**
 
 1. **HuggingFace Datasets** (easiest): Load directly from HuggingFace Hub
