@@ -79,14 +79,14 @@ class MoELayer(nn.Module):
 
         # Compute gate scores
         if expert_weights is not None:
-            # Use meta-controller provided weights
-            gate_logits = expert_weights.unsqueeze(1).expand(-1, seq_len, -1)
-            gate_logits = gate_logits.reshape(-1, self.n_experts)
+            # Use meta-controller provided weights (already probabilities from softmax)
+            # Expand to all tokens in sequence
+            gate_probs = expert_weights.unsqueeze(1).expand(-1, seq_len, -1)
+            gate_probs = gate_probs.reshape(-1, self.n_experts)
         else:
-            # Standard learned gating
+            # Standard learned gating - compute per-token routing
             gate_logits = self.gate(x_flat)  # (batch * seq_len, n_experts)
-
-        gate_probs = F.softmax(gate_logits, dim=-1)
+            gate_probs = F.softmax(gate_logits, dim=-1)
 
         # Top-k routing
         top_k_probs, top_k_indices = torch.topk(gate_probs, self.top_k, dim=-1)
@@ -260,9 +260,20 @@ class BaseMoEModel(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize weights."""
-        nn.init.normal_(self.token_embedding.weight, std=0.02)
-        nn.init.normal_(self.position_embedding.weight, std=0.02)
+        """Initialize weights with GPT-style standards."""
+        def _init_module(module):
+            if isinstance(module, nn.Linear):
+                # GPT-style initialization: Normal(0, 0.02)
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.zeros_(module.bias)
+                nn.init.ones_(module.weight)
+
+        self.apply(_init_module)
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory efficiency."""

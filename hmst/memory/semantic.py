@@ -38,9 +38,11 @@ class SemanticMemory:
         self._init_index()
 
         # Metadata storage (parallel to FAISS index)
+        # Each entry: {'text': str, 'embedding': np.ndarray, 'embedding_id': int, 'metadata': dict}
         self.metadata = []
 
-        # Store embeddings for index training/rebuilding
+        # Store embeddings for index training (IVF only)
+        # Cleared after training to save memory, but embeddings are kept in self.metadata
         self.embeddings_cache = []
 
     def _init_index(self):
@@ -119,16 +121,18 @@ class SemanticMemory:
         else:
             self.index.add(embedding)
 
-        # Store metadata
+        # Store metadata with embedding for rebuilding
         entry = {
             'text': text,
+            'embedding': embedding.copy(),  # Keep embedding for index rebuilding
             'embedding_id': len(self.metadata),
             'metadata': metadata or {}
         }
         self.metadata.append(entry)
 
-        # Cache embedding for index training
-        self.embeddings_cache.append(embedding.copy())
+        # Cache embedding for index training (IVF only, cleared after training)
+        if self.index_type == 'IVF' and not self.index_trained:
+            self.embeddings_cache.append(embedding.copy())
 
     def add_batch(
         self,
@@ -162,14 +166,20 @@ class SemanticMemory:
         if self.index_type != 'IVF' or self.index_trained:
             self.index.add(embeddings)
 
-        # Store metadata
+        # Store metadata with embeddings for rebuilding
         for i in range(n):
             entry = {
                 'text': texts[i],
+                'embedding': embeddings[i:i+1].copy(),  # Keep embedding for index rebuilding
                 'embedding_id': len(self.metadata),
                 'metadata': metadata_list[i]
             }
             self.metadata.append(entry)
+
+        # Cache embeddings for index training (IVF only, cleared after training)
+        if self.index_type == 'IVF' and not self.index_trained:
+            for i in range(n):
+                self.embeddings_cache.append(embeddings[i:i+1].copy())
 
     def retrieve(
         self,
@@ -270,7 +280,8 @@ class SemanticMemory:
 
         self.index_trained = True
 
-        # Clear cache to prevent memory leak (embeddings are now in FAISS index)
+        # Clear training cache to save memory
+        # Note: Embeddings are permanently stored in self.metadata for rebuilding
         self.embeddings_cache = []
 
         print("Index training complete.")
@@ -285,12 +296,35 @@ class SemanticMemory:
 
     def _rebuild_index(self):
         """Rebuild index from scratch (expensive operation)."""
-        print("Rebuilding FAISS index...")
+        print(f"Rebuilding FAISS index with {len(self.metadata)} entries...")
 
-        old_index_type = self.index_type
+        # Reinitialize index
         self._init_index()
 
-        # Re-add all entries (would need cached embeddings in production)
+        if len(self.metadata) == 0:
+            print("Index rebuild complete (no entries to add).")
+            return
+
+        # Extract embeddings from metadata
+        embeddings = np.vstack([entry['embedding'] for entry in self.metadata]).astype('float32')
+
+        # Train index if needed (IVF)
+        if self.index_type == 'IVF':
+            if len(embeddings) >= 10000:
+                print(f"  Training IVF index with {len(embeddings)} samples...")
+                self.index.train(embeddings)
+                self.index_trained = True
+            else:
+                print(f"  Warning: Only {len(embeddings)} samples, need ≥10000 for training. Index remains untrained.")
+                self.index_trained = False
+
+        # Re-add all embeddings to the rebuilt index
+        if self.index_type != 'IVF' or self.index_trained:
+            self.index.add(embeddings)
+            print(f"  Re-added {len(embeddings)} embeddings to index.")
+        else:
+            print(f"  Index not trained yet, embeddings will be added after training.")
+
         print("Index rebuild complete.")
 
     def size(self) -> int:

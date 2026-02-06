@@ -69,6 +69,7 @@ import argparse
 from pathlib import Path
 from tqdm import tqdm
 import warnings
+import mmap
 
 # Disable TF32 for cross-architecture compatibility
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -89,7 +90,16 @@ except ImportError:
 
 
 class TextDataset(Dataset):
-    """Efficient dataset for language modeling."""
+    """
+    Memory-efficient dataset for language modeling using streaming tokenization.
+
+    Tokenizes file in chunks without loading entire file into RAM.
+    Suitable for files up to ~100GB on systems with 16GB+ RAM.
+
+    For larger files, use:
+    - PreTokenizedDataset (scripts/preprocess_data.py)
+    - HuggingFace streaming datasets (--hf-dataset with --streaming)
+    """
 
     def __init__(self, file_path, tokenizer, seq_len=512, stride=None):
         """
@@ -103,17 +113,28 @@ class TextDataset(Dataset):
         self.seq_len = seq_len
         self.stride = stride or seq_len
 
-        print(f"Loading {file_path}...")
-        with open(file_path, 'r', encoding='utf-8') as f:
-            text = f.read()
+        print(f"Tokenizing {file_path} (streaming mode)...")
 
-        # Tokenize in chunks
-        chunk_size = 100000
+        # Get file size for progress bar
+        file_size = os.path.getsize(file_path)
+
+        # Tokenize in chunks without loading full file
+        chunk_size = 1_000_000  # 1MB text chunks
         all_tokens = []
-        for i in tqdm(range(0, len(text), chunk_size), desc="Tokenizing"):
-            chunk = text[i:i + chunk_size]
-            tokens = tokenizer.encode(chunk, add_special_tokens=False)
-            all_tokens.extend(tokens)
+
+        with open(file_path, 'r', encoding='utf-8') as f:
+            pbar = tqdm(total=file_size, desc="Tokenizing", unit='B', unit_scale=True)
+
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+
+                tokens = tokenizer.encode(chunk, add_special_tokens=False)
+                all_tokens.extend(tokens)
+                pbar.update(len(chunk.encode('utf-8')))
+
+            pbar.close()
 
         self.tokens = all_tokens
         print(f"Total tokens: {len(self.tokens):,}")
@@ -365,7 +386,9 @@ def validate(model, dataloader, tokenizer, device, rank=0):
         )
 
         total_loss += loss.item()
-        total_tokens += labels.numel()
+        # Count only non-padding tokens for accurate PPL calculation
+        non_pad_tokens = (labels != tokenizer.pad_token_id).sum().item()
+        total_tokens += non_pad_tokens
 
     avg_loss = total_loss / total_tokens
     perplexity = compute_perplexity(avg_loss)
@@ -1036,6 +1059,18 @@ Examples:
     parser.add_argument('--model-size', type=str, choices=['micro', 'tiny', 'small', 'base'], default='tiny',
                         help='Model size: micro (10M), tiny (100M), small (1B), base (12B) (default: tiny)')
 
+    # Training Stage
+    parser.add_argument('--stage', type=int, choices=[1, 2, 3], default=1,
+                        help='Training stage: 1=Base MoE pre-training (default), '
+                             '2=Memory fine-tuning (not yet implemented), '
+                             '3=RL meta-controller training')
+
+    # Stage 3 (RL) specific options
+    parser.add_argument('--rl-episodes', type=int, default=50000,
+                        help='Number of RL episodes for stage 3 (default: 50000)')
+    parser.add_argument('--rl-batch-size', type=int, default=256,
+                        help='RL batch size for stage 3 (default: 256)')
+
     # Training
     parser.add_argument('--epochs', type=int, default=20, help='Training epochs (default: 20)')
     parser.add_argument('--batch-size', type=int, default=8, help='Batch size per GPU (default: 8)')
@@ -1151,8 +1186,57 @@ Examples:
     if args.gpu_ids:
         os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, args.gpu_ids))
 
-    # Run training (Accelerate handles single/multi-GPU automatically)
-    train(args)
+    # Run training based on stage
+    if args.stage == 1:
+        # Stage 1: Base MoE pre-training (current implementation)
+        print(f"\n{'='*80}")
+        print("STAGE 1: Base MoE Pre-training")
+        print(f"{'='*80}\n")
+        train(args)
+
+    elif args.stage == 2:
+        # Stage 2: Memory fine-tuning (not yet implemented)
+        print(f"\n{'='*80}")
+        print("STAGE 2: Memory Fine-tuning")
+        print(f"{'='*80}\n")
+        raise NotImplementedError(
+            "Stage 2 (Memory Fine-tuning) is not yet implemented.\n\n"
+            "This stage will train:\n"
+            "  - Episodic memory (SSM-based, 8K context)\n"
+            "  - Semantic memory (FAISS vector DB, 1M+ entries)\n"
+            "  - Memory consolidation (episodic → semantic)\n\n"
+            "For now, you can:\n"
+            "  - Complete Stage 1 pre-training\n"
+            "  - Move directly to Stage 3 (RL training) with --stage 3\n\n"
+            "Track implementation progress: https://github.com/anthropics/hmst/issues"
+        )
+
+    elif args.stage == 3:
+        # Stage 3: RL training for meta-controller
+        print(f"\n{'='*80}")
+        print("STAGE 3: RL Training (Meta-Controller Optimization)")
+        print(f"{'='*80}\n")
+
+        if not args.resume:
+            raise ValueError(
+                "Stage 3 requires a pre-trained model from Stage 1.\n"
+                "Use: --resume checkpoints/stage1/best_model.pt --tokenizer-path checkpoints/stage1/tokenizer"
+            )
+
+        # Import RL training components
+        try:
+            from hmst.training.rl_train import train_rl_stage
+        except ImportError as e:
+            raise ImportError(
+                f"Failed to import RL training module: {e}\n\n"
+                "Stage 3 requires RL training implementation in hmst/training/rl_train.py"
+            )
+
+        # Run RL training
+        train_rl_stage(args)
+
+    else:
+        raise ValueError(f"Invalid stage: {args.stage}. Must be 1, 2, or 3.")
 
 
 if __name__ == '__main__':
