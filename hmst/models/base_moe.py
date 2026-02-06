@@ -175,13 +175,15 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
         expert_weights: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Optional[Dict]]:
         """
         Args:
             x: (batch, seq_len, d_model)
-            attention_mask: Optional mask
+            attn_mask: Causal mask (seq_len, seq_len) - float with -inf for masked positions
+            key_padding_mask: Padding mask (batch, seq_len) - bool (True=ignore padding)
             expert_weights: Optional routing weights from meta-controller
 
         Returns:
@@ -190,7 +192,11 @@ class TransformerBlock(nn.Module):
         """
         # Self-attention with pre-norm
         normed = self.attn_norm(x)
-        attn_out, _ = self.attn(normed, normed, normed, attn_mask=attention_mask)
+        attn_out, _ = self.attn(
+            normed, normed, normed,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask
+        )
         x = x + self.dropout(attn_out)
 
         # Feedforward
@@ -281,17 +287,27 @@ class BaseMoEModel(nn.Module):
         x = self.token_embedding(input_ids) + self.position_embedding(positions)
         x = self.dropout(x)
 
-        # Prepare attention mask
+        # Create causal mask (upper triangular with -inf)
+        # Shape: (seq_len, seq_len)
+        # Position i can attend to positions 0..i (not i+1..seq_len)
+        causal_mask = torch.triu(
+            torch.full((seq_len, seq_len), float('-inf'), device=input_ids.device),
+            diagonal=1
+        )
+
+        # Prepare padding mask (if provided)
+        # nn.MultiheadAttention expects True for positions to IGNORE
+        key_padding_mask = None
         if attention_mask is not None:
-            attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-            attention_mask = (1.0 - attention_mask) * -10000.0
+            # Input format: 1=valid token, 0=padding
+            key_padding_mask = (attention_mask == 0)
 
         # Forward through layers
         total_load_loss = 0.0
         hidden_states = [] if return_hidden else None
 
         for layer in self.layers:
-            x, aux_info = layer(x, attention_mask, expert_weights)
+            x, aux_info = layer(x, causal_mask, key_padding_mask, expert_weights)
 
             if aux_info is not None:
                 total_load_loss += aux_info['load_balance_loss']
