@@ -33,7 +33,10 @@ python demo.py              # Run demo (untrained model)
 # Demo (untrained, shows data flow only)
 python demo.py
 
-# Training (convenience mode with auto-split validation)
+# Training with HuggingFace datasets (no download, streaming)
+python train.py --hf-dataset roneneldan/TinyStories --hf-val-split validation --streaming --steps-per-epoch 1000
+
+# Training with local files (auto-split validation)
 python train.py data/train.txt --val-split 0.1
 
 # Production training (pre-split validation)
@@ -48,7 +51,20 @@ python inference.py checkpoints/train/best_model.pt --prompt "Once upon a time" 
 
 ## Training
 
-### Pre-tokenization (Recommended, 5-10x faster)
+### HuggingFace Datasets (Easiest for Public Datasets)
+
+```bash
+# Stream without downloading (no storage needed)
+python train.py --hf-dataset roneneldan/TinyStories --hf-val-split validation --streaming --steps-per-epoch 1000
+
+# Use only 10% of dataset
+python train.py --hf-dataset wikitext --hf-config wikitext-2-raw-v1 --hf-train-split "train[:10%]" --hf-val-split validation
+
+# Use first 1000 examples (testing)
+python train.py --hf-dataset openwebtext --hf-train-split "train[:1000]" --hf-val-split "train[1000:1200]"
+```
+
+### Pre-tokenization (Fastest for Local Data)
 
 ```bash
 # Preprocess once, train many times
@@ -60,6 +76,7 @@ python train.py data/tokenized/train_split --pretokenized --val-file data/tokeni
 ### Validation Options
 - `--val-split 0.1`: Auto-split for quick iteration (reshuffles each run)
 - `--val-file data/val.txt`: Pre-split for reproducible results (production)
+- `--hf-val-split validation`: Use HuggingFace dataset split
 
 ### Tokenizer Management
 First run creates tokenizer at `<output-dir>/tokenizer`. Reuse with `--tokenizer-path` for consistency.
@@ -94,7 +111,7 @@ python train.py data/train.txt \
 ```
 
 ### Key Training Options
-`--model-size` • `--val-split` / `--val-file` • `--gpu-ids` • `--gradient-accumulation-steps` • `--mixed-precision` • `--gradient-checkpointing` • `--use-8bit-optimizer` • `--eval-every` • `--patience` • `--tokenizer-path` • `--pretokenized`
+`--hf-dataset` • `--hf-train-split` • `--hf-val-split` • `--streaming` • `--model-size` • `--val-split` / `--val-file` • `--gpu-ids` • `--gradient-accumulation-steps` • `--mixed-precision` • `--gradient-checkpointing` • `--use-8bit-optimizer` • `--eval-every` • `--patience` • `--tokenizer-path` • `--pretokenized`
 
 See `python train.py --help` for full options.
 

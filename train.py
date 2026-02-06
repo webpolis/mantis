@@ -5,6 +5,7 @@ Supports:
 - Single-GPU and multi-GPU training (via HuggingFace Accelerate)
 - Proper tokenization (HuggingFace BPE or custom)
 - Pre-tokenized datasets (recommended for large-scale training)
+- HuggingFace datasets (direct from Hub with streaming support)
 - Auto-split validation (convenience mode) or pre-split validation (production mode)
 - Validation metrics and early stopping
 - Steps per epoch control
@@ -14,13 +15,19 @@ Supports:
 
 Usage:
 
-Convenience Mode (quick iteration):
+Local files (convenience mode):
    python train.py data/tokenized/train --pretokenized --val-split 0.1
 
-Production Mode (reproducible):
+Local files (production mode):
    python scripts/preprocess_data.py --input data/train.txt --output data/tokenized/train
    python scripts/split_dataset.py  # creates train_split and val
    python train.py data/tokenized/train_split --pretokenized --val-file data/tokenized/val
+
+HuggingFace datasets (no download):
+   python train.py --hf-dataset roneneldan/TinyStories --hf-val-split validation --streaming --steps-per-epoch 1000
+
+HuggingFace datasets (use only 10% of data):
+   python train.py --hf-dataset wikitext --hf-config wikitext-2-raw-v1 --hf-train-split "train[:10%]" --hf-val-split validation
 """
 
 import os
@@ -49,7 +56,7 @@ from hmst.configs.model_config import get_micro_config, get_tiny_config, get_sma
 from hmst.tokenizer import HMSTTokenizer
 
 try:
-    from datasets import load_from_disk
+    from datasets import load_from_disk, load_dataset
     DATASETS_AVAILABLE = True
 except ImportError:
     DATASETS_AVAILABLE = False
@@ -146,6 +153,138 @@ class PreTokenizedDataset(Dataset):
         }
 
 
+class HuggingFaceDataset(Dataset):
+    """
+    Dataset that loads directly from HuggingFace Hub.
+
+    Supports:
+    - Streaming (no download required)
+    - Dataset slicing (e.g., "train[:10%]" to use only 10% of data)
+    - On-the-fly tokenization
+    - Multiple dataset configurations
+
+    Note: Streaming mode uses sequential iteration, not random access.
+    DataLoader will automatically handle this correctly.
+    """
+
+    def __init__(self, dataset_name, split, tokenizer, seq_len=512,
+                 streaming=False, config_name=None, text_column='text'):
+        """
+        Args:
+            dataset_name: HuggingFace dataset name (e.g., "roneneldan/TinyStories")
+            split: Dataset split with optional slice (e.g., "train[:10%]", "validation")
+            tokenizer: Tokenizer instance
+            seq_len: Sequence length
+            streaming: If True, streams data without downloading (default: False)
+            config_name: Optional configuration name for datasets with multiple configs
+            text_column: Name of the text column (default: 'text')
+        """
+        if not DATASETS_AVAILABLE:
+            raise ImportError(
+                "datasets library required for HuggingFace datasets. "
+                "Install with: pip install datasets"
+            )
+
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.streaming = streaming
+        self.text_column = text_column
+
+        print(f"Loading HuggingFace dataset: {dataset_name}")
+        print(f"  Split: {split}")
+        print(f"  Streaming: {streaming}")
+        if config_name:
+            print(f"  Config: {config_name}")
+
+        # Load dataset
+        self.dataset = load_dataset(
+            dataset_name,
+            name=config_name,
+            split=split,
+            streaming=streaming
+        )
+
+        if not streaming:
+            dataset_len = len(self.dataset)
+            if dataset_len == 0:
+                raise ValueError(
+                    f"Dataset '{dataset_name}' split '{split}' is empty. "
+                    f"Check split name and slice syntax."
+                )
+
+            print(f"Loaded {dataset_len:,} examples")
+            # Pre-tokenize all examples for faster training
+            print("Pre-tokenizing dataset (this may take a moment)...")
+            self._tokenized_data = []
+            for idx in tqdm(range(dataset_len), desc="Tokenizing"):
+                self._tokenized_data.append(self._tokenize_example(self.dataset[idx]))
+            print(f"Created {len(self._tokenized_data):,} sequences")
+        else:
+            print("Streaming mode: data will be tokenized on-the-fly")
+            # For streaming, create an iterator that will be consumed sequentially
+            # PyTorch DataLoader will call __iter__ to get batches
+            self._tokenized_data = None
+            self._stream_iterator = None
+
+    def _tokenize_example(self, example):
+        """Tokenize a single example and create input/label pair."""
+        # Validate text column exists
+        if self.text_column not in example:
+            available = list(example.keys())
+            raise ValueError(
+                f"Text column '{self.text_column}' not found in dataset. "
+                f"Available columns: {available}"
+            )
+
+        text = example[self.text_column]
+        tokens = self.tokenizer.encode(text, add_special_tokens=False)
+
+        # Truncate or pad to seq_len + 1 (for input and label)
+        if len(tokens) < self.seq_len + 1:
+            # Pad with pad token
+            tokens = tokens + [self.tokenizer.pad_token_id] * (self.seq_len + 1 - len(tokens))
+        else:
+            # Truncate
+            tokens = tokens[:self.seq_len + 1]
+
+        # Create input_ids and labels for next-token prediction
+        input_ids = tokens[:-1]
+        labels = tokens[1:]
+
+        return {
+            'input_ids': torch.tensor(input_ids, dtype=torch.long),
+            'labels': torch.tensor(labels, dtype=torch.long)
+        }
+
+    def __len__(self):
+        if self.streaming:
+            # For streaming datasets, we can't know the length in advance
+            # Return a large number and rely on steps_per_epoch
+            return 10**9  # Effectively infinite
+        return len(self._tokenized_data)
+
+    def __getitem__(self, idx):
+        if self.streaming:
+            # Streaming mode: this should not be called with random access
+            # Instead, DataLoader should iterate via __iter__
+            # However, if called, we need to handle it gracefully
+            # This will only work efficiently for sequential access
+            if self._stream_iterator is None:
+                self._stream_iterator = iter(self.dataset)
+
+            # Try to get next item from iterator
+            try:
+                example = next(self._stream_iterator)
+                return self._tokenize_example(example)
+            except StopIteration:
+                # Reset iterator if we've exhausted it
+                self._stream_iterator = iter(self.dataset)
+                example = next(self._stream_iterator)
+                return self._tokenize_example(example)
+        else:
+            return self._tokenized_data[idx]
+
+
 def compute_perplexity(loss):
     """Compute perplexity from cross-entropy loss."""
     return math.exp(min(loss, 100))
@@ -223,7 +362,78 @@ def train(args):
     if accelerator.is_main_process:
         print("\nLoading datasets...")
 
-    if args.pretokenized:
+    # HuggingFace datasets (direct from Hub)
+    if args.hf_dataset:
+        if accelerator.is_main_process:
+            print("Using HuggingFace dataset from Hub")
+
+        # Determine split (with optional slicing)
+        train_split = args.hf_train_split or "train"
+
+        train_dataset = HuggingFaceDataset(
+            dataset_name=args.hf_dataset,
+            split=train_split,
+            tokenizer=tokenizer,
+            seq_len=args.seq_len,
+            streaming=args.streaming,
+            config_name=args.hf_config,
+            text_column=args.hf_text_column
+        )
+
+        # Validation dataset
+        if args.hf_val_split:
+            val_dataset = HuggingFaceDataset(
+                dataset_name=args.hf_dataset,
+                split=args.hf_val_split,
+                tokenizer=tokenizer,
+                seq_len=args.seq_len,
+                streaming=args.streaming,
+                config_name=args.hf_config,
+                text_column=args.hf_text_column
+            )
+        elif args.val_split and not args.streaming:
+            # Auto-split only works for non-streaming
+            if accelerator.is_main_process:
+                print(f"Auto-splitting dataset: {args.val_split*100:.0f}% for validation")
+            # Split the underlying HF dataset
+            split_dataset = train_dataset.dataset.train_test_split(
+                test_size=args.val_split,
+                seed=42
+            )
+
+            # Create new HuggingFaceDataset instances
+            train_dataset.dataset = split_dataset['train']
+            train_dataset._tokenized_data = []
+            for idx in tqdm(range(len(train_dataset.dataset)), desc="Tokenizing train"):
+                train_dataset._tokenized_data.append(train_dataset._tokenize_example(train_dataset.dataset[idx]))
+
+            val_dataset = HuggingFaceDataset.__new__(HuggingFaceDataset)
+            val_dataset.tokenizer = tokenizer
+            val_dataset.seq_len = args.seq_len
+            val_dataset.streaming = False
+            val_dataset.text_column = args.hf_text_column
+            val_dataset.dataset = split_dataset['test']
+            val_dataset._tokenized_data = []
+            for idx in tqdm(range(len(val_dataset.dataset)), desc="Tokenizing val"):
+                val_dataset._tokenized_data.append(val_dataset._tokenize_example(val_dataset.dataset[idx]))
+
+            if accelerator.is_main_process:
+                print(f"Train examples: {len(train_dataset.dataset):,}")
+                print(f"Val examples: {len(val_dataset.dataset):,}")
+        else:
+            val_dataset = None
+
+        # Warn if streaming without steps_per_epoch
+        if args.streaming and not args.steps_per_epoch:
+            print("\n⚠️  WARNING: Streaming mode without --steps-per-epoch will run indefinitely!")
+            print("   Recommend: --steps-per-epoch 1000 (or appropriate value)")
+
+        # Warn about num_workers in streaming mode
+        if args.streaming and args.num_workers > 0:
+            print("\n⚠️  WARNING: Streaming with num_workers > 0 may cause issues.")
+            print("   If you encounter errors, try --num-workers 0")
+
+    elif args.pretokenized:
         if accelerator.is_main_process:
             print("Using pre-tokenized datasets (fast!)")
         train_dataset = PreTokenizedDataset(args.train_file)
@@ -270,10 +480,17 @@ def train(args):
         else:
             val_dataset = TextDataset(args.val_file, tokenizer, args.seq_len) if args.val_file else None
 
+    # Determine shuffle setting - streaming datasets should not shuffle in DataLoader
+    use_shuffle = True
+    if args.hf_dataset and args.streaming:
+        use_shuffle = False
+        if accelerator.is_main_process:
+            print("Note: Shuffle disabled for streaming mode (dataset streams in sequential order)")
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=use_shuffle,
         num_workers=args.num_workers,
         pin_memory=True
     )
@@ -568,6 +785,37 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+
+  # HUGGINGFACE DATASETS (recommended for public datasets)
+  # ====================================================
+
+  # Stream dataset without downloading (no storage needed!)
+  python train.py --hf-dataset roneneldan/TinyStories \\
+      --hf-val-split validation \\
+      --streaming \\
+      --steps-per-epoch 1000 \\
+      --epochs 10
+
+  # Use only 10% of dataset (avoids downloading full dataset)
+  python train.py --hf-dataset wikitext \\
+      --hf-config wikitext-2-raw-v1 \\
+      --hf-train-split "train[:10%]" \\
+      --hf-val-split validation
+
+  # Use first 1000 examples (great for testing)
+  python train.py --hf-dataset openwebtext \\
+      --hf-train-split "train[:1000]" \\
+      --hf-val-split "train[1000:1200]"
+
+  # Auto-split validation from HuggingFace dataset (no validation split available)
+  python train.py --hf-dataset c4 \\
+      --hf-config en \\
+      --hf-train-split "train[:1%]" \\
+      --val-split 0.1
+
+  # LOCAL FILES (when you have your own data)
+  # =========================================
+
   # CONVENIENCE MODE: Auto-split validation (quick iteration)
   python train.py data/tokenized/train --pretokenized --val-split 0.1
 
@@ -578,6 +826,9 @@ Examples:
 
   # Single/Multi-GPU training (auto-detected, raw text)
   python train.py data/train.txt --val-split 0.1
+
+  # ADVANCED OPTIONS
+  # ===============
 
   # Use specific GPUs (e.g., only GPU 0)
   python train.py data/tokenized/train --pretokenized --gpu-ids 0 --val-split 0.1
@@ -597,8 +848,8 @@ Examples:
     )
 
     # Data
-    parser.add_argument('train_file', type=str,
-                       help='Training data: text file or pre-tokenized dataset directory')
+    parser.add_argument('train_file', type=str, nargs='?',
+                       help='Training data: text file or pre-tokenized dataset directory (not needed with --hf-dataset)')
     parser.add_argument('--val-file', type=str,
                        help='Validation data: text file or pre-tokenized dataset directory')
     parser.add_argument('--val-split', type=float,
@@ -608,6 +859,24 @@ Examples:
                         help='Output directory (default: ./checkpoints/train)')
     parser.add_argument('--pretokenized', action='store_true',
                         help='Use pre-tokenized datasets (MUCH faster, recommended for large-scale training)')
+
+    # HuggingFace datasets
+    parser.add_argument('--hf-dataset', type=str,
+                        help='HuggingFace dataset name (e.g., "roneneldan/TinyStories"). '
+                             'Loads directly from Hub without needing local files.')
+    parser.add_argument('--hf-train-split', type=str,
+                        help='Train split with optional slice (e.g., "train[:10%%]", "train[:1000]"). '
+                             'Default: "train"')
+    parser.add_argument('--hf-val-split', type=str,
+                        help='Validation split (e.g., "validation", "test[:10%%]"). '
+                             'If not provided, uses --val-split for auto-splitting.')
+    parser.add_argument('--hf-config', type=str,
+                        help='Dataset configuration name (for datasets with multiple configs)')
+    parser.add_argument('--hf-text-column', type=str, default='text',
+                        help='Name of the text column (default: "text")')
+    parser.add_argument('--streaming', action='store_true',
+                        help='Stream dataset without downloading (requires --steps-per-epoch). '
+                             'Useful for very large datasets to avoid storage issues.')
 
     # Tokenizer
     parser.add_argument('--tokenizer-path', type=str,
@@ -654,13 +923,40 @@ Examples:
 
     args = parser.parse_args()
 
-    # Validate inputs exist
-    if not os.path.exists(args.train_file):
-        print(f"Error: Training {'dataset' if args.pretokenized else 'file'} not found: {args.train_file}")
-        return
-    if args.val_file and not os.path.exists(args.val_file):
-        print(f"Error: Validation {'dataset' if args.pretokenized else 'file'} not found: {args.val_file}")
-        return
+    # Validate data source
+    if args.hf_dataset:
+        # Using HuggingFace dataset
+        if args.train_file:
+            print("Warning: --hf-dataset provided, ignoring train_file argument")
+        if args.pretokenized:
+            print("Error: Cannot use --pretokenized with --hf-dataset")
+            return
+        if not DATASETS_AVAILABLE:
+            print("Error: HuggingFace datasets requires 'datasets' library. Install with: pip install datasets")
+            return
+        if args.streaming and args.val_split:
+            print("Error: --val-split not supported with --streaming. Use --hf-val-split instead.")
+            return
+        if args.val_file:
+            print("Error: Cannot use --val-file with --hf-dataset. Use --hf-val-split instead.")
+            return
+    else:
+        # Using local files
+        if not args.train_file:
+            print("Error: Either train_file or --hf-dataset must be provided")
+            return
+        if not os.path.exists(args.train_file):
+            print(f"Error: Training {'dataset' if args.pretokenized else 'file'} not found: {args.train_file}")
+            return
+        if args.val_file and not os.path.exists(args.val_file):
+            print(f"Error: Validation {'dataset' if args.pretokenized else 'file'} not found: {args.val_file}")
+            return
+        if args.streaming:
+            print("Error: --streaming only works with --hf-dataset")
+            return
+        if args.hf_train_split or args.hf_val_split or args.hf_config or args.hf_text_column != 'text':
+            print("Error: HuggingFace-specific arguments require --hf-dataset")
+            return
 
     # Validate val-split arguments
     if args.val_split and args.val_file:

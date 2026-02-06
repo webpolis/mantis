@@ -126,10 +126,13 @@ class InferenceConfig:
 class HMSTConfig:
     """Complete HMST Configuration."""
     base_moe: BaseMoEConfig = field(default_factory=BaseMoEConfig)
-    meta_controller: MetaControllerConfig = field(default_factory=MetaControllerConfig)
+    meta_controller: MetaControllerConfig = field(
+        default_factory=MetaControllerConfig)
     critic: CriticConfig = field(default_factory=CriticConfig)
-    episodic_memory: EpisodicMemoryConfig = field(default_factory=EpisodicMemoryConfig)
-    semantic_memory: SemanticMemoryConfig = field(default_factory=SemanticMemoryConfig)
+    episodic_memory: EpisodicMemoryConfig = field(
+        default_factory=EpisodicMemoryConfig)
+    semantic_memory: SemanticMemoryConfig = field(
+        default_factory=SemanticMemoryConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
 
@@ -211,4 +214,12 @@ def get_large_config() -> HMSTConfig:
     config.base_moe.n_layers = 32
     config.base_moe.d_ff = 16384
     config.base_moe.n_experts = 16
+    return config
+
+
+def get_extmem_config() -> HMSTConfig:
+    """Extended episodic memory"""
+    config = HMSTConfig()
+    config.episodic_memory.max_seq_len = 32768  # 32K tokens
+    config.base_moe.max_seq_len = 32768  # Match the base model too
     return config

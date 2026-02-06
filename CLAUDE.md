@@ -37,12 +37,63 @@ python demo.py
 
 ### Training
 
-**Two Training Modes:**
+**Three Data Source Options:**
 
-1. **Convenience Mode** (quick iteration): Auto-split validation from training data
-2. **Production Mode** (reproducible): Pre-split datasets for consistent evaluation
+1. **HuggingFace Datasets** (easiest): Load directly from HuggingFace Hub
+2. **Pre-tokenized Local Data** (fastest): Pre-tokenize once, train many times
+3. **Raw Text Files** (simplest): On-the-fly tokenization from local files
 
-#### RECOMMENDED: Pre-tokenize + Production Mode
+#### OPTION 1: HuggingFace Datasets (Recommended for Public Datasets)
+
+Load datasets directly from HuggingFace Hub without downloading:
+
+```bash
+# Stream dataset without downloading (no storage needed!)
+python train.py --hf-dataset roneneldan/TinyStories \
+    --hf-val-split validation \
+    --streaming \
+    --steps-per-epoch 1000 \
+    --epochs 10
+
+# Use only 10% of dataset (avoids downloading full dataset)
+python train.py --hf-dataset wikitext \
+    --hf-config wikitext-2-raw-v1 \
+    --hf-train-split "train[:10%]" \
+    --hf-val-split validation
+
+# Use first 1000 examples (great for quick testing)
+python train.py --hf-dataset openwebtext \
+    --hf-train-split "train[:1000]" \
+    --hf-val-split "train[1000:1200]"
+
+# Auto-split validation from HuggingFace dataset
+python train.py --hf-dataset c4 \
+    --hf-config en \
+    --hf-train-split "train[:1%]" \
+    --val-split 0.1
+
+# Custom text column (default is 'text')
+python train.py --hf-dataset my-dataset \
+    --hf-text-column content \
+    --hf-val-split validation
+```
+
+**HuggingFace Dataset Features:**
+- `--streaming`: Stream data without downloading (requires `--steps-per-epoch`)
+- `--hf-train-split`: Specify split with optional slice (e.g., `"train[:10%]"`, `"train[:1000]"`)
+- `--hf-val-split`: Validation split (e.g., `"validation"`, `"test[:10%]"`)
+- `--hf-config`: For datasets with multiple configurations
+- `--hf-text-column`: Name of text column (default: `'text'`)
+- `--val-split`: Auto-split validation (only works without `--streaming`)
+
+**Popular Datasets:**
+- `roneneldan/TinyStories` - Small stories (good for testing)
+- `wikitext` - Wikipedia text (needs `--hf-config wikitext-2-raw-v1`)
+- `openwebtext` - Web text corpus
+- `c4` - Colossal Clean Crawled Corpus (needs `--hf-config en`)
+- `EleutherAI/pile` - Large diverse text corpus
+
+#### OPTION 2: Pre-tokenized Local Data (Fastest Training)
 
 Pre-tokenization is 5-10x faster and used by all major LLM projects (GPT, LLaMA, etc.):
 
@@ -66,7 +117,9 @@ python train.py data/tokenized/train \
     --output-dir checkpoints/my_run
 ```
 
-**Alternative: On-the-Fly Tokenization** (slower, for small datasets):
+#### OPTION 3: Raw Text Files (On-the-Fly Tokenization)
+
+Slower but simpler for small datasets:
 
 ```bash
 # Basic single-GPU training with auto-split validation
