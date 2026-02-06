@@ -23,6 +23,8 @@ from .inference import HMSTInferenceEngine
 
 from .configs.model_config import (
     HMSTConfig,
+    get_micro_config,
+    get_tiny_config,
     get_small_config,
     get_base_config,
     get_large_config
@@ -38,6 +40,8 @@ __all__ = [
     'MemoryConsolidator',
     'HMSTInferenceEngine',
     'HMSTConfig',
+    'get_micro_config',
+    'get_tiny_config',
     'get_small_config',
     'get_base_config',
     'get_large_config',

@@ -116,6 +116,7 @@ python train.py data/train.txt \
 - Ensures vocabulary consistency across training runs
 
 **Model Sizes**:
+- `micro`: ~10M parameters (ultra-fast testing, TinyStories dataset)
 - `tiny`: ~100M parameters (testing/development)
 - `small`: ~1B parameters (experimentation)
 - `base`: ~12B parameters (production)
@@ -271,7 +272,11 @@ Current implementation includes a BPE tokenizer but falls back to placeholder to
 ```python
 from hmst import (
     HMSTInferenceEngine,
+    get_micro_config,
+    get_tiny_config,
+    get_small_config,
     get_base_config,
+    get_large_config,
     BaseMoEModel,
     MetaController,
     CriticModel,
