@@ -86,6 +86,9 @@ class TrainingConfig:
     finetune_batch_size: int = 512
     finetune_steps: int = 20000
     finetune_warmup: int = 1000
+    episodic_loss_weight: float = 1.0
+    semantic_loss_weight: float = 0.5
+    consolidation_loss_weight: float = 0.3
 
     # Stage 3: RL training
     rl_lr: float = 1e-5
