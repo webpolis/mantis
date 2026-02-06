@@ -58,10 +58,14 @@ except Exception:
     pass
 
 import torch
+import warnings
 
 # Disable TF32 for compatibility
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
+
+# Suppress cuBLAS recovery warnings (these are expected when workaround is applied)
+warnings.filterwarnings('ignore', message='.*gemm_and_bias error: CUBLAS_STATUS_NOT_INITIALIZED.*')
 
 import torch.nn.functional as F
 from hmst.models import BaseMoEModel
