@@ -303,11 +303,8 @@ class BaseMoEModel(nn.Module):
         x = self.token_embedding(input_ids) + self.position_embedding(positions)
         x = self.dropout(x)
 
-        # Create causal mask (upper triangular with -inf)
-        # Shape: (seq_len, seq_len)
-        # Position i can attend to positions 0..i (not i+1..seq_len)
         causal_mask = torch.triu(
-            torch.full((seq_len, seq_len), float('-inf'), device=input_ids.device),
+            torch.full((seq_len, seq_len), float('-inf'), device=x.device, dtype=x.dtype),
             diagonal=1
         )
 
