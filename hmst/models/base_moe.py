@@ -235,6 +235,7 @@ class BaseMoEModel(nn.Module):
 
         self.d_model = d_model
         self.max_seq_len = max_seq_len
+        self.gradient_checkpointing = False
 
         # Token embeddings
         self.token_embedding = nn.Embedding(vocab_size, d_model)
@@ -260,6 +261,19 @@ class BaseMoEModel(nn.Module):
         """Initialize weights."""
         nn.init.normal_(self.token_embedding.weight, std=0.02)
         nn.init.normal_(self.position_embedding.weight, std=0.02)
+
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing for memory efficiency."""
+        self.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing."""
+        self.gradient_checkpointing = False
+
+    @staticmethod
+    def _checkpoint_forward(layer, x, causal_mask, key_padding_mask, expert_weights):
+        """Wrapper for gradient checkpointing."""
+        return layer(x, causal_mask, key_padding_mask, expert_weights)
 
     def forward(
         self,
@@ -307,7 +321,15 @@ class BaseMoEModel(nn.Module):
         hidden_states = [] if return_hidden else None
 
         for layer in self.layers:
-            x, aux_info = layer(x, causal_mask, key_padding_mask, expert_weights)
+            if self.gradient_checkpointing and self.training:
+                # Use gradient checkpointing to save memory
+                x, aux_info = torch.utils.checkpoint.checkpoint(
+                    self._checkpoint_forward,
+                    layer, x, causal_mask, key_padding_mask, expert_weights,
+                    use_reentrant=False
+                )
+            else:
+                x, aux_info = layer(x, causal_mask, key_padding_mask, expert_weights)
 
             if aux_info is not None:
                 total_load_loss += aux_info['load_balance_loss']
