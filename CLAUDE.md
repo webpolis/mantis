@@ -242,6 +242,26 @@ python train.py data/train.txt \
 - Combine with `--mixed-precision`, small `--batch-size`, and `--gradient-accumulation-steps`
 - Example: Small model (~1B) fits in 12GB with all optimizations enabled
 
+**DeepSpeed ZeRO-3** (for mixed VRAM multi-GPU setups):
+- `--deepspeed`: Enable ZeRO-3 partitioning across GPUs (requires 2+ GPUs, `pip install deepspeed`)
+- `--cpu-offload`: Offload optimizer/parameters to CPU (requires `--deepspeed`, slower but lower GPU memory)
+- Automatically handles mixed VRAM (e.g., 12GB + 6GB GPUs)
+- Incompatible with `--use-8bit-optimizer` (DeepSpeed manages optimizer)
+- Compatible with `--gradient-checkpointing` for additional memory savings
+
+Example:
+```bash
+accelerate launch train.py data/train.txt \
+    --deepspeed \
+    --cpu-offload \
+    --model-size small \
+    --batch-size 1 \
+    --gradient-accumulation-steps 4 \
+    --mixed-precision \
+    --gradient-checkpointing \
+    --val-split 0.1
+```
+
 **Stage 3: RL Training** (meta-controller optimization):
 ```bash
 python -m training.rl_train \

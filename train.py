@@ -33,8 +33,6 @@ HuggingFace datasets (use only 10% of data):
 import os
 import subprocess
 
-# Fix for mixed GPU architectures (e.g., RTX 2060 Turing + RTX 3060 Ampere)
-# MUST be set before any CUDA/PyTorch imports
 os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ["NCCL_IB_DISABLE"] = "1"
 
@@ -376,14 +374,45 @@ def validate(model, dataloader, tokenizer, device, rank=0):
 
 
 def train(args):
-    """Unified training with Accelerate (handles single/multi-GPU automatically)."""
+    deepspeed_plugin = None
+    if args.deepspeed:
+        try:
+            from accelerate import DeepSpeedPlugin
+
+            if args.cpu_offload:
+                deepspeed_plugin = DeepSpeedPlugin(
+                    zero_stage=2,
+                    offload_optimizer_device="cpu",
+                    zero3_init_flag=False,
+                )
+            else:
+                deepspeed_plugin = DeepSpeedPlugin(
+                    zero_stage=2,
+                    zero3_init_flag=False,
+                )
+            if torch.cuda.device_count() < 2:
+                print("Warning: --deepspeed requires multiple GPUs, ignoring flag")
+                deepspeed_plugin = None
+        except ImportError:
+            print("Warning: DeepSpeed not installed, ignoring --deepspeed flag")
+            deepspeed_plugin = None
+    elif args.cpu_offload:
+        print("Warning: --cpu-offload requires --deepspeed, ignoring flag")
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision='fp16' if args.mixed_precision else 'no',
+        deepspeed_plugin=deepspeed_plugin,
         log_with=None
     )
 
-    # Tokenizer
+    use_deepspeed = accelerator.state.deepspeed_plugin is not None
+
+    if use_deepspeed and accelerator.is_main_process:
+        print("\n✓ DeepSpeed ZeRO-3 enabled")
+        if args.cpu_offload:
+            print("✓ CPU offloading enabled")
+
     tokenizer = load_or_create_tokenizer(args.tokenizer_path)
 
     # Datasets
@@ -566,21 +595,15 @@ def train(args):
         n_experts=config.base_moe.n_experts,
         top_k=config.base_moe.top_k,
         max_seq_len=config.base_moe.max_seq_len,
-        dropout=config.base_moe.dropout
+        dropout=config.base_moe.dropout,
+        load_balance_weight=config.base_moe.load_balance_weight
     )
-
-    # Enable gradient checkpointing for large models
-    if args.gradient_checkpointing and hasattr(model, 'gradient_checkpointing_enable'):
-        model.gradient_checkpointing_enable()
-        if accelerator.is_main_process:
-            print("✓ Gradient checkpointing enabled (trades compute for memory)")
 
     if accelerator.is_main_process:
         param_counts = model.count_parameters()
         print(f"Model: {param_counts['total'] / 1e6:.2f}M total, {param_counts['active'] / 1e6:.2f}M active")
 
-    # Optimizer (with optional 8-bit for memory savings)
-    if args.use_8bit_optimizer:
+    if args.use_8bit_optimizer and not use_deepspeed:
         try:
             import bitsandbytes as bnb
             optimizer = bnb.optim.AdamW8bit(
@@ -609,6 +632,9 @@ def train(args):
             betas=(0.9, 0.95)
         )
 
+    if use_deepspeed and accelerator.is_main_process:
+        print("✓ Using DeepSpeed ZeRO optimizer")
+
     # Scheduler (adjusted for gradient accumulation)
     steps_per_epoch = args.steps_per_epoch or len(train_loader)
     effective_steps_per_epoch = steps_per_epoch // args.gradient_accumulation_steps
@@ -634,6 +660,13 @@ def train(args):
 
     if val_loader:
         val_loader = accelerator.prepare(val_loader)
+
+    if args.gradient_checkpointing:
+        unwrapped_model = accelerator.unwrap_model(model)
+        if hasattr(unwrapped_model, 'gradient_checkpointing_enable'):
+            unwrapped_model.gradient_checkpointing_enable()
+            if accelerator.is_main_process:
+                print("✓ Gradient checkpointing enabled (trades compute for memory)")
 
     # Resume from checkpoint if specified (AFTER accelerator.prepare())
     start_epoch = 0
@@ -691,13 +724,19 @@ def train(args):
         if args.resume:
             print(f"Resuming training on {accelerator.num_processes} GPU(s): epochs {start_epoch+1}-{args.epochs}")
         else:
-            print(f"Training on {accelerator.num_processes} GPU(s): {args.epochs} epochs")
+            gpu_desc = f"{accelerator.num_processes} GPU(s)"
+            if use_deepspeed:
+                gpu_desc += " with DeepSpeed ZeRO-3"
+            print(f"Training on {gpu_desc}: {args.epochs} epochs")
         if args.steps_per_epoch:
             print(f"Steps per epoch: {args.steps_per_epoch}")
         print(f"{'='*80}\n")
 
     global_step = start_global_step
     optimizer_step = start_step
+
+    if accelerator.is_main_process:
+        print("Starting training loop...")
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
@@ -715,11 +754,18 @@ def train(args):
             if args.steps_per_epoch and epoch_steps >= args.steps_per_epoch:
                 break
 
+            if epoch_steps == 0 and accelerator.is_main_process:
+                print("Got first batch, starting forward pass...")
+
             with accelerator.accumulate(model):
                 input_ids = batch['input_ids']
                 labels = batch['labels']
 
                 output = model(input_ids)
+
+                if epoch_steps == 0 and accelerator.is_main_process:
+                    print("Forward pass complete, computing loss...")
+
                 logits = output['logits']
                 load_balance_loss = output.get('load_balance_loss', 0.0)
 
@@ -1033,6 +1079,10 @@ Examples:
                         help='Enable gradient checkpointing (trades compute for memory, essential for large models)')
     parser.add_argument('--use-8bit-optimizer', action='store_true',
                         help='Use 8-bit AdamW optimizer (saves ~50%% optimizer memory, requires bitsandbytes)')
+    parser.add_argument('--deepspeed', action='store_true',
+                        help='Enable DeepSpeed ZeRO-3 for multi-GPU training (auto-detected, handles mixed VRAM)')
+    parser.add_argument('--cpu-offload', action='store_true',
+                        help='Offload DeepSpeed optimizer and parameters to CPU (requires --deepspeed, slower but lower GPU memory)')
 
     args = parser.parse_args()
 
