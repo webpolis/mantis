@@ -65,33 +65,31 @@ First run creates tokenizer at `<output-dir>/tokenizer`. Reuse with `--tokenizer
 ### Common Training Patterns
 
 ```bash
-# Multi-GPU with mixed precision
-python train.py data/train.txt --multi-gpu --mixed-precision --val-split 0.1
+# Multi-GPU with mixed precision (auto-detected)
+python train.py data/train.txt --mixed-precision --val-split 0.1
 
 # Specific GPUs only
-python train.py data/train.txt --multi-gpu --gpu-ids 0 2 --val-split 0.1
+python train.py data/train.txt --gpu-ids 0 2 --val-split 0.1
 
 # Mixed VRAM GPUs (e.g., 12GB + 6GB): use gradient accumulation
 python train.py data/train.txt \
-    --multi-gpu \
     --batch-size 2 \
     --gradient-accumulation-steps 4 \
     --mixed-precision \
     --val-split 0.1
-# Effective batch: 2 × 4 × 2 GPUs = 16
+# Effective batch: 2 × 4 × N_GPUs
 
 # Full production config
 python train.py data/train.txt \
     --val-file data/val.txt \
     --model-size small \
-    --multi-gpu \
     --mixed-precision \
     --eval-every 500 \
     --patience 3
 ```
 
 ### Key Training Options
-`--model-size` • `--val-split` / `--val-file` • `--multi-gpu` • `--gpu-ids` • `--gradient-accumulation-steps` • `--mixed-precision` • `--eval-every` • `--patience` • `--tokenizer-path` • `--pretokenized`
+`--model-size` • `--val-split` / `--val-file` • `--gpu-ids` • `--gradient-accumulation-steps` • `--mixed-precision` • `--eval-every` • `--patience` • `--tokenizer-path` • `--pretokenized`
 
 See `python train.py --help` for full options.
 
@@ -129,7 +127,7 @@ hmst/
 **Mixed VRAM GPUs**: Use `--gradient-accumulation-steps 4 --batch-size 2`
 **Slow tokenization**: Pre-tokenize with `scripts/preprocess_data.py` (5-10x faster)
 **Tokenizer mismatch**: Reuse with `--tokenizer-path` when continuing training
-**Multi-GPU issues**: Check NCCL installation and `nvidia-smi`
+**Multi-GPU issues**: Check `nvidia-smi` and available VRAM
 **FAISS errors**: Requires ~10K embeddings before index training
 
 ## Validation Requirements

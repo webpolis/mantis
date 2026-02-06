@@ -83,17 +83,16 @@ python train.py data/train.txt \
 # Control steps per epoch (useful for large datasets or quick iterations)
 python train.py data/train.txt --steps-per-epoch 1000 --epochs 50 --val-split 0.1
 
-# Multi-GPU training (DDP, all GPUs)
-python train.py data/train.txt --multi-gpu --batch-size 4 --val-split 0.1
+# Multi-GPU training (auto-detected)
+python train.py data/train.txt --batch-size 4 --val-split 0.1
 
 # Multi-GPU with specific GPUs only (useful for shared systems)
-python train.py data/train.txt --multi-gpu --gpu-ids 0 2 --val-split 0.1
+python train.py data/train.txt --gpu-ids 0 2 --val-split 0.1
 
 # Mixed VRAM GPUs (e.g., 12GB + 6GB): use gradient accumulation
 # Effective batch size per GPU: 2 × 4 = 8
-# Total effective batch size: 8 × 2 GPUs = 16
+# Total effective batch size: 8 × N_GPUs
 python train.py data/train.txt \
-    --multi-gpu \
     --gradient-accumulation-steps 4 \
     --batch-size 2 \
     --mixed-precision \
@@ -143,10 +142,11 @@ python train.py data/train.txt \
 - Example: `--batch-size 2 --gradient-accumulation-steps 4` → effective batch size of 8 per GPU
 
 **GPU Selection**:
-- `--multi-gpu`: Use all available GPUs
-- `--gpu-ids 0 2`: Use only specific GPUs (e.g., GPU 0 and GPU 2)
-- Script automatically detects heterogeneous VRAM and warns with recommendations
-- For mixed VRAM, use gradient accumulation or select only the larger GPU
+- By default: Uses all available GPUs automatically (via Accelerate)
+- `--gpu-ids 0`: Use only GPU 0
+- `--gpu-ids 0 2`: Use specific GPUs (e.g., GPU 0 and GPU 2)
+- Accelerate handles mixed architectures (e.g., Turing + Ampere) automatically
+- For mixed VRAM, use gradient accumulation
 
 **Stage 3: RL Training** (meta-controller optimization):
 ```bash
