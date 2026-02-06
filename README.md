@@ -89,7 +89,7 @@ python train.py data/train.txt \
 ```
 
 ### Key Training Options
-`--model-size` • `--val-split` / `--val-file` • `--gpu-ids` • `--gradient-accumulation-steps` • `--mixed-precision` • `--eval-every` • `--patience` • `--tokenizer-path` • `--pretokenized`
+`--model-size` • `--val-split` / `--val-file` • `--gpu-ids` • `--gradient-accumulation-steps` • `--mixed-precision` • `--gradient-checkpointing` • `--use-8bit-optimizer` • `--eval-every` • `--patience` • `--tokenizer-path` • `--pretokenized`
 
 See `python train.py --help` for full options.
 
@@ -123,7 +123,7 @@ hmst/
 
 ## Troubleshooting
 
-**OOM**: Reduce `--batch-size`, add `--mixed-precision`, use `--gradient-accumulation-steps`
+**OOM**: Reduce `--batch-size`, add `--mixed-precision`, `--gradient-checkpointing`, `--use-8bit-optimizer`, or use `--gradient-accumulation-steps`
 **Mixed VRAM GPUs**: Use `--gradient-accumulation-steps 4 --batch-size 2`
 **Slow tokenization**: Pre-tokenize with `scripts/preprocess_data.py` (5-10x faster)
 **Tokenizer mismatch**: Reuse with `--tokenizer-path` when continuing training
