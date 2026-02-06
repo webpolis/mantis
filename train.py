@@ -23,16 +23,26 @@ Production Mode (reproducible):
    python train.py data/tokenized/train_split --pretokenized --val-file data/tokenized/val
 """
 
+import os
+
+# Fix for mixed GPU architectures (e.g., RTX 2060 Turing + RTX 3060 Ampere)
+# MUST be set before any CUDA/PyTorch imports
+os.environ["NCCL_P2P_DISABLE"] = "1"
+os.environ["NCCL_IB_DISABLE"] = "1"
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from accelerate import Accelerator
-import os
 import math
 import argparse
 from pathlib import Path
 from tqdm import tqdm
+
+# Disable TF32 for cross-architecture compatibility
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
 
 from hmst.models import BaseMoEModel
 from hmst.configs.model_config import get_micro_config, get_tiny_config, get_small_config, get_base_config
@@ -303,17 +313,45 @@ def train(args):
         dropout=config.base_moe.dropout
     )
 
+    # Enable gradient checkpointing for large models
+    if args.gradient_checkpointing and hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
+        if accelerator.is_main_process:
+            print("✓ Gradient checkpointing enabled (trades compute for memory)")
+
     if accelerator.is_main_process:
         param_counts = model.count_parameters()
         print(f"Model: {param_counts['total'] / 1e6:.2f}M total, {param_counts['active'] / 1e6:.2f}M active")
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-        betas=(0.9, 0.95)
-    )
+    # Optimizer (with optional 8-bit for memory savings)
+    if args.use_8bit_optimizer:
+        try:
+            import bitsandbytes as bnb
+            optimizer = bnb.optim.AdamW8bit(
+                model.parameters(),
+                lr=args.learning_rate,
+                weight_decay=args.weight_decay,
+                betas=(0.9, 0.95)
+            )
+            if accelerator.is_main_process:
+                print("✓ Using 8-bit AdamW optimizer (saves ~50% optimizer memory)")
+        except ImportError:
+            if accelerator.is_main_process:
+                print("⚠️  bitsandbytes not installed, falling back to standard AdamW")
+                print("   Install with: pip install bitsandbytes")
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=args.learning_rate,
+                weight_decay=args.weight_decay,
+                betas=(0.9, 0.95)
+            )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+            betas=(0.9, 0.95)
+        )
 
     # Scheduler (adjusted for gradient accumulation)
     steps_per_epoch = args.steps_per_epoch or len(train_loader)
@@ -609,6 +647,10 @@ Examples:
                         help='Gradient accumulation steps. Effective batch per GPU = batch_size × accumulation_steps. '
                              'Essential for mixed VRAM GPUs (e.g., 12GB + 6GB) (default: 1)')
     parser.add_argument('--mixed-precision', action='store_true', help='Use mixed precision (FP16)')
+    parser.add_argument('--gradient-checkpointing', action='store_true',
+                        help='Enable gradient checkpointing (trades compute for memory, essential for large models)')
+    parser.add_argument('--use-8bit-optimizer', action='store_true',
+                        help='Use 8-bit AdamW optimizer (saves ~50%% optimizer memory, requires bitsandbytes)')
 
     args = parser.parse_args()
 
