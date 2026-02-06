@@ -206,6 +206,11 @@ python inference.py checkpoints/train/best_model.pt \
     --top-p 0.95 \
     --top-k 40 \
     --max-length 100
+
+# Quantized inference (2-4x faster)
+python inference.py checkpoints/train/best_model.pt \
+    --prompt "Hello world" \
+    --quantize int8
 ```
 
 **Generation Parameters**:
@@ -213,6 +218,7 @@ python inference.py checkpoints/train/best_model.pt \
 - `--temperature`: Sampling temperature, 0=greedy (default: 0.8)
 - `--top-p`: Nucleus sampling threshold (default: 0.9)
 - `--top-k`: Top-k sampling threshold (default: 50)
+- `--quantize`: Quantization mode (`int8` for 2-4x speedup, `float16` for 2x speedup on GPU)
 - `--output`: Save results to file
 
 **Interactive Commands**:
