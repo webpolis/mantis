@@ -255,6 +255,13 @@ Note: Stage 2 (memory fine-tuning) is not yet implemented.
 
 Use `inference.py` for production text generation with trained models. Supports interactive, single-prompt, and batch modes.
 
+**RTX 3060 Known Issue:** If you encounter `CUBLAS_STATUS_NOT_INITIALIZED` errors on RTX 3060 GPUs, use these environment variables to force legacy cuBLAS:
+```bash
+export CUBLAS_WORKSPACE_CONFIG=:0:0
+export TORCH_BLAS_PREFER_CUBLASLT=0
+```
+This works around a cuBLASLt kernel bug with large vocabulary matrices (128K) on Ampere GPUs.
+
 ```bash
 # Interactive mode (default)
 python inference.py checkpoints/train/best_model.pt
