@@ -1,7 +1,5 @@
 # HMST: Hierarchical Memory-State Transformer
 
-> **⚠️ Research Prototype**: Architecture implementation only. No trained weights. Performance claims are unvalidated design goals. Requires $750K-$1.5M compute investment for validation.
-
 A novel LLM architecture exploring hallucination mitigation and long-context memory through hierarchical memory systems and integrated self-verification.
 
 **Includes**: Architecture implementation • Training scripts • Inference engine • Tests
