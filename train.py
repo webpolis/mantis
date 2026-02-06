@@ -155,6 +155,17 @@ def get_gpu_device_count():
     return torch.cuda.device_count() if torch.cuda.is_available() else 0
 
 
+def _get_gpu_count_worker(queue):
+    """Worker function to get GPU count in subprocess.
+
+    This function is used to isolate CUDA initialization from the main process.
+
+    Args:
+        queue: multiprocessing.Queue to return the result
+    """
+    queue.put(get_gpu_device_count())
+
+
 def get_gpu_memory_info():
     """Get available VRAM for each GPU in GB.
 
@@ -987,11 +998,7 @@ Examples:
         # Use subprocess to avoid corrupting worker contexts
         ctx = mp.get_context('spawn')
         queue = ctx.Queue()
-
-        def _get_count(q):
-            q.put(get_gpu_device_count())
-
-        p = ctx.Process(target=_get_count, args=(queue,))
+        p = ctx.Process(target=_get_gpu_count_worker, args=(queue,))
         p.start()
         p.join()
         available_gpus = queue.get()
