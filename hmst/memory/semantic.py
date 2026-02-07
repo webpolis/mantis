@@ -234,28 +234,34 @@ class SemanticMemory:
         top_k: int = 5
     ) -> List[Dict]:
         """
-        Retrieve facts with full metadata.
+        Retrieve facts with full metadata using FAISS index positions directly.
 
         Returns:
             List of dicts with 'text', 'distance', 'metadata'
         """
-        texts, distances = self.retrieve(
-            query_embedding,
-            top_k,
-            return_distances=True
-        )
+        if len(self.metadata) == 0:
+            return []
+
+        if isinstance(query_embedding, torch.Tensor):
+            query_embedding = query_embedding.cpu().numpy()
+
+        query_embedding = query_embedding.astype('float32').reshape(1, -1)
+
+        try:
+            distances, indices = self.index.search(query_embedding, min(top_k, len(self.metadata)))
+        except Exception as e:
+            print(f"Search failed: {e}")
+            return []
 
         results = []
-        for text, dist in zip(texts, distances):
-            # Find metadata
-            for entry in self.metadata:
-                if entry['text'] == text:
-                    results.append({
-                        'text': text,
-                        'distance': dist,
-                        'metadata': entry['metadata']
-                    })
-                    break
+        for idx, dist in zip(indices[0], distances[0]):
+            if idx != -1 and 0 <= idx < len(self.metadata):
+                entry = self.metadata[idx]
+                results.append({
+                    'text': entry['text'],
+                    'distance': float(dist),
+                    'metadata': entry['metadata']
+                })
 
         return results
 

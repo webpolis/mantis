@@ -312,10 +312,8 @@ class HuggingFaceDataset(Dataset):
 
     def __getitem__(self, idx):
         if self.streaming:
-            # Streaming mode: this should not be called with random access
-            # Instead, DataLoader should iterate via __iter__
-            # However, if called, we need to handle it gracefully
-            # This will only work efficiently for sequential access
+            # Streaming mode: idx is ignored; returns next sequential item.
+            # Only works with shuffle=False and num_workers=0.
             if self._stream_iterator is None:
                 self._stream_iterator = iter(self.dataset)
 
@@ -364,7 +362,7 @@ def load_or_create_tokenizer(tokenizer_path=None):
 
 @torch.no_grad()
 def validate(model, dataloader, tokenizer, device, rank=0):
-    """Run validation."""
+    """Run validation. Returns (avg_loss, perplexity, total_loss, total_tokens)."""
     model.eval()
     total_loss = 0.0
     total_tokens = 0
@@ -390,10 +388,10 @@ def validate(model, dataloader, tokenizer, device, rank=0):
         non_pad_tokens = (labels != tokenizer.pad_token_id).sum().item()
         total_tokens += non_pad_tokens
 
-    avg_loss = total_loss / total_tokens
+    avg_loss = total_loss / total_tokens if total_tokens > 0 else 0.0
     perplexity = compute_perplexity(avg_loss)
 
-    return avg_loss, perplexity
+    return avg_loss, perplexity, total_loss, total_tokens
 
 
 def train(args):
@@ -810,7 +808,7 @@ def train(args):
 
             if args.eval_every and optimizer_step > 0 and optimizer_step % args.eval_every == 0:
                 if val_loader:
-                    val_loss, val_ppl = validate(
+                    val_loss, val_ppl, raw_loss, raw_tokens = validate(
                         accelerator.unwrap_model(model),
                         val_loader,
                         tokenizer,
@@ -818,10 +816,10 @@ def train(args):
                         accelerator.process_index
                     )
 
-                    # Gather validation loss from all processes
-                    val_loss_tensor = torch.tensor(val_loss, device=accelerator.device)
-                    val_loss_tensor = accelerator.gather(val_loss_tensor).mean()
-                    val_loss = val_loss_tensor.item()
+                    # Gather raw totals for mathematically correct multi-GPU averaging
+                    gathered_loss = accelerator.gather(torch.tensor(raw_loss, device=accelerator.device)).sum()
+                    gathered_tokens = accelerator.gather(torch.tensor(float(raw_tokens), device=accelerator.device)).sum()
+                    val_loss = (gathered_loss / gathered_tokens).item() if gathered_tokens > 0 else 0.0
                     val_ppl = compute_perplexity(val_loss)
 
                     if accelerator.is_main_process:
@@ -855,7 +853,7 @@ def train(args):
 
         # Validation (all processes participate)
         if val_loader:
-            val_loss, val_ppl = validate(
+            val_loss, val_ppl, raw_loss, raw_tokens = validate(
                 accelerator.unwrap_model(model),
                 val_loader,
                 tokenizer,
@@ -863,10 +861,10 @@ def train(args):
                 accelerator.process_index
             )
 
-            # Gather validation loss from all processes
-            val_loss_tensor = torch.tensor(val_loss, device=accelerator.device)
-            val_loss_tensor = accelerator.gather(val_loss_tensor).mean()
-            val_loss = val_loss_tensor.item()
+            # Gather raw totals for mathematically correct multi-GPU averaging
+            gathered_loss = accelerator.gather(torch.tensor(raw_loss, device=accelerator.device)).sum()
+            gathered_tokens = accelerator.gather(torch.tensor(float(raw_tokens), device=accelerator.device)).sum()
+            val_loss = (gathered_loss / gathered_tokens).item() if gathered_tokens > 0 else 0.0
             val_ppl = compute_perplexity(val_loss)
 
             if accelerator.is_main_process:

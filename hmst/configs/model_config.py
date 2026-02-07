@@ -26,7 +26,7 @@ class BaseMoEConfig:
 @dataclass
 class MetaControllerConfig:
     """Configuration for Meta-Controller."""
-    d_model: int = 1024
+    d_model: int = 2048  # Must match BaseMoEConfig.d_model for input alignment
     n_layers: int = 6
     n_heads: int = 16
     d_ff: int = 4096
@@ -63,7 +63,7 @@ class EpisodicMemoryConfig:
 @dataclass
 class SemanticMemoryConfig:
     """Configuration for Semantic Memory (FAISS)."""
-    dimension: int = 1536
+    dimension: int = 2048  # Must match BaseMoEConfig.d_model
     max_entries: int = 1_000_000
     index_type: str = 'IVF'  # 'Flat', 'IVF', 'HNSW'
     use_gpu: bool = True
@@ -95,8 +95,6 @@ class TrainingConfig:
     rl_batch_size: int = 256
     rl_episodes: int = 50000
     rl_ppo_epsilon: float = 0.2
-    rl_discount: float = 0.99
-    rl_gae_lambda: float = 0.95
 
     # Reward weights
     alpha_accuracy: float = 1.0
@@ -177,7 +175,9 @@ def get_micro_config() -> HMSTConfig:
     config.base_moe.n_experts = 1  # Dense, not MoE
     config.base_moe.top_k = 1
     config.base_moe.dropout = 0.1
+    config.meta_controller.d_model = 256  # Must match base_moe.d_model
     config.meta_controller.n_experts = 1  # Must match base_moe.n_experts
+    config.semantic_memory.dimension = 256  # Must match base_moe.d_model
     return config
 
 
@@ -190,7 +190,9 @@ def get_tiny_config() -> HMSTConfig:
     config.base_moe.d_ff = 2048
     config.base_moe.n_experts = 4
     config.base_moe.top_k = 2
+    config.meta_controller.d_model = 512  # Must match base_moe.d_model
     config.meta_controller.n_experts = 4  # Must match base_moe.n_experts
+    config.semantic_memory.dimension = 512  # Must match base_moe.d_model
     return config
 
 
@@ -201,7 +203,9 @@ def get_small_config() -> HMSTConfig:
     config.base_moe.n_layers = 12
     config.base_moe.d_ff = 4096
     config.base_moe.n_experts = 4
+    config.meta_controller.d_model = 1024  # Must match base_moe.d_model
     config.meta_controller.n_experts = 4  # Must match base_moe.n_experts
+    config.semantic_memory.dimension = 1024  # Must match base_moe.d_model
     return config
 
 
@@ -217,6 +221,9 @@ def get_large_config() -> HMSTConfig:
     config.base_moe.n_layers = 32
     config.base_moe.d_ff = 16384
     config.base_moe.n_experts = 16
+    config.meta_controller.d_model = 4096  # Must match base_moe.d_model
+    config.meta_controller.n_experts = 16  # Must match base_moe.n_experts
+    config.semantic_memory.dimension = 4096  # Must match base_moe.d_model
     return config
 
 
@@ -224,5 +231,6 @@ def get_extmem_config() -> HMSTConfig:
     """Extended episodic memory"""
     config = HMSTConfig()
     config.episodic_memory.max_seq_len = 32768  # 32K tokens
-    config.base_moe.max_seq_len = 32768  # Match the base model too
+    config.base_moe.max_seq_len = 32768  # Match the base model too
+    config.meta_controller.n_experts = config.base_moe.n_experts  # Keep in sync
     return config

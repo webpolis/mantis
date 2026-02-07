@@ -115,8 +115,8 @@ class CriticModel(nn.Module):
         # Encode
         encoded = self.encoder(x, src_key_padding_mask=attention_mask)
 
-        # Pool: use [CLS] token (first position) or mean pooling
-        pooled = encoded[:, 0, :]  # (batch, d_model)
+        # Mean pooling (no dedicated CLS token in this architecture)
+        pooled = encoded.mean(dim=1)  # (batch, d_model)
 
         # Predictions
         correctness = self.correctness_head(pooled)

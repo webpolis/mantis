@@ -123,14 +123,23 @@ class MoELayer(nn.Module):
 
     def _compute_load_balance_loss(self, gate_probs: torch.Tensor) -> torch.Tensor:
         """
-        Encourage balanced expert usage.
+        Switch Transformer load balancing loss.
 
-        Loss = Σ_i (f_i - 1/K)²
-        where f_i is fraction of tokens routed to expert i
+        L = N * Σ_i (f_i * P_i)
+        where f_i = fraction of tokens dispatched to expert i (hard routing)
+              P_i = mean routing probability for expert i (soft)
+              N = number of experts
         """
-        expert_freq = gate_probs.mean(dim=0)  # (n_experts,)
-        target = 1.0 / self.n_experts
-        balance_loss = ((expert_freq - target) ** 2).sum()
+        # Hard dispatch fractions: which expert gets each token (top-1)
+        top1_indices = gate_probs.argmax(dim=-1)  # (num_tokens,)
+        f = torch.zeros(self.n_experts, device=gate_probs.device)
+        for i in range(self.n_experts):
+            f[i] = (top1_indices == i).float().mean()
+
+        # Soft routing probabilities
+        P = gate_probs.mean(dim=0)  # (n_experts,)
+
+        balance_loss = self.n_experts * (f * P).sum()
 
         return self.load_balance_weight * balance_loss
 
@@ -177,23 +186,39 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
-        expert_weights: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, Optional[Dict]]:
+        expert_weights: Optional[torch.Tensor] = None,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> Tuple[torch.Tensor, Optional[Dict], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Args:
             x: (batch, seq_len, d_model)
-            attn_mask: Causal mask (seq_len, seq_len) - float with -inf for masked positions
+            attn_mask: Causal mask - float with -inf for masked positions
             key_padding_mask: Padding mask (batch, seq_len) - bool (True=ignore padding)
             expert_weights: Optional routing weights from meta-controller
+            past_kv: Optional cached (key, value) from previous steps
 
         Returns:
             output: (batch, seq_len, d_model)
             aux_info: None or dict with MoE losses
+            present_kv: (key, value) cache for this layer
         """
         # Self-attention with pre-norm
         normed = self.attn_norm(x)
+
+        if past_kv is not None:
+            past_key, past_value = past_kv
+            # Concat past keys/values with current for full context
+            key = torch.cat([past_key, normed], dim=1)
+            value = torch.cat([past_value, normed], dim=1)
+        else:
+            key = normed
+            value = normed
+
+        # Store current kv for cache
+        present_kv = (key.detach(), value.detach())
+
         attn_out, _ = self.attn(
-            normed, normed, normed,
+            normed, key, value,
             attn_mask=attn_mask,
             key_padding_mask=key_padding_mask
         )
@@ -205,11 +230,11 @@ class TransformerBlock(nn.Module):
         if self.use_moe:
             ff_out, aux_info = self.ff(normed, expert_weights)
             x = x + self.dropout(ff_out)
-            return x, aux_info
+            return x, aux_info, present_kv
         else:
             ff_out = self.ff(normed)
             x = x + ff_out
-            return x, None
+            return x, None, present_kv
 
 
 class BaseMoEModel(nn.Module):
@@ -285,7 +310,7 @@ class BaseMoEModel(nn.Module):
 
     @staticmethod
     def _checkpoint_forward(layer, x, causal_mask, key_padding_mask, expert_weights):
-        """Wrapper for gradient checkpointing."""
+        """Wrapper for gradient checkpointing (no KV-cache during training)."""
         return layer(x, causal_mask, key_padding_mask, expert_weights)
 
     def forward(
@@ -293,7 +318,9 @@ class BaseMoEModel(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         expert_weights: Optional[torch.Tensor] = None,
-        return_hidden: bool = False
+        return_hidden: bool = False,
+        past_key_values: Optional[list] = None,
+        use_cache: bool = False
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass.
@@ -303,20 +330,27 @@ class BaseMoEModel(nn.Module):
             attention_mask: Optional (batch, seq_len)
             expert_weights: Optional (batch, n_experts) from meta-controller
             return_hidden: Return hidden states
+            past_key_values: List of (key, value) tuples per layer for KV-cache
+            use_cache: Whether to return present key values for caching
 
         Returns:
-            Dict with logits, losses, and optional hidden states
+            Dict with logits, losses, optional hidden states, and optional present_key_values
         """
         batch_size, seq_len = input_ids.shape
 
+        # Position offset for KV-cache (positions start after cached tokens)
+        past_len = past_key_values[0][0].size(1) if past_key_values else 0
+
         # Embeddings
-        positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
+        positions = torch.arange(past_len, past_len + seq_len, device=input_ids.device).unsqueeze(0)
         x = self.token_embedding(input_ids) + self.position_embedding(positions)
         x = self.dropout(x)
 
+        # Causal mask: only needed for the new tokens attending to full context
+        total_len = past_len + seq_len
         causal_mask = torch.triu(
-            torch.full((seq_len, seq_len), float('-inf'), device=x.device, dtype=x.dtype),
-            diagonal=1
+            torch.full((seq_len, total_len), float('-inf'), device=x.device, dtype=x.dtype),
+            diagonal=1 + past_len
         )
 
         # Prepare padding mask (if provided)
@@ -329,23 +363,29 @@ class BaseMoEModel(nn.Module):
         # Forward through layers
         total_load_loss = 0.0
         hidden_states = [] if return_hidden else None
+        present_key_values = [] if use_cache else None
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            layer_past = past_key_values[i] if past_key_values else None
+
             if self.gradient_checkpointing and self.training:
                 # Use gradient checkpointing to save memory
-                x, aux_info = torch.utils.checkpoint.checkpoint(
+                x, aux_info, present_kv = torch.utils.checkpoint.checkpoint(
                     self._checkpoint_forward,
                     layer, x, causal_mask, key_padding_mask, expert_weights,
                     use_reentrant=False
                 )
             else:
-                x, aux_info = layer(x, causal_mask, key_padding_mask, expert_weights)
+                x, aux_info, present_kv = layer(x, causal_mask, key_padding_mask, expert_weights, past_kv=layer_past)
 
             if aux_info is not None:
                 total_load_loss += aux_info['load_balance_loss']
 
             if return_hidden:
                 hidden_states.append(x)
+
+            if use_cache:
+                present_key_values.append(present_kv)
 
         # Final norm and projection
         x = self.final_norm(x)
@@ -359,6 +399,9 @@ class BaseMoEModel(nn.Module):
         if return_hidden:
             output['hidden_states'] = hidden_states
             output['last_hidden'] = x
+
+        if use_cache:
+            output['past_key_values'] = present_key_values
 
         return output
 

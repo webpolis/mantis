@@ -42,8 +42,6 @@ class PPOTrainer:
         delta: float = 0.5,  # Calibration weight
         lr: float = 1e-5,
         ppo_epsilon: float = 0.2,
-        discount: float = 0.99,
-        gae_lambda: float = 0.95,
         batch_size: int = 256,
         n_epochs: int = 4,
         device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -61,8 +59,6 @@ class PPOTrainer:
 
         # PPO hyperparameters
         self.epsilon = ppo_epsilon
-        self.discount = discount
-        self.gae_lambda = gae_lambda
         self.batch_size = batch_size
         self.n_epochs = n_epochs
 
@@ -240,7 +236,7 @@ class PPOTrainer:
         rewards = torch.tensor([t['reward'] for t in batch], device=self.device)
         old_values = torch.tensor([t['value'] for t in batch], device=self.device)
 
-        # Compute advantages (GAE)
+        # Compute advantages (single-step: reward - baseline value)
         values = self.value_net(states).squeeze(-1)
         advantages = rewards - values.detach()
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -274,9 +270,14 @@ class PPOTrainer:
 
             total_policy_loss += policy_loss.item()
 
-        # Value function update
+        # Value function update with clipping
         values = self.value_net(states).squeeze(-1)
-        value_loss = ((values - rewards) ** 2).mean()
+        values_clipped = old_values + torch.clamp(
+            values - old_values, -self.epsilon, self.epsilon
+        )
+        value_loss_unclipped = (values - rewards) ** 2
+        value_loss_clipped = (values_clipped - rewards) ** 2
+        value_loss = torch.max(value_loss_unclipped, value_loss_clipped).mean()
 
         self.value_optimizer.zero_grad()
         value_loss.backward()
@@ -562,8 +563,6 @@ def train_rl_stage(args):
         delta=config.training.delta_calibration,
         lr=config.training.rl_lr,
         ppo_epsilon=config.training.rl_ppo_epsilon,
-        discount=config.training.rl_discount,
-        gae_lambda=config.training.rl_gae_lambda,
         batch_size=args.rl_batch_size,
         device=device
     )

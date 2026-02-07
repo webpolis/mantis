@@ -96,16 +96,15 @@ class EpisodicMemory:
         query_embedding = query_embedding.to(self.device)
 
         # Project query_embedding to d_state space if dimensions don't match
-        if query_embedding.size(0) != self.ssm.d_state:
-            # Use SSM's state projection to get compatible dimensions
+        if query_embedding.size(-1) != self.ssm.d_state:
             with torch.no_grad():
                 if query_embedding.dim() == 1:
                     query_embedding = query_embedding.unsqueeze(0).unsqueeze(0)  # (1, 1, d_model)
-                    _, query_state = self.ssm(query_embedding, return_state=True)
-                    query_embedding = query_state.squeeze(0)  # (d_state,)
-                else:
-                    query_embedding = query_embedding.unsqueeze(0)  # (1, d_model)
-                    query_embedding = self.ssm.state_proj(query_embedding).squeeze(0)  # (d_state,)
+                elif query_embedding.dim() == 2:
+                    query_embedding = query_embedding.unsqueeze(0)  # (1, seq_len, d_model)
+                # Always use full SSM + mean pool + projection for consistent embeddings
+                _, query_state = self.ssm(query_embedding, return_state=True)
+                query_embedding = query_state.squeeze(0)  # (d_state,)
 
         # Compute similarities with stored states
         scores = []

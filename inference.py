@@ -236,11 +236,25 @@ class InferenceEngine:
         if num_beams > 1:
             raise NotImplementedError("Beam search not yet implemented")
 
-        # Generate tokens
+        # Generate tokens with KV-cache
+        past_key_values = None
         for step in range(max_length):
-            # Forward pass
-            output = self.model(input_tensor)
+            if past_key_values is None:
+                model_input = input_tensor[:, -self.model.max_seq_len:]
+            else:
+                model_input = input_tensor[:, -1:]
+
+            # Forward pass with KV-cache
+            output = self.model(model_input, past_key_values=past_key_values, use_cache=True)
             logits = output['logits']
+            past_key_values = output['past_key_values']
+
+            # Truncate cache if it exceeds max_seq_len
+            if past_key_values[0][0].size(1) >= self.model.max_seq_len:
+                past_key_values = [
+                    (k[:, -self.model.max_seq_len + 1:], v[:, -self.model.max_seq_len + 1:])
+                    for k, v in past_key_values
+                ]
 
             # Get next token logits
             next_token_logits = logits[0, -1, :] / temperature

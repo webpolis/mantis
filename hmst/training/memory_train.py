@@ -59,10 +59,10 @@ def compute_episodic_retrieval_loss(
     # Get embeddings from base model
     with torch.no_grad():
         base_model.eval()
-        query_output = base_model(query_ids)
-        context_output = base_model(context_ids)
-        query_emb = query_output['embeddings']  # (batch, seq_len, d_model)
-        context_emb = context_output['embeddings']
+        query_output = base_model(query_ids, return_hidden=True)
+        context_output = base_model(context_ids, return_hidden=True)
+        query_emb = query_output['last_hidden']  # (batch, seq_len, d_model)
+        context_emb = context_output['last_hidden']
 
     # Compress with SSM
     query_state = ssm_model.encode_sequence(query_emb)  # (batch, d_state)
@@ -124,8 +124,8 @@ def compute_semantic_embedding_loss(
 
         with torch.no_grad():
             base_model.eval()
-            output = base_model(token_ids)
-            embeddings = output['embeddings']  # (batch, seq_len, d_model)
+            output = base_model(token_ids, return_hidden=True)
+            embeddings = output['last_hidden']  # (batch, seq_len, d_model)
 
         # Mean pooling and detach to ensure no gradients flow to base model
         return embeddings.mean(dim=1).detach()  # (batch, d_model)

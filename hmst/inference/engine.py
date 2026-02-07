@@ -75,16 +75,16 @@ class HMSTInferenceEngine:
         """
         start_time = time.time()
 
-        # Step 1: Tokenize and encode query
+        # Step 1: Tokenize and encode query (single forward pass)
         query_tokens = self._tokenize(query)
-        query_emb = self.base.encode(query_tokens)  # (1, d_model)
-
-        # Step 2: Quick forward pass for uncertainty estimation
         with torch.no_grad():
             output = self.base(query_tokens, return_hidden=True)
             logits = output['logits']
             hidden = output['last_hidden']
+            # Mean pooling of last hidden state (same as base.encode())
+            query_emb = hidden.mean(dim=1)  # (1, d_model)
 
+        # Step 2: Uncertainty estimation from logits
         uncertainty = self._estimate_uncertainty(logits)
 
         # Step 3: Create state summary for meta-controller
@@ -318,11 +318,32 @@ class HMSTInferenceEngine:
             (1, seq_len + generated_len) full sequence
         """
         generated = input_tokens.clone()
+        past_key_values = None
 
-        for _ in range(max_length):
-            # Forward pass
-            output = self.base(generated, expert_weights=expert_weights)
+        for step in range(max_length):
+            if past_key_values is None:
+                # First step: process full prompt
+                model_input = generated[:, -self.base.max_seq_len:]
+            else:
+                # Subsequent steps: only process the new token
+                model_input = generated[:, -1:]
+
+            # Forward pass with KV-cache
+            output = self.base(
+                model_input,
+                expert_weights=expert_weights,
+                past_key_values=past_key_values,
+                use_cache=True
+            )
             logits = output['logits'][:, -1, :]  # (1, vocab_size)
+            past_key_values = output['past_key_values']
+
+            # Truncate cache if it exceeds max_seq_len
+            if past_key_values[0][0].size(1) >= self.base.max_seq_len:
+                past_key_values = [
+                    (k[:, -self.base.max_seq_len + 1:], v[:, -self.base.max_seq_len + 1:])
+                    for k, v in past_key_values
+                ]
 
             # Sample next token
             next_token = self._sample(logits, temperature, top_p)
@@ -355,6 +376,10 @@ class HMSTInferenceEngine:
         """
         # Squeeze to 1D for easier indexing
         logits = logits.squeeze(0)  # (vocab_size,)
+
+        # Greedy decoding for temperature <= 0
+        if temperature <= 0:
+            return logits.argmax(dim=-1).unsqueeze(0)
 
         # Apply temperature
         logits = logits / temperature

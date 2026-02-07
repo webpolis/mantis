@@ -97,7 +97,7 @@ class PreTrainer:
         self.epoch = 0
 
         # Mixed precision
-        self.scaler = torch.cuda.amp.GradScaler() if device == 'cuda' else None
+        self.scaler = torch.amp.GradScaler('cuda') if device == 'cuda' else None
 
     def train(self):
         """Main training loop."""
@@ -187,7 +187,7 @@ class PreTrainer:
             self.scheduler.step()
 
         # Mixed precision forward
-        with torch.cuda.amp.autocast(enabled=self.scaler is not None):
+        with torch.amp.autocast('cuda', enabled=self.scaler is not None):
             output = self.model(input_ids)
             logits = output['logits']
             load_balance_loss = output.get('load_balance_loss', 0.0)

@@ -27,9 +27,9 @@ class HMSTTokenizer:
         """
         self.tokenizer = GPT2Tokenizer.from_pretrained(model_name)
 
-        # GPT-2 doesn't have a pad token by default, so we set it to eos_token
+        # Add a distinct pad token so it doesn't conflict with EOS during training
         if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.add_special_tokens({'pad_token': '<pad>'})
 
         self.vocab_size = len(self.tokenizer)
 

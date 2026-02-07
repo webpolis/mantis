@@ -120,6 +120,7 @@ class MemoryConsolidator:
                 if fact:
                     # Encode and store in semantic memory
                     embedding = self._encode_fact(fact)
+                    group_timestamps = {e['timestamp'].item() for e in group}
                     self.semantic.add(
                         embedding,
                         fact,
@@ -128,7 +129,7 @@ class MemoryConsolidator:
                             'importance': sum(
                                 self.episodic.importance_scores[i]
                                 for i, e in enumerate(self.episodic.entries)
-                                if e in group
+                                if e['timestamp'].item() in group_timestamps
                             ) / len(group),
                             'timestamp': time.time()
                         }
