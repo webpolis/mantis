@@ -658,8 +658,33 @@ def train(args):
 
     # Scheduler (adjusted for gradient accumulation)
     steps_per_epoch = args.steps_per_epoch or len(train_loader)
-    effective_steps_per_epoch = steps_per_epoch // args.gradient_accumulation_steps
+
+    # Round steps_per_epoch up to nearest multiple of gradient_accumulation_steps
+    # to prevent partial accumulation leaking stale gradients across epoch boundaries
+    accum = args.gradient_accumulation_steps
+    if accum > 1 and steps_per_epoch % accum != 0:
+        old_steps = steps_per_epoch
+        steps_per_epoch = ((steps_per_epoch + accum - 1) // accum) * accum
+        args.steps_per_epoch = steps_per_epoch
+        if accelerator.is_main_process:
+            print(f"⚠️  Rounded steps_per_epoch {old_steps} → {steps_per_epoch} "
+                  f"(nearest multiple of gradient_accumulation_steps={accum}) "
+                  f"to prevent stale gradient leakage across epoch boundaries")
+
+    effective_steps_per_epoch = steps_per_epoch // accum
     total_steps = effective_steps_per_epoch * args.epochs
+
+    if accelerator.is_main_process:
+        print(f"\nScheduler: {effective_steps_per_epoch} optimizer steps/epoch × "
+              f"{args.epochs} epochs = {total_steps} total optimizer steps")
+        if args.warmup_steps > 0:
+            warmup_pct = args.warmup_steps / total_steps * 100 if total_steps > 0 else 0
+            print(f"Warmup: {args.warmup_steps} optimizer steps ({warmup_pct:.1f}% of training)")
+            if warmup_pct > 30:
+                print(f"⚠️  WARNING: Warmup consumes {warmup_pct:.0f}% of training! "
+                      f"The model will spend most of training at a sub-optimal learning rate.")
+                print(f"   Consider reducing --warmup-steps to ~{max(1, total_steps // 10)} "
+                      f"(10% of {total_steps} total steps)")
 
     def lr_lambda(step):
         if step < args.warmup_steps:
