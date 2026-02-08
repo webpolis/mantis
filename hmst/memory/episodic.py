@@ -4,6 +4,8 @@ Episodic Memory System
 SSM-based compression of recent interactions into continuous state vectors.
 """
 
+import threading
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,6 +35,7 @@ class EpisodicMemory:
         self.device = device
         self.max_entries = max_entries
         self.context_window = context_window
+        self._lock = threading.Lock()
 
         # Memory buffers
         self.entries = deque(maxlen=max_entries)
@@ -70,8 +73,9 @@ class EpisodicMemory:
             'timestamp': torch.tensor(len(self.entries), dtype=torch.float32)
         }
 
-        self.entries.append(entry)
-        self.importance_scores.append(importance)
+        with self._lock:
+            self.entries.append(entry)
+            self.importance_scores.append(importance)
 
     def retrieve(
         self,
@@ -90,54 +94,55 @@ class EpisodicMemory:
         Returns:
             List of retrieved memory texts or token sequences
         """
-        if len(self.entries) == 0:
-            return []
+        with self._lock:
+            if len(self.entries) == 0:
+                return []
 
-        query_embedding = query_embedding.to(self.device)
+            query_embedding = query_embedding.to(self.device)
 
-        # Project query_embedding to d_state space if dimensions don't match
-        if query_embedding.size(-1) != self.ssm.d_state:
-            with torch.no_grad():
-                if query_embedding.dim() == 1:
-                    query_embedding = query_embedding.unsqueeze(0).unsqueeze(0)  # (1, 1, d_model)
-                elif query_embedding.dim() == 2:
-                    query_embedding = query_embedding.unsqueeze(0)  # (1, seq_len, d_model)
-                # Always use full SSM + mean pool + projection for consistent embeddings
-                _, query_state = self.ssm(query_embedding, return_state=True)
-                query_embedding = query_state.squeeze(0)  # (d_state,)
+            # Project query_embedding to d_state space if dimensions don't match
+            if query_embedding.size(-1) != self.ssm.d_state:
+                with torch.no_grad():
+                    if query_embedding.dim() == 1:
+                        query_embedding = query_embedding.unsqueeze(0).unsqueeze(0)  # (1, 1, d_model)
+                    elif query_embedding.dim() == 2:
+                        query_embedding = query_embedding.unsqueeze(0)  # (1, seq_len, d_model)
+                    # Always use full SSM + mean pool + projection for consistent embeddings
+                    _, query_state = self.ssm(query_embedding, return_state=True)
+                    query_embedding = query_state.squeeze(0)  # (d_state,)
 
-        # Compute similarities with stored states
-        scores = []
-        for entry in self.entries:
-            state = entry['state'].to(self.device)
+            # Compute similarities with stored states
+            scores = []
+            for entry in self.entries:
+                state = entry['state'].to(self.device)
 
-            # Cosine similarity
-            similarity = F.cosine_similarity(
-                query_embedding.unsqueeze(0),
-                state.unsqueeze(0),
-                dim=-1
-            ).item()
+                # Cosine similarity
+                similarity = F.cosine_similarity(
+                    query_embedding.unsqueeze(0),
+                    state.unsqueeze(0),
+                    dim=-1
+                ).item()
 
-            scores.append(similarity)
+                scores.append(similarity)
 
-        # Get top-k indices
-        top_indices = sorted(
-            range(len(scores)),
-            key=lambda i: scores[i],
-            reverse=True
-        )[:top_k]
+            # Get top-k indices
+            top_indices = sorted(
+                range(len(scores)),
+                key=lambda i: scores[i],
+                reverse=True
+            )[:top_k]
 
-        # Return retrieved memories
-        retrieved = []
-        for idx in top_indices:
-            entry = self.entries[idx]
-            if return_tokens:
-                retrieved.append(entry['tokens'])
-            else:
-                # Convert tokens to text (placeholder - needs tokenizer)
-                retrieved.append(f"<memory_{idx}>")
+            # Return retrieved memories
+            retrieved = []
+            for idx in top_indices:
+                entry = self.entries[idx]
+                if return_tokens:
+                    retrieved.append(entry['tokens'])
+                else:
+                    # Convert tokens to text (placeholder - needs tokenizer)
+                    retrieved.append(f"<memory_{idx}>")
 
-        return retrieved
+            return retrieved
 
     def get_high_importance(self, threshold: float = 0.7) -> List[Dict]:
         """
@@ -149,38 +154,40 @@ class EpisodicMemory:
         Returns:
             List of high-importance entries
         """
-        if len(self.entries) == 0:
-            return []
+        with self._lock:
+            if len(self.entries) == 0:
+                return []
 
-        # Normalize importance scores
-        scores = torch.tensor(list(self.importance_scores))
-        scores = (scores - scores.min()) / (scores.max() - scores.min() + 1e-8)
+            # Normalize importance scores
+            scores = torch.tensor(list(self.importance_scores))
+            scores = (scores - scores.min()) / (scores.max() - scores.min() + 1e-8)
 
-        # Filter by threshold
-        candidates = []
-        for i, score in enumerate(scores):
-            if score >= threshold:
-                candidates.append(self.entries[i])
+            # Filter by threshold
+            candidates = []
+            for i, score in enumerate(scores):
+                if score >= threshold:
+                    candidates.append(self.entries[i])
 
-        return candidates
+            return candidates
 
     def remove(self, entries_to_remove: List[Dict]) -> None:
         """
         Remove consolidated memories from episodic buffer.
         """
-        # Simple removal by timestamp matching
-        timestamps_to_remove = {e['timestamp'].item() for e in entries_to_remove}
+        with self._lock:
+            # Simple removal by timestamp matching
+            timestamps_to_remove = {e['timestamp'].item() for e in entries_to_remove}
 
-        new_entries = deque()
-        new_scores = deque()
+            new_entries = deque()
+            new_scores = deque()
 
-        for entry, score in zip(self.entries, self.importance_scores):
-            if entry['timestamp'].item() not in timestamps_to_remove:
-                new_entries.append(entry)
-                new_scores.append(score)
+            for entry, score in zip(self.entries, self.importance_scores):
+                if entry['timestamp'].item() not in timestamps_to_remove:
+                    new_entries.append(entry)
+                    new_scores.append(score)
 
-        self.entries = new_entries
-        self.importance_scores = new_scores
+            self.entries = new_entries
+            self.importance_scores = new_scores
 
     def size(self) -> int:
         """Return number of stored memories."""
@@ -188,8 +195,9 @@ class EpisodicMemory:
 
     def clear(self) -> None:
         """Clear all memories."""
-        self.entries.clear()
-        self.importance_scores.clear()
+        with self._lock:
+            self.entries.clear()
+            self.importance_scores.clear()
 
     def get_state_summary(self) -> torch.Tensor:
         """
@@ -198,20 +206,21 @@ class EpisodicMemory:
         Returns:
             (d_state,) aggregated state vector
         """
-        if len(self.entries) == 0:
-            return torch.zeros(self.ssm.d_state)
+        with self._lock:
+            if len(self.entries) == 0:
+                return torch.zeros(self.ssm.d_state)
 
-        # Aggregate states (weighted by recency)
-        states = torch.stack([e['state'] for e in self.entries])
+            # Aggregate states (weighted by recency)
+            states = torch.stack([e['state'] for e in self.entries])
 
-        # Exponential decay weights (recent = higher)
-        weights = torch.exp(-0.1 * torch.arange(len(states), 0, -1))
-        weights = weights / weights.sum()
+            # Exponential decay weights (recent = higher)
+            weights = torch.exp(-0.1 * torch.arange(len(states), 0, -1))
+            weights = weights / weights.sum()
 
-        # Weighted sum
-        aggregated = (states * weights.unsqueeze(-1)).sum(dim=0)
+            # Weighted sum
+            aggregated = (states * weights.unsqueeze(-1)).sum(dim=0)
 
-        return aggregated
+            return aggregated
 
 
 def group_similar(entries: List[Dict], threshold: float = 0.8) -> List[List[Dict]]:

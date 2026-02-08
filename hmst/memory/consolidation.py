@@ -33,11 +33,13 @@ class MemoryConsolidator:
         consolidation_interval: int = 3600,  # 1 hour
         importance_threshold: float = 0.7,
         similarity_threshold: float = 0.8,
-        min_consolidation_size: int = 5
+        min_consolidation_size: int = 5,
+        tokenizer=None
     ):
         self.episodic = episodic_memory
         self.semantic = semantic_memory
         self.model = base_model
+        self.tokenizer = tokenizer
         self.interval = consolidation_interval
         self.importance_threshold = importance_threshold
         self.similarity_threshold = similarity_threshold
@@ -183,7 +185,7 @@ class MemoryConsolidator:
 
     def _encode_fact(self, fact: str) -> torch.Tensor:
         """
-        Encode fact into embedding vector.
+        Encode fact into embedding vector using the base model.
 
         Args:
             fact: Text string
@@ -191,10 +193,15 @@ class MemoryConsolidator:
         Returns:
             (dimension,) embedding vector
         """
-        # Placeholder: In production, use model's embedding layer
-        # For now, return random vector
-        embedding = torch.randn(self.semantic.dimension)
-        return embedding
+        with torch.no_grad():
+            if self.tokenizer:
+                token_ids = self.tokenizer.encode(fact)[:128]
+                tokens = torch.tensor([token_ids], dtype=torch.long)
+            else:
+                tokens = torch.zeros(1, 1, dtype=torch.long)
+            device = next(self.model.parameters()).device
+            embedding = self.model.encode(tokens.to(device))
+            return embedding.squeeze(0).cpu()
 
     def get_stats(self) -> Dict:
         """Get consolidation statistics."""

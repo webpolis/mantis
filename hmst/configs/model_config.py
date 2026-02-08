@@ -11,7 +11,7 @@ from typing import Optional
 @dataclass
 class BaseMoEConfig:
     """Configuration for Base MoE Model."""
-    vocab_size: int = 128000
+    vocab_size: int = 50304
     d_model: int = 2048
     n_layers: int = 24
     n_heads: int = 32
@@ -38,7 +38,7 @@ class MetaControllerConfig:
 @dataclass
 class CriticConfig:
     """Configuration for Critic Model."""
-    vocab_size: int = 128000
+    vocab_size: int = 50304
     d_model: int = 1024
     n_layers: int = 12
     n_heads: int = 16
@@ -136,6 +136,14 @@ class HMSTConfig:
         default_factory=SemanticMemoryConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
+
+    def __post_init__(self):
+        assert self.meta_controller.d_model == self.base_moe.d_model, \
+            f"MetaController d_model ({self.meta_controller.d_model}) must match BaseMoE d_model ({self.base_moe.d_model})"
+        assert self.meta_controller.n_experts == self.base_moe.n_experts, \
+            f"MetaController n_experts ({self.meta_controller.n_experts}) must match BaseMoE n_experts ({self.base_moe.n_experts})"
+        assert self.semantic_memory.dimension == self.base_moe.d_model, \
+            f"SemanticMemory dimension ({self.semantic_memory.dimension}) must match BaseMoE d_model ({self.base_moe.d_model})"
 
     def save(self, path: str):
         """Save configuration to file."""

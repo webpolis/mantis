@@ -78,14 +78,12 @@ class MoELayer(nn.Module):
         x_flat = x.view(-1, d_model)  # (batch * seq_len, d_model)
 
         # Compute gate scores
+        gate_logits = self.gate(x_flat)  # (batch * seq_len, n_experts)
         if expert_weights is not None:
-            # Use meta-controller provided weights (already probabilities from softmax)
-            # Expand to all tokens in sequence
-            gate_probs = expert_weights.unsqueeze(1).expand(-1, seq_len, -1)
-            gate_probs = gate_probs.reshape(-1, self.n_experts)
+            # Bias the learned gate with meta-controller signal
+            bias = expert_weights.unsqueeze(1).expand(-1, seq_len, -1).reshape(-1, self.n_experts)
+            gate_probs = F.softmax(gate_logits + bias, dim=-1)
         else:
-            # Standard learned gating - compute per-token routing
-            gate_logits = self.gate(x_flat)  # (batch * seq_len, n_experts)
             gate_probs = F.softmax(gate_logits, dim=-1)
 
         # Top-k routing
@@ -343,6 +341,7 @@ class BaseMoEModel(nn.Module):
 
         # Embeddings
         positions = torch.arange(past_len, past_len + seq_len, device=input_ids.device).unsqueeze(0)
+        positions = positions.clamp(max=self.max_seq_len - 1)
         x = self.token_embedding(input_ids) + self.position_embedding(positions)
         x = self.dropout(x)
 

@@ -110,7 +110,7 @@ class MetaController(nn.Module):
             'episodic': torch.sigmoid(self.episodic_gate(h)),
             'semantic': torch.sigmoid(self.semantic_gate(h)),
             'verification': torch.sigmoid(self.verification_gate(h)),
-            'expert_weights': torch.softmax(self.expert_selector(h), dim=-1),  # (batch, n_experts)
+            'expert_weights': self.expert_selector(h),  # (batch, n_experts) raw logits as additive bias
             'uncertainty': torch.sigmoid(self.uncertainty_head(h))  # (batch, 1)
         }
 

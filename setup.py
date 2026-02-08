@@ -20,6 +20,7 @@ setup(
     python_requires='>=3.8',
     install_requires=[
         'torch>=2.10.0',
+        'mamba-ssm>=2.2.2',
         'numpy>=2.4.2',
         'faiss-cpu>=1.13.2',
         'transformers>=5.0.0',

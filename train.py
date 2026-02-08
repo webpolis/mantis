@@ -119,20 +119,33 @@ class TextDataset(Dataset):
         file_size = os.path.getsize(file_path)
 
         # Tokenize in chunks without loading full file
+        # Uses line-aware reading to avoid splitting words at chunk boundaries
         chunk_size = 1_000_000  # 1MB text chunks
         all_tokens = []
 
         with open(file_path, 'r', encoding='utf-8') as f:
             pbar = tqdm(total=file_size, desc="Tokenizing", unit='B', unit_scale=True)
 
+            remainder = ""
             while True:
                 chunk = f.read(chunk_size)
                 if not chunk:
+                    if remainder:
+                        tokens = tokenizer.encode(remainder, add_special_tokens=False)
+                        all_tokens.extend(tokens)
+                        pbar.update(len(remainder.encode('utf-8')))
                     break
 
-                tokens = tokenizer.encode(chunk, add_special_tokens=False)
+                chunk = remainder + chunk
+                last_nl = chunk.rfind('\n')
+                if last_nl == -1:
+                    remainder = chunk
+                    continue
+                remainder = chunk[last_nl + 1:]
+                text_to_encode = chunk[:last_nl + 1]
+                tokens = tokenizer.encode(text_to_encode, add_special_tokens=False)
                 all_tokens.extend(tokens)
-                pbar.update(len(chunk.encode('utf-8')))
+                pbar.update(len(text_to_encode.encode('utf-8')))
 
             pbar.close()
 

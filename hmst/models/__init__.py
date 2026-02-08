@@ -5,7 +5,7 @@ HMST Models Module
 from .base_moe import BaseMoEModel, MoELayer, Expert
 from .meta_controller import MetaController, StateSummaryEncoder
 from .critic import CriticModel, CriticValueNetwork
-from .ssm import EpisodicMemorySSM, MambaBlock, SelectiveSSM
+from .ssm import EpisodicMemorySSM, MambaBlock
 
 __all__ = [
     'BaseMoEModel',
@@ -17,5 +17,4 @@ __all__ = [
     'CriticValueNetwork',
     'EpisodicMemorySSM',
     'MambaBlock',
-    'SelectiveSSM'
 ]

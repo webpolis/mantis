@@ -45,22 +45,39 @@ class SemanticMemory:
         # Cleared after training to save memory, but embeddings are kept in self.metadata
         self.embeddings_cache = []
 
+        # Temporary flat index for exact search before IVF is trained
+        if self.index_type == 'IVF':
+            self.pre_train_index = faiss.IndexFlatL2(self.dimension)
+        else:
+            self.pre_train_index = None
+
+        # Sequential ID counter for IndexIDMap
+        self._next_id = 0
+        # Track stale (removed) entries for IVF deferred rebuild
+        self._stale_count = 0
+
     def _init_index(self):
         """Initialize FAISS index based on type."""
         if self.index_type == 'Flat':
-            # Exact search (slow but accurate)
-            self.index = faiss.IndexFlatL2(self.dimension)
+            # Exact search with ID map for efficient deletion
+            base_index = faiss.IndexFlatL2(self.dimension)
+            self.index = faiss.IndexIDMap(base_index)
 
         elif self.index_type == 'IVF':
             # IVF with PQ compression (fast approximate search)
             n_clusters = min(16384, self.max_entries // 100)
             quantizer = faiss.IndexFlatL2(self.dimension)
 
+            # PQ code size must divide dimension evenly
+            code_size = min(128, self.dimension)
+            while self.dimension % code_size != 0:
+                code_size -= 1
+
             self.index = faiss.IndexIVFPQ(
                 quantizer,
                 self.dimension,
                 n_clusters,
-                128,  # code size
+                code_size,
                 8     # bits per sub-quantizer
             )
 
@@ -68,10 +85,11 @@ class SemanticMemory:
             self.index_trained = False
 
         elif self.index_type == 'HNSW':
-            # Hierarchical NSW graph (very fast, moderate memory)
-            self.index = faiss.IndexHNSWFlat(self.dimension, 32)
-            self.index.hnsw.efConstruction = 40
-            self.index.hnsw.efSearch = 16
+            # Hierarchical NSW graph with ID map for deletion support
+            base_index = faiss.IndexHNSWFlat(self.dimension, 32)
+            base_index.hnsw.efConstruction = 40
+            base_index.hnsw.efSearch = 16
+            self.index = faiss.IndexIDMap(base_index)
 
         else:
             raise ValueError(f"Unknown index type: {self.index_type}")
@@ -114,18 +132,26 @@ class SemanticMemory:
             if len(self.metadata) >= 10000:  # Minimum training size
                 self._train_index()
 
+        # Assign a unique ID to this entry
+        entry_id = self._next_id
+        self._next_id += 1
+
         # Add to index
         if self.index_type == 'IVF' and not self.index_trained:
-            # Store for later training
-            pass  # Will train when enough samples
-        else:
+            # IVF not trained yet: add to temporary flat index for exact search
+            self.pre_train_index.add(embedding)
+        elif self.index_type == 'IVF':
             self.index.add(embedding)
+        else:
+            # Flat/HNSW use IndexIDMap, require add_with_ids
+            ids = np.array([entry_id], dtype=np.int64)
+            self.index.add_with_ids(embedding, ids)
 
         # Store metadata with embedding for rebuilding
         entry = {
             'text': text,
-            'embedding': embedding.copy(),  # Keep embedding for index rebuilding
-            'embedding_id': len(self.metadata),
+            'embedding': embedding.copy(),
+            'embedding_id': entry_id,
             'metadata': metadata or {}
         }
         self.metadata.append(entry)
@@ -163,15 +189,25 @@ class SemanticMemory:
             if len(self.metadata) + n >= 10000:
                 self._train_index()
 
-        if self.index_type != 'IVF' or self.index_trained:
+        # Assign IDs for this batch
+        batch_ids = np.arange(self._next_id, self._next_id + n, dtype=np.int64)
+        self._next_id += n
+
+        if self.index_type == 'IVF' and self.index_trained:
             self.index.add(embeddings)
+        elif self.index_type == 'IVF' and not self.index_trained:
+            if self.pre_train_index is not None:
+                self.pre_train_index.add(embeddings)
+        else:
+            # Flat/HNSW use IndexIDMap
+            self.index.add_with_ids(embeddings, batch_ids)
 
         # Store metadata with embeddings for rebuilding
         for i in range(n):
             entry = {
                 'text': texts[i],
-                'embedding': embeddings[i:i+1].copy(),  # Keep embedding for index rebuilding
-                'embedding_id': len(self.metadata),
+                'embedding': embeddings[i:i+1].copy(),
+                'embedding_id': int(batch_ids[i]),
                 'metadata': metadata_list[i]
             }
             self.metadata.append(entry)
@@ -207,21 +243,37 @@ class SemanticMemory:
 
         query_embedding = query_embedding.astype('float32').reshape(1, -1)
 
-        # Search
+        # Search (use pre-train index if IVF not yet trained)
+        search_index = self.index
+        if self.index_type == 'IVF' and not self.index_trained and self.pre_train_index is not None:
+            search_index = self.pre_train_index
+
         try:
-            distances, indices = self.index.search(query_embedding, min(top_k, len(self.metadata)))
+            distances, indices = search_index.search(query_embedding, min(top_k, len(self.metadata)))
         except Exception as e:
             print(f"Search failed: {e}")
             return [] if not return_distances else ([], [])
 
         # Retrieve corresponding text
+        # For IndexIDMap (Flat/HNSW), search returns custom IDs, not positional indices
+        # For IVF and pre_train_index, search returns positional indices
+        uses_id_map = self.index_type in ('Flat', 'HNSW') and search_index is self.index
+
         results = []
         result_distances = []
 
-        for idx, dist in zip(indices[0], distances[0]):
-            if idx != -1 and 0 <= idx < len(self.metadata):
-                results.append(self.metadata[idx]['text'])
-                result_distances.append(float(dist))
+        if uses_id_map:
+            # Build ID -> metadata lookup
+            id_to_entry = {entry['embedding_id']: entry for entry in self.metadata}
+            for idx, dist in zip(indices[0], distances[0]):
+                if idx != -1 and idx in id_to_entry:
+                    results.append(id_to_entry[idx]['text'])
+                    result_distances.append(float(dist))
+        else:
+            for idx, dist in zip(indices[0], distances[0]):
+                if idx != -1 and 0 <= idx < len(self.metadata):
+                    results.append(self.metadata[idx]['text'])
+                    result_distances.append(float(dist))
 
         if return_distances:
             return results, result_distances
@@ -247,21 +299,38 @@ class SemanticMemory:
 
         query_embedding = query_embedding.astype('float32').reshape(1, -1)
 
+        search_index = self.index
+        if self.index_type == 'IVF' and not self.index_trained and self.pre_train_index is not None:
+            search_index = self.pre_train_index
+
         try:
-            distances, indices = self.index.search(query_embedding, min(top_k, len(self.metadata)))
+            distances, indices = search_index.search(query_embedding, min(top_k, len(self.metadata)))
         except Exception as e:
             print(f"Search failed: {e}")
             return []
 
+        uses_id_map = self.index_type in ('Flat', 'HNSW') and search_index is self.index
+
         results = []
-        for idx, dist in zip(indices[0], distances[0]):
-            if idx != -1 and 0 <= idx < len(self.metadata):
-                entry = self.metadata[idx]
-                results.append({
-                    'text': entry['text'],
-                    'distance': float(dist),
-                    'metadata': entry['metadata']
-                })
+        if uses_id_map:
+            id_to_entry = {entry['embedding_id']: entry for entry in self.metadata}
+            for idx, dist in zip(indices[0], distances[0]):
+                if idx != -1 and idx in id_to_entry:
+                    entry = id_to_entry[idx]
+                    results.append({
+                        'text': entry['text'],
+                        'distance': float(dist),
+                        'metadata': entry['metadata']
+                    })
+        else:
+            for idx, dist in zip(indices[0], distances[0]):
+                if idx != -1 and 0 <= idx < len(self.metadata):
+                    entry = self.metadata[idx]
+                    results.append({
+                        'text': entry['text'],
+                        'distance': float(dist),
+                        'metadata': entry['metadata']
+                    })
 
         return results
 
@@ -286,19 +355,32 @@ class SemanticMemory:
 
         self.index_trained = True
 
-        # Clear training cache to save memory
-        # Note: Embeddings are permanently stored in self.metadata for rebuilding
+        # Clear training cache and pre-train index to save memory
         self.embeddings_cache = []
+        self.pre_train_index = None
 
         print("Index training complete.")
 
     def _remove_oldest(self, n: int):
         """Remove n oldest entries (FIFO)."""
-        # Remove from metadata
+        removed_entries = self.metadata[:n]
         self.metadata = self.metadata[n:]
 
-        # Rebuild index (FAISS doesn't support efficient deletion)
-        self._rebuild_index()
+        if self.index_type == 'IVF':
+            # IVF doesn't support efficient deletion via remove_ids
+            # Track stale entries and only rebuild when >20% are stale
+            self._stale_count += n
+            total_indexed = self.index.ntotal if self.index_trained else 0
+            if total_indexed > 0 and self._stale_count / total_indexed > 0.2:
+                self._rebuild_index()
+                self._stale_count = 0
+        else:
+            # Flat/HNSW use IndexIDMap which supports remove_ids
+            ids_to_remove = np.array(
+                [entry['embedding_id'] for entry in removed_entries],
+                dtype=np.int64
+            )
+            self.index.remove_ids(ids_to_remove)
 
     def _rebuild_index(self):
         """Rebuild index from scratch (expensive operation)."""
@@ -306,6 +388,8 @@ class SemanticMemory:
 
         # Reinitialize index
         self._init_index()
+        self.pre_train_index = faiss.IndexFlatL2(self.dimension) if self.index_type == 'IVF' else None
+        self._stale_count = 0
 
         if len(self.metadata) == 0:
             print("Index rebuild complete (no entries to add).")
@@ -321,15 +405,24 @@ class SemanticMemory:
                 self.index.train(embeddings)
                 self.index_trained = True
             else:
-                print(f"  Warning: Only {len(embeddings)} samples, need ≥10000 for training. Index remains untrained.")
+                print(f"  Warning: Only {len(embeddings)} samples, need >=10000 for training. Index remains untrained.")
                 self.index_trained = False
 
         # Re-add all embeddings to the rebuilt index
-        if self.index_type != 'IVF' or self.index_trained:
+        if self.index_type == 'IVF' and self.index_trained:
             self.index.add(embeddings)
+            self.pre_train_index = None
             print(f"  Re-added {len(embeddings)} embeddings to index.")
+        elif self.index_type == 'IVF':
+            # Add to pre-train flat index for exact search until IVF is trained
+            self.pre_train_index.add(embeddings)
+            self.embeddings_cache = [embeddings[i:i+1].copy() for i in range(len(embeddings))]
+            print(f"  Added {len(embeddings)} embeddings to pre-train index.")
         else:
-            print(f"  Index not trained yet, embeddings will be added after training.")
+            # Flat/HNSW use IndexIDMap with add_with_ids
+            ids = np.array([entry['embedding_id'] for entry in self.metadata], dtype=np.int64)
+            self.index.add_with_ids(embeddings, ids)
+            print(f"  Re-added {len(embeddings)} embeddings to index.")
 
         print("Index rebuild complete.")
 
