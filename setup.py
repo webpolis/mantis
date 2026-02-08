@@ -1,5 +1,5 @@
 """
-HMST: Hierarchical Memory-State Transformer
+MANTIS: Metacognitive Adaptive Network with Tiered Inference Strategies
 
 Setup script for installation.
 """
@@ -10,10 +10,10 @@ with open('README.md', 'r', encoding='utf-8') as f:
     long_description = f.read()
 
 setup(
-    name='hmst',
+    name='mantis',
     version='1.0.0',
     author='Claude (Anthropic) & Gemini (Google)',
-    description='Hierarchical Memory-State Transformer - A novel LLM architecture for mitigating hallucination',
+    description='Metacognitive Adaptive Network with Tiered Inference Strategies - A novel LLM architecture for mitigating hallucination',
     long_description=long_description,
     long_description_content_type='text/markdown',
     packages=find_packages(),

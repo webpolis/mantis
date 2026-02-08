@@ -1,4 +1,4 @@
-% HMST: Hierarchical Memory-State Transformer
+% MANTIS: Metacognitive Adaptive Network with Tiered Inference Strategies
 % Scientific Paper - NeurIPS 2024 Style
 
 \documentclass{article}
@@ -21,7 +21,7 @@
 \usepackage{subcaption}
 
 % Title and Authors
-\title{HMST: A Proposed Hierarchical Memory-State Transformer Architecture for Hallucination Mitigation}
+\title{MANTIS: Metacognitive Adaptive Network with Tiered Inference Strategies for Hallucination Mitigation}
 
 \author{%
   Anonymous Authors \\
@@ -34,7 +34,7 @@
 \maketitle
 
 \begin{abstract}
-Large Language Models (LLMs) exhibit a fundamental trade-off between long-context retention, computational efficiency, and hallucination rates. Existing approaches either scale quadratically with context length (dense transformers), compress information lossy (state-space models), or lack contextual statefulness (retrieval-augmented generation). We propose \textbf{HMST} (Hierarchical Memory-State Transformer), a novel hybrid architecture design that integrates a sparse Mixture-of-Experts (MoE) backbone with a meta-controlled three-tier memory system. We present a complete reference implementation where a lightweight \textit{Meta-Controller}, designed to be optimized via reinforcement learning (PPO), dynamically routes queries between: (1) immediate self-attention, (2) episodic state-space compression (Mamba-based SSM), and (3) semantic vector retrieval (FAISS). An optional critic model is included to provide hallucination detection through output verification. This paper details the architectural design and implementation of HMST as a framework for future research into adaptive memory systems. We discuss the theoretical properties of the architecture, its expected computational advantages, and the proposed training methodology required to validate its performance on long-context benchmarks.
+Large Language Models (LLMs) exhibit a fundamental trade-off between long-context retention, computational efficiency, and hallucination rates. Existing approaches either scale quadratically with context length (dense transformers), compress information lossy (state-space models), or lack contextual statefulness (retrieval-augmented generation). We propose \textbf{MANTIS} (Metacognitive Adaptive Network with Tiered Inference Strategies), a novel hybrid architecture design that integrates a sparse Mixture-of-Experts (MoE) backbone with a meta-controlled three-tier memory system. We present a complete reference implementation where a lightweight \textit{Meta-Controller}, designed to be optimized via reinforcement learning (PPO), dynamically routes queries between: (1) immediate self-attention, (2) episodic state-space compression (Mamba-based SSM), and (3) semantic vector retrieval (FAISS). An optional critic model is included to provide hallucination detection through output verification. This paper details the architectural design and implementation of MANTIS as a framework for future research into adaptive memory systems. We discuss the theoretical properties of the architecture, its expected computational advantages, and the proposed training methodology required to validate its performance on long-context benchmarks.
 \end{abstract>
 
 \section{Introduction}
@@ -51,7 +51,7 @@ Existing mitigation strategies exhibit complementary weaknesses. \textit{Retriev
 
 \subsection{Contributions}
 
-We propose HMST, a hierarchical architecture that integrates three memory tiers under unified RL-based control:
+We propose MANTIS, a metacognitive architecture that integrates three memory tiers under unified RL-based control:
 
 \begin{enumerate}
     \item \textbf{Sparse MoE Backbone:} A 12B-parameter base model design with 8 experts and top-2 routing, activating only 2B parameters per token for efficient processing.
@@ -71,9 +71,9 @@ We provide a comprehensive description of the system architecture and its implem
 
 \paragraph{Sparse Models \& Mixture of Experts.} Switch Transformer \cite{fedus2022switch} and Mixtral \cite{jiang2024mixtral} demonstrate that sparse expert activation maintains model quality while reducing per-token compute. Our MoE backbone follows top-K routing principles but integrates with memory-augmented components rather than serving as the sole architecture.
 
-\paragraph{State Space Models.} Structured SSMs (S4 \cite{gu2022s4}, Mamba \cite{gu2023mamba}, Jamba \cite{lieber2024jamba}) achieve linear complexity through selective state compression. While Jamba explores SSM-attention hybrids at the layer level, HMST implements hierarchical memory with explicit meta-control for routing decisions.
+\paragraph{State Space Models.} Structured SSMs (S4 \cite{gu2022s4}, Mamba \cite{gu2023mamba}, Jamba \cite{lieber2024jamba}) achieve linear complexity through selective state compression. While Jamba explores SSM-attention hybrids at the layer level, MANTIS implements metacognitive routing with hierarchical memory and explicit control over inference strategies.
 
-\paragraph{Memory-Augmented Networks.} Neural Turing Machines \cite{graves2014ntm} and Memory Networks \cite{weston2014memory} pioneered external memory interfaces. Modern RAG systems \cite{lewis2020retrieval,izacard2021atlas} combine dense retrievers with generative models. HMST extends this paradigm with multi-tier memory and learned access policies.
+\paragraph{Memory-Augmented Networks.} Neural Turing Machines \cite{graves2014ntm} and Memory Networks \cite{weston2014memory} pioneered external memory interfaces. Modern RAG systems \cite{lewis2020retrieval,izacard2021atlas} combine dense retrievers with generative models. MANTIS extends this paradigm with tiered inference strategies and learned metacognitive access policies.
 
 \paragraph{Hallucination Detection.} Recent work addresses factual errors through self-consistency checking \cite{manakul2023selfcheckgpt}, retrieval verification \cite{gao2023rarr}, and uncertainty quantification \cite{kuhn2023semantic}. Our critic model explicitly conditions on retrieved evidence for calibrated confidence estimation.
 
@@ -255,7 +255,7 @@ The critic model is intended to be fine-tuned on curated hallucination datasets 
 
 \subsection{Baselines}
 
-We propose comparing HMST against the following baselines to validate its effectiveness:
+We propose comparing MANTIS against the following baselines to validate its effectiveness:
 \begin{itemize}
     \item \textbf{Llama-3-8B} \cite{touvron2023llama}: Dense transformer baseline
     \item \textbf{Mixtral-8x7B} \cite{jiang2024mixtral}: Sparse MoE without memory augmentation
@@ -290,7 +290,7 @@ The hierarchical memory design is expected to enable graceful degradation: simpl
 
 \subsection{Scaling Analysis}
 
-Theoretically, HMST should maintain sub-quadratic complexity as context length increases, due to the $O(1)$ memory footprint of the episodic memory and $O(\sqrt{M})$ retrieval complexity of the semantic memory. This contrasts with dense baselines which exhibit quadratic growth.
+Theoretically, MANTIS should maintain sub-quadratic complexity as context length increases, due to the $O(1)$ memory footprint of the episodic memory and $O(\sqrt{M})$ retrieval complexity of the semantic memory. This contrasts with dense baselines which exhibit quadratic growth.
 
 \section{Discussion}
 
@@ -312,13 +312,13 @@ The critic model is designed to improve calibration by conditioning verification
 
 \section{Conclusion}
 
-We have presented HMST, a proposed hierarchical memory-augmented transformer architecture designed to address fundamental trade-offs in long-context LLM design. By combining sparse MoE computation with multi-tier memory under RL-based meta-control, HMST offers a promising direction for achieving superior efficiency and factual accuracy. This paper details the complete architectural design and implementation, laying the groundwork for future training and evaluation. The proposed design suggests that learned routing policies could dynamically balance compute allocation based on query complexity.
+We have presented MANTIS, a proposed metacognitive adaptive network designed to address fundamental trade-offs in long-context LLM design. By combining sparse MoE computation with tiered inference strategies under RL-based meta-control, MANTIS offers a promising direction for achieving superior efficiency and factual accuracy. This paper details the complete architectural design and implementation, laying the groundwork for future training and evaluation. The proposed design suggests that learned routing policies could dynamically balance compute allocation based on query complexity.
 
 Pending validation of the core architecture, future work could explore: (1) scaling memory capacity to 10M+ entries, (2) continual learning protocols for memory consolidation, and (3) integration with tool-augmented reasoning systems.
 
 \section*{Broader Impact}
 
-The proposed HMST architecture aims to improve reliability in high-stakes applications (medical QA, legal reasoning). However, the critic model might introduce brittleness if trained on biased datasets, potentially amplifying systemic biases. Any future deployment should include human-in-the-loop verification for critical decisions.
+The proposed MANTIS architecture aims to improve reliability in high-stakes applications (medical QA, legal reasoning). However, the critic model might introduce brittleness if trained on biased datasets, potentially amplifying systemic biases. Any future deployment should include human-in-the-loop verification for critical decisions.
 
 \begin{thebibliography}{99}
 

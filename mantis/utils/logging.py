@@ -1,5 +1,5 @@
 """
-Logging utilities for HMST training and inference.
+Logging utilities for MANTIS training and inference.
 """
 
 import logging
@@ -9,7 +9,7 @@ import wandb
 
 
 def setup_logger(
-    name: str = 'hmst',
+    name: str = 'mantis',
     level: int = logging.INFO,
     log_file: Optional[str] = None
 ) -> logging.Logger:
@@ -59,7 +59,7 @@ class MetricsLogger:
     def __init__(
         self,
         use_wandb: bool = False,
-        project_name: str = 'hmst',
+        project_name: str = 'mantis',
         run_name: Optional[str] = None
     ):
         self.use_wandb = use_wandb

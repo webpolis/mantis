@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-HMST (Hierarchical Memory-State Transformer) is a research prototype LLM architecture exploring hallucination mitigation and long-context memory through hierarchical memory systems. The architecture consists of:
+MANTIS (Metacognitive Adaptive Network with Tiered Inference Strategies) is a research prototype LLM architecture exploring hallucination mitigation and long-context memory through metacognitive routing and hierarchical memory systems. The architecture consists of:
 
 - **Base MoE Model**: Sparse Mixture-of-Experts transformer (~12B total, ~2B active parameters)
 - **Three-tier memory**: Attention (8K) → Episodic SSM → Semantic FAISS
@@ -111,7 +111,7 @@ python -m pytest tests/ -v
 python -m pytest tests/test_models.py -v
 
 # With coverage
-python -m pytest tests/ --cov=hmst --cov-report=html
+python -m pytest tests/ --cov=mantis --cov-report=html
 ```
 
 ## Evaluation
@@ -134,7 +134,7 @@ python scripts/run_eval.py checkpoints/stage1/best_model.pt \
 ### Project Structure
 
 ```
-hmst/
+mantis/
 ├── models/              # Neural network architectures
 │   ├── base_moe.py      # Base MoE model with sparse experts
 │   ├── meta_controller.py  # RL-trainable routing controller
@@ -152,7 +152,7 @@ hmst/
 │   └── engine.py        # Dynamic routing and generation
 ├── configs/             # Configuration management
 │   └── model_config.py  # Presets: micro/tiny/small/base
-└── tokenizer.py         # HMSTTokenizer (GPT-2 BPE wrapper)
+└── tokenizer.py         # MANTISTokenizer (GPT-2 BPE wrapper)
 
 evaluation/              # Evaluation harness
 ├── benchmarks.py        # MMLU, TruthfulQA, HumanEval, GSM8K
@@ -166,7 +166,7 @@ scripts/                 # Utility scripts
 
 ### Key Components
 
-#### BaseMoEModel (`hmst/models/base_moe.py`)
+#### BaseMoEModel (`mantis/models/base_moe.py`)
 
 Sparse MoE transformer with:
 - 8 experts, top-2 routing
@@ -178,7 +178,7 @@ Sparse MoE transformer with:
 
 **Meta-controller integration**: When `expert_weights` are provided by the meta-controller, they are applied as additive bias to the learned gate logits (not as replacement routing). This allows the meta-controller to influence expert selection while preserving learned routing patterns.
 
-#### MetaController (`hmst/models/meta_controller.py`)
+#### MetaController (`mantis/models/meta_controller.py`)
 
 RL-trainable routing controller with 5 gates:
 1. **Early exit**: Skip processing for simple queries
@@ -191,31 +191,31 @@ Trained with PPO in Stage 3. Gates 1-3 and 5 output continuous values [0,1] thre
 
 #### Memory Systems
 
-**Episodic Memory** (`hmst/memory/episodic.py`):
+**Episodic Memory** (`mantis/memory/episodic.py`):
 - Mamba SSM using mamba-ssm library (CUDA-optimized)
 - 8K token window
 - L2 cache in memory hierarchy
 - Thread-safe operations with locking for concurrent access
 
-**Semantic Memory** (`hmst/memory/semantic.py`):
+**Semantic Memory** (`mantis/memory/semantic.py`):
 - FAISS vector database with IndexIDMap for efficient deletion
 - 1M+ entries capacity
 - L3 cache in memory hierarchy
 - Deferred IVF index rebuild (only when >20% entries stale)
 - **WARNING**: Stores embeddings in RAM (12GB+ for 1M entries). Limit to ~100K entries on 16GB RAM systems.
 
-**Consolidation** (`hmst/memory/consolidation.py`):
+**Consolidation** (`mantis/memory/consolidation.py`):
 - Background transfer from episodic → semantic
 - Uses importance scoring and decay
 - Encodes facts using base model embeddings (no longer placeholder)
 
-#### Critic Model (`hmst/models/critic.py`)
+#### Critic Model (`mantis/models/critic.py`)
 
 1-2B parameter verification model for hallucination detection via consistency checking. Used when meta-controller triggers verification gate.
 
 ### Model Configuration
 
-Model sizes are defined in `hmst/configs/model_config.py`:
+Model sizes are defined in `mantis/configs/model_config.py`:
 
 - **micro**: ~10M parameters (dense, not MoE) - ultra-fast testing
 - **tiny**: ~100M parameters (4 experts) - development/debugging
@@ -224,7 +224,7 @@ Model sizes are defined in `hmst/configs/model_config.py`:
 
 **Vocabulary**: All models use 50304 tokens (GPT-2 standard vocabulary size).
 
-**Critical alignment requirements** (validated in `HMSTConfig.__post_init__`):
+**Critical alignment requirements** (validated in `MANTISConfig.__post_init__`):
 - `MetaControllerConfig.d_model` must match `BaseMoEConfig.d_model`
 - `MetaControllerConfig.n_experts` must match `BaseMoEConfig.n_experts`
 - `SemanticMemoryConfig.dimension` must match `BaseMoEConfig.d_model`
@@ -233,7 +233,7 @@ When adding new model sizes, ensure these dimensions are synchronized. Config mi
 
 ### Training Pipeline
 
-HMST uses a 3-stage training pipeline:
+MANTIS uses a 3-stage training pipeline:
 
 1. **Stage 1 (REQUIRED)**: Base MoE pre-training
    - Standard next-token prediction
@@ -250,7 +250,7 @@ HMST uses a 3-stage training pipeline:
    - Optimizes accuracy/latency/compute trade-offs
    - Requires Stage 1 (or Stage 2) checkpoint
 
-Each stage builds on the previous. Training is implemented in `hmst/training/` with separate modules per stage.
+Each stage builds on the previous. Training is implemented in `mantis/training/` with separate modules per stage.
 
 ## Development Guidelines
 
@@ -298,7 +298,7 @@ Cannot combine both. HuggingFace datasets use `--hf-val-split` instead.
 
 ### Inference Engine
 
-Full HMST inference requires all components:
+Full MANTIS inference requires all components:
 - Base MoE model
 - Meta-controller
 - Episodic memory
@@ -307,7 +307,7 @@ Full HMST inference requires all components:
 
 For basic generation (Stage 1 only), use `inference.py` which provides simplified inference without memory systems.
 
-Production inference engine is in `hmst/inference/engine.py` and coordinates:
+Production inference engine is in `mantis/inference/engine.py` and coordinates:
 1. Query encoding
 2. Uncertainty estimation
 3. Meta-controller routing

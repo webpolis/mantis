@@ -1,7 +1,7 @@
 """
-HMST Evaluation Framework
+MANTIS Evaluation Framework
 
-Provides benchmark runners and evaluation utilities for HMST models.
+Provides benchmark runners and evaluation utilities for MANTIS models.
 """
 
 from evaluation.benchmarks import (
@@ -33,7 +33,7 @@ __all__ = [
 
 class EvaluationHarness:
     """
-    Main evaluation harness for running benchmarks on HMST models.
+    Main evaluation harness for running benchmarks on MANTIS models.
     """
 
     def __init__(self, model, tokenizer, device='cuda'):

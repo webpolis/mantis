@@ -1,5 +1,5 @@
 """
-Proper Tokenizer for HMST using HuggingFace Transformers
+Proper Tokenizer for MANTIS using HuggingFace Transformers
 
 Uses pre-trained GPT-2 BPE tokenizer with 50K vocabulary.
 """
@@ -9,9 +9,9 @@ from typing import List, Union
 import torch
 
 
-class HMSTTokenizer:
+class MANTISTokenizer:
     """
-    Wrapper around HuggingFace GPT-2 tokenizer for HMST.
+    Wrapper around HuggingFace GPT-2 tokenizer for MANTIS.
 
     Uses BPE (Byte-Pair Encoding) with 50,257 token vocabulary.
     Includes proper subword decomposition for better generalization.

@@ -1,5 +1,5 @@
 """
-Evaluation Metrics for HMST
+Evaluation Metrics for MANTIS
 
 Provides metrics for accuracy, hallucination detection, and calibration.
 """

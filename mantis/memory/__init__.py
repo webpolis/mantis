@@ -1,5 +1,5 @@
 """
-HMST Memory Systems Module
+MANTIS Memory Systems Module
 """
 
 from .episodic import EpisodicMemory, group_similar

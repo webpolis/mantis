@@ -1,5 +1,5 @@
 """
-Unified Training Script for HMST
+Unified Training Script for MANTIS
 
 Supports:
 - Single-GPU and multi-GPU training (via HuggingFace Accelerate)
@@ -78,9 +78,9 @@ torch.backends.cudnn.allow_tf32 = False
 # Suppress cuBLAS recovery warnings (these are expected when workaround is applied)
 warnings.filterwarnings('ignore', message='.*gemm_and_bias error: CUBLAS_STATUS_NOT_INITIALIZED.*')
 
-from hmst.models import BaseMoEModel
-from hmst.configs.model_config import get_micro_config, get_tiny_config, get_small_config, get_base_config
-from hmst.tokenizer import HMSTTokenizer
+from mantis.models import BaseMoEModel
+from mantis.configs.model_config import get_micro_config, get_tiny_config, get_small_config, get_base_config
+from mantis.tokenizer import MANTISTokenizer
 
 try:
     from datasets import load_from_disk, load_dataset
@@ -359,15 +359,15 @@ def load_or_create_tokenizer(tokenizer_path=None):
                        If None, creates a new tokenizer
 
     Returns:
-        HMSTTokenizer instance
+        MANTISTokenizer instance
     """
     if tokenizer_path and os.path.exists(tokenizer_path):
         print(f"Loading tokenizer from {tokenizer_path}...")
-        tokenizer = HMSTTokenizer.load(tokenizer_path)
+        tokenizer = MANTISTokenizer.load(tokenizer_path)
         print(f"Loaded vocabulary: {len(tokenizer):,} tokens")
     else:
         print("Creating new tokenizer...")
-        tokenizer = HMSTTokenizer()
+        tokenizer = MANTISTokenizer()
         print(f"Vocabulary size: {len(tokenizer):,} tokens")
 
     return tokenizer
@@ -979,7 +979,7 @@ def train(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Train HMST Model',
+        description='Train MANTIS Model',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1244,11 +1244,11 @@ Examples:
 
         # Import memory training components
         try:
-            from hmst.training.memory_train import train_memory_stage
+            from mantis.training.memory_train import train_memory_stage
         except ImportError as e:
             raise ImportError(
                 f"Failed to import memory training module: {e}\n\n"
-                "Stage 2 requires memory training implementation in hmst/training/memory_train.py"
+                "Stage 2 requires memory training implementation in mantis/training/memory_train.py"
             )
 
         # Run memory fine-tuning
@@ -1268,11 +1268,11 @@ Examples:
 
         # Import RL training components
         try:
-            from hmst.training.rl_train import train_rl_stage
+            from mantis.training.rl_train import train_rl_stage
         except ImportError as e:
             raise ImportError(
                 f"Failed to import RL training module: {e}\n\n"
-                "Stage 3 requires RL training implementation in hmst/training/rl_train.py"
+                "Stage 3 requires RL training implementation in mantis/training/rl_train.py"
             )
 
         # Run RL training

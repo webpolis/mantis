@@ -13,11 +13,11 @@ from collections import deque
 import random
 import os
 
-from hmst.models.base_moe import BaseMoEModel
-from hmst.models.meta_controller import MetaController, StateSummaryEncoder
-from hmst.models.critic import CriticModel, CriticValueNetwork
-from hmst.inference.engine import HMSTInferenceEngine
-from hmst.tokenizer import HMSTTokenizer
+from mantis.models.base_moe import BaseMoEModel
+from mantis.models.meta_controller import MetaController, StateSummaryEncoder
+from mantis.models.critic import CriticModel, CriticValueNetwork
+from mantis.inference.engine import MANTISInferenceEngine
+from mantis.tokenizer import MANTISTokenizer
 
 
 class PPOTrainer:
@@ -455,7 +455,7 @@ def train_rl_stage(args):
     print(f"Loading tokenizer from: {args.tokenizer_path}")
     if not os.path.exists(args.tokenizer_path):
         raise FileNotFoundError(f"Tokenizer not found: {args.tokenizer_path}")
-    tokenizer = HMSTTokenizer.load(args.tokenizer_path)
+    tokenizer = MANTISTokenizer.load(args.tokenizer_path)
     config.base_moe.vocab_size = len(tokenizer)
     config.critic.vocab_size = len(tokenizer)
 
@@ -495,8 +495,8 @@ def train_rl_stage(args):
     )
     print("✓ Meta-Controller and Value Network initialized.")
 
-    # 3. Create HMSTInferenceEngine
-    print("Creating HMST Inference Engine...")
+    # 3. Create MANTISInferenceEngine
+    print("Creating MANTIS Inference Engine...")
     state_encoder = StateSummaryEncoder(state_dim=config.meta_controller.state_dim)
     critic_model = CriticModel(
         vocab_size=config.critic.vocab_size,
@@ -508,7 +508,7 @@ def train_rl_stage(args):
         dropout=config.critic.dropout
     )
 
-    inference_engine = HMSTInferenceEngine(
+    inference_engine = MANTISInferenceEngine(
         base_model=base_model,
         meta_controller=meta_controller,
         episodic_memory=None,

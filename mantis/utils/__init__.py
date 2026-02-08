@@ -1,5 +1,5 @@
 """
-HMST Utilities Module
+MANTIS Utilities Module
 """
 
 from .logging import setup_logger, MetricsLogger

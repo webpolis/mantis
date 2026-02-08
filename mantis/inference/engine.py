@@ -1,5 +1,5 @@
 """
-HMST Inference Engine
+MANTIS Inference Engine
 
 Orchestrates dynamic routing and generation with memory systems.
 """
@@ -10,9 +10,9 @@ from typing import Dict, Optional, List, Tuple
 import time
 
 
-class HMSTInferenceEngine:
+class MANTISInferenceEngine:
     """
-    Main inference engine for HMST.
+    Main inference engine for MANTIS.
 
     Coordinates:
     - Meta-controller routing decisions

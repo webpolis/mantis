@@ -1,5 +1,5 @@
 """
-Production Inference Script for HMST
+Production Inference Script for MANTIS
 
 Features:
 - Load trained models from checkpoints
@@ -68,8 +68,8 @@ torch.backends.cudnn.allow_tf32 = False
 warnings.filterwarnings('ignore', message='.*gemm_and_bias error: CUBLAS_STATUS_NOT_INITIALIZED.*')
 
 import torch.nn.functional as F
-from hmst.models import BaseMoEModel
-from hmst.tokenizer import HMSTTokenizer
+from mantis.models import BaseMoEModel
+from mantis.tokenizer import MANTISTokenizer
 import argparse
 import os
 import sys
@@ -79,7 +79,7 @@ from typing import Optional, Dict, List
 
 
 class InferenceEngine:
-    """Production-ready inference engine for HMST models."""
+    """Production-ready inference engine for MANTIS models."""
 
     def __init__(
         self,
@@ -153,11 +153,11 @@ class InferenceEngine:
         tokenizer_path = os.path.join(checkpoint_dir, 'tokenizer')
 
         if os.path.exists(tokenizer_path):
-            self.tokenizer = HMSTTokenizer.load(tokenizer_path)
+            self.tokenizer = MANTISTokenizer.load(tokenizer_path)
             print(f"Tokenizer loaded from: {tokenizer_path}")
         else:
             print("Warning: Tokenizer not found, using default GPT-2 tokenizer")
-            self.tokenizer = HMSTTokenizer()
+            self.tokenizer = MANTISTokenizer()
 
         # Print model info
         param_counts = self.model.count_parameters()
@@ -388,7 +388,7 @@ class InferenceEngine:
 def interactive_mode(engine: InferenceEngine, args):
     """Interactive generation mode."""
     print("\n" + "="*80)
-    print("HMST Interactive Generation")
+    print("MANTIS Interactive Generation")
     print("="*80)
     print("\nCommands:")
     print("  Type a prompt to generate text")
@@ -549,7 +549,7 @@ def single_prompt_mode(engine: InferenceEngine, args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='HMST Production Inference',
+        description='MANTIS Production Inference',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

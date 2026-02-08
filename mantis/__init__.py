@@ -1,5 +1,5 @@
 """
-HMST: Hierarchical Memory-State Transformer
+MANTIS: Metacognitive Adaptive Network with Tiered Inference Strategies
 
 A novel LLM architecture for mitigating hallucination and extending long-context memory.
 """
@@ -19,10 +19,10 @@ from .memory import (
     MemoryConsolidator
 )
 
-from .inference import HMSTInferenceEngine
+from .inference import MANTISInferenceEngine
 
 from .configs.model_config import (
-    HMSTConfig,
+    MANTISConfig,
     get_micro_config,
     get_tiny_config,
     get_small_config,
@@ -38,8 +38,8 @@ __all__ = [
     'EpisodicMemory',
     'SemanticMemory',
     'MemoryConsolidator',
-    'HMSTInferenceEngine',
-    'HMSTConfig',
+    'MANTISInferenceEngine',
+    'MANTISConfig',
     'get_micro_config',
     'get_tiny_config',
     'get_small_config',

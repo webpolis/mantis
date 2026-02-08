@@ -104,7 +104,7 @@ class PreTrainer:
         print(f"Starting pre-training for {self.total_steps} steps")
 
         if self.use_wandb:
-            wandb.init(project='hmst-pretrain', config={
+            wandb.init(project='mantis-pretrain', config={
                 'learning_rate': self.optimizer.param_groups[0]['lr'],
                 'warmup_steps': self.warmup_steps,
                 'total_steps': self.total_steps,

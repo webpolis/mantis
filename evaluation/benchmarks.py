@@ -1,5 +1,5 @@
 """
-Benchmark Runners for HMST
+Benchmark Runners for MANTIS
 
 Implements runners for standard LLM benchmarks:
 - MMLU (Massive Multitask Language Understanding)
@@ -65,7 +65,7 @@ class MMLURunner(BenchmarkRunner):
         temperature: float = 0.0
     ) -> Tuple[str, float]:
         """Generate response for MMLU (typically A/B/C/D)."""
-        # Check if model has generate method (HMSTInferenceEngine)
+        # Check if model has generate method (MANTISInferenceEngine)
         if hasattr(self.model, 'generate') and callable(getattr(self.model, 'generate')):
             # Use inference engine's generate method
             with torch.no_grad():
@@ -172,7 +172,7 @@ class TruthfulQARunner(BenchmarkRunner):
         temperature: float = 0.7
     ) -> Tuple[str, float]:
         """Generate response for TruthfulQA."""
-        # Check if model has generate method (HMSTInferenceEngine)
+        # Check if model has generate method (MANTISInferenceEngine)
         if hasattr(self.model, 'generate') and callable(getattr(self.model, 'generate')):
             with torch.no_grad():
                 response = self.model.generate(
@@ -308,7 +308,7 @@ class HumanEvalRunner(BenchmarkRunner):
         temperature: float = 0.2
     ) -> Tuple[str, float]:
         """Generate code completion."""
-        # Check if model has generate method (HMSTInferenceEngine)
+        # Check if model has generate method (MANTISInferenceEngine)
         if hasattr(self.model, 'generate') and callable(getattr(self.model, 'generate')):
             with torch.no_grad():
                 code = self.model.generate(
@@ -417,7 +417,7 @@ class GSM8KRunner(BenchmarkRunner):
         temperature: float = 0.0
     ) -> Tuple[str, float]:
         """Generate math reasoning response."""
-        # Check if model has generate method (HMSTInferenceEngine)
+        # Check if model has generate method (MANTISInferenceEngine)
         if hasattr(self.model, 'generate') and callable(getattr(self.model, 'generate')):
             with torch.no_grad():
                 response = self.model.generate(

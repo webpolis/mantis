@@ -1,5 +1,5 @@
 """
-HMST Model Configuration
+MANTIS Model Configuration
 
 Centralized configuration for all model components.
 """
@@ -124,8 +124,8 @@ class InferenceConfig:
 
 
 @dataclass
-class HMSTConfig:
-    """Complete HMST Configuration."""
+class MANTISConfig:
+    """Complete MANTIS Configuration."""
     base_moe: BaseMoEConfig = field(default_factory=BaseMoEConfig)
     meta_controller: MetaControllerConfig = field(
         default_factory=MetaControllerConfig)
@@ -173,9 +173,9 @@ class HMSTConfig:
 
 
 # Default configurations for different scales
-def get_micro_config() -> HMSTConfig:
+def get_micro_config() -> MANTISConfig:
     """Micro model for TinyStories dataset (10-15M parameters, dense)."""
-    config = HMSTConfig()
+    config = MANTISConfig()
     config.base_moe.d_model = 256
     config.base_moe.n_layers = 4
     config.base_moe.n_heads = 4
@@ -189,9 +189,9 @@ def get_micro_config() -> HMSTConfig:
     return config
 
 
-def get_tiny_config() -> HMSTConfig:
+def get_tiny_config() -> MANTISConfig:
     """Tiny model for rapid testing (~100M parameters)."""
-    config = HMSTConfig()
+    config = MANTISConfig()
     config.base_moe.d_model = 512
     config.base_moe.n_layers = 6
     config.base_moe.n_heads = 8
@@ -204,9 +204,9 @@ def get_tiny_config() -> HMSTConfig:
     return config
 
 
-def get_small_config() -> HMSTConfig:
+def get_small_config() -> MANTISConfig:
     """Small model for testing (~1B parameters)."""
-    config = HMSTConfig()
+    config = MANTISConfig()
     config.base_moe.d_model = 1024
     config.base_moe.n_layers = 12
     config.base_moe.d_ff = 4096
@@ -217,14 +217,14 @@ def get_small_config() -> HMSTConfig:
     return config
 
 
-def get_base_config() -> HMSTConfig:
+def get_base_config() -> MANTISConfig:
     """Base model (~12B parameters)."""
-    return HMSTConfig()
+    return MANTISConfig()
 
 
-def get_large_config() -> HMSTConfig:
+def get_large_config() -> MANTISConfig:
     """Large model (~30B parameters)."""
-    config = HMSTConfig()
+    config = MANTISConfig()
     config.base_moe.d_model = 4096
     config.base_moe.n_layers = 32
     config.base_moe.d_ff = 16384
@@ -235,9 +235,9 @@ def get_large_config() -> HMSTConfig:
     return config
 
 
-def get_extmem_config() -> HMSTConfig:
+def get_extmem_config() -> MANTISConfig:
     """Extended episodic memory"""
-    config = HMSTConfig()
+    config = MANTISConfig()
     config.episodic_memory.max_seq_len = 32768  # 32K tokens
     config.base_moe.max_seq_len = 32768  # Match the base model too
     config.meta_controller.n_experts = config.base_moe.n_experts  # Keep in sync

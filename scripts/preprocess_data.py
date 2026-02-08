@@ -23,7 +23,7 @@ Usage:
 import argparse
 from pathlib import Path
 from datasets import load_dataset
-from hmst.tokenizer import HMSTTokenizer
+from mantis.tokenizer import MANTISTokenizer
 from tqdm import tqdm
 
 
@@ -70,7 +70,7 @@ def preprocess_dataset(input_file, output_path, tokenizer, seq_len, stride, num_
     Args:
         input_file: Path to input text file
         output_path: Path to save tokenized dataset
-        tokenizer: HMSTTokenizer instance
+        tokenizer: MANTISTokenizer instance
         seq_len: Sequence length
         stride: Stride for overlapping sequences
         num_proc: Number of processes for parallel tokenization
@@ -193,11 +193,11 @@ Examples:
     # Load or create tokenizer
     if args.tokenizer:
         print(f"Loading tokenizer from {args.tokenizer}...")
-        tokenizer = HMSTTokenizer.load(args.tokenizer)
+        tokenizer = MANTISTokenizer.load(args.tokenizer)
         print(f"Loaded vocabulary: {len(tokenizer):,} tokens")
     else:
         print("Creating new tokenizer...")
-        tokenizer = HMSTTokenizer()
+        tokenizer = MANTISTokenizer()
         print(f"Vocabulary size: {len(tokenizer):,} tokens")
 
         # Save tokenizer if requested

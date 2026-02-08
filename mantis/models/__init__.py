@@ -1,5 +1,5 @@
 """
-HMST Models Module
+MANTIS Models Module
 """
 
 from .base_moe import BaseMoEModel, MoELayer, Expert

@@ -12,12 +12,12 @@ from tqdm import tqdm
 import os
 import random
 
-from hmst.models.base_moe import BaseMoEModel
-from hmst.models.ssm import EpisodicMemorySSM
-from hmst.memory.episodic import EpisodicMemory
-from hmst.memory.semantic import SemanticMemory
-from hmst.memory.consolidation import MemoryConsolidator
-from hmst.tokenizer import HMSTTokenizer
+from mantis.models.base_moe import BaseMoEModel
+from mantis.models.ssm import EpisodicMemorySSM
+from mantis.memory.episodic import EpisodicMemory
+from mantis.memory.semantic import SemanticMemory
+from mantis.memory.consolidation import MemoryConsolidator
+from mantis.tokenizer import MANTISTokenizer
 import numpy as np
 
 
@@ -26,7 +26,7 @@ def compute_episodic_retrieval_loss(
     base_model: BaseMoEModel,
     queries: List[str],
     contexts: List[str],
-    tokenizer: HMSTTokenizer,
+    tokenizer: MANTISTokenizer,
     device: str
 ) -> torch.Tensor:
     """
@@ -83,7 +83,7 @@ def compute_episodic_retrieval_loss(
 def compute_semantic_embedding_loss(
     base_model: BaseMoEModel,
     facts: List[str],
-    tokenizer: HMSTTokenizer,
+    tokenizer: MANTISTokenizer,
     device: str
 ) -> torch.Tensor:
     """
@@ -169,7 +169,7 @@ def train_memory_stage(args):
     print(f"Loading tokenizer from: {args.tokenizer_path}")
     if not os.path.exists(args.tokenizer_path):
         raise FileNotFoundError(f"Tokenizer not found: {args.tokenizer_path}")
-    tokenizer = HMSTTokenizer.load(args.tokenizer_path)
+    tokenizer = MANTISTokenizer.load(args.tokenizer_path)
     config.base_moe.vocab_size = len(tokenizer)
 
     # Load base model

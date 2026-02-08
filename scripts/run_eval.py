@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CLI Script to run HMST model evaluations.
+CLI Script to run MANTIS model evaluations.
 
 Usage:
     python scripts/run_eval.py checkpoints/model.pt --benchmarks mmlu truthfulqa
@@ -15,8 +15,8 @@ import os
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from hmst import BaseMoEModel
-from hmst.tokenizer import HMSTTokenizer
+from mantis import BaseMoEModel
+from mantis.tokenizer import MANTISTokenizer
 from evaluation import EvaluationHarness
 
 
@@ -28,7 +28,7 @@ def load_model(checkpoint_path: str, tokenizer_path: str, device: str):
     config = checkpoint['config']
 
     # Load tokenizer
-    tokenizer = HMSTTokenizer.load(tokenizer_path)
+    tokenizer = MANTISTokenizer.load(tokenizer_path)
     config.base_moe.vocab_size = len(tokenizer)
 
     # Load model
@@ -93,7 +93,7 @@ def load_demo_datasets():
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Run HMST model evaluation on standard benchmarks'
+        description='Run MANTIS model evaluation on standard benchmarks'
     )
 
     parser.add_argument('checkpoint', type=str,
@@ -150,7 +150,7 @@ def main():
 
     # Run evaluations
     print(f"\n{'='*80}")
-    print("HMST MODEL EVALUATION")
+    print("MANTIS MODEL EVALUATION")
     print(f"{'='*80}\n")
     print(f"Model: {args.checkpoint}")
     print(f"Benchmarks: {list(datasets.keys())}")

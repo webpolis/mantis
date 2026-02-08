@@ -1,5 +1,5 @@
 """
-Mixture-of-Experts Base Model for HMST Architecture
+Mixture-of-Experts Base Model for MANTIS Architecture
 
 Implements sparse MoE transformer with top-k routing and load balancing.
 """
@@ -237,7 +237,7 @@ class TransformerBlock(nn.Module):
 
 class BaseMoEModel(nn.Module):
     """
-    Base MoE Transformer model for HMST.
+    Base MoE Transformer model for MANTIS.
 
     12B total parameters, 2B active per forward pass.
     """

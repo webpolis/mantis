@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate HMST architecture diagram for scientific publication.
+Generate MANTIS architecture diagram for scientific publication.
 Creates a TikZ LaTeX file that can be compiled to PDF.
 """
 
@@ -12,11 +12,11 @@ tikz_content = r"""
 \usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, calc, backgrounds, shadows}
 
 % Color Palette (Nature/Science style)
-\definecolor{hmstBlue}{RGB}{66, 133, 244}   % Main Process
-\definecolor{hmstRed}{RGB}{234, 67, 53}     % Controller/Decision
-\definecolor{hmstGreen}{RGB}{52, 168, 83}   % Memory
-\definecolor{hmstYellow}{RGB}{251, 188, 5}  % Warning/Critic
-\definecolor{hmstGray}{RGB}{240, 240, 240}  % Backgrounds
+\definecolor{mantisBlue}{RGB}{66, 133, 244}   % Main Process
+\definecolor{mantisRed}{RGB}{234, 67, 53}     % Controller/Decision
+\definecolor{mantisGreen}{RGB}{52, 168, 83}   % Memory
+\definecolor{mantisYellow}{RGB}{251, 188, 5}  % Warning/Critic
+\definecolor{mantisGray}{RGB}{240, 240, 240}  % Backgrounds
 \definecolor{darkGray}{RGB}{100, 100, 100}
 
 \begin{document}
@@ -32,8 +32,8 @@ tikz_content = r"""
         minimum width=2.5cm,
         minimum height=1cm,
         text centered,
-        draw=hmstBlue!80,
-        fill=hmstBlue!10,
+        draw=mantisBlue!80,
+        fill=mantisBlue!10,
         thick
     },
     controller/.style={
@@ -42,8 +42,8 @@ tikz_content = r"""
         minimum width=3cm,
         minimum height=1.5cm,
         text centered,
-        draw=hmstRed!80,
-        fill=hmstRed!10,
+        draw=mantisRed!80,
+        fill=mantisRed!10,
         thick,
         drop shadow
     },
@@ -54,14 +54,14 @@ tikz_content = r"""
         minimum width=2cm,
         minimum height=1.5cm,
         text centered,
-        draw=hmstGreen!80,
-        fill=hmstGreen!10,
+        draw=mantisGreen!80,
+        fill=mantisGreen!10,
         thick
     },
     expert/.style={
         rectangle,
         minimum size=0.8cm,
-        draw=hmstBlue!80,
+        draw=mantisBlue!80,
         fill=white,
         thick
     },
@@ -71,8 +71,8 @@ tikz_content = r"""
         trapezium angle=70,
         minimum width=1.5cm,
         minimum height=0.6cm,
-        draw=hmstRed!80,
-        fill=hmstRed!5,
+        draw=mantisRed!80,
+        fill=mantisRed!5,
         thick,
         font=\tiny
     },
@@ -80,7 +80,7 @@ tikz_content = r"""
         diamond,
         aspect=1.5,
         minimum width=1.5cm,
-        draw=hmstRed!80,
+        draw=mantisRed!80,
         fill=white,
         font=\tiny
     },
@@ -90,8 +90,8 @@ tikz_content = r"""
         trapezium right angle=110,
         minimum width=2.5cm,
         minimum height=1cm,
-        draw=hmstYellow!100!orange,
-        fill=hmstYellow!20,
+        draw=mantisYellow!100!orange,
+        fill=mantisYellow!20,
         thick
     },
     state_summary/.style={
@@ -103,9 +103,9 @@ tikz_content = r"""
     },
     % Connector Styles
     flow/.style={->, thick, darkGray},
-    control/.style={->, thick, hmstRed, dashed},
-    memory_link/.style={->, thick, hmstGreen},
-    consolidation/.style={->, double, thick, hmstGreen!60}
+    control/.style={->, thick, mantisRed, dashed},
+    memory_link/.style={->, thick, mantisGreen},
+    consolidation/.style={->, double, thick, mantisGreen!60}
 ]
 
 % --- 1. Central Spine ---
@@ -128,13 +128,13 @@ tikz_content = r"""
 % --- 2. Memory Hierarchy (Left Flank) ---
 
 % L2 Episodic
-\node (episodic) [process, left=3cm of meta, align=center, fill=hmstGreen!10] {L2: Episodic\\(SSM/Mamba State)};
-\draw[control] (meta) to[bend right=10] node[midway, above, font=\tiny, text=hmstRed] {Gate 2} (episodic);
+\node (episodic) [process, left=3cm of meta, align=center, fill=mantisGreen!10] {L2: Episodic\\(SSM/Mamba State)};
+\draw[control] (meta) to[bend right=10] node[midway, above, font=\tiny, text=mantisRed] {Gate 2} (episodic);
 \draw[memory_link] (episodic) to[bend right=10] (meta);
 
 % L3 Semantic
 \node (semantic) [memory, below=1.5cm of episodic, align=center] {L3: Semantic\\(FAISS Index)};
-\draw[control] (meta) to[bend left=10] node[midway, below, font=\tiny, text=hmstRed] {Gate 3} (semantic);
+\draw[control] (meta) to[bend left=10] node[midway, below, font=\tiny, text=mantisRed] {Gate 3} (semantic);
 \draw[memory_link] (semantic) to[bend left=10] (meta);
 
 % Consolidation Flow (outer left edge, asynchronous)
@@ -148,7 +148,7 @@ tikz_content = r"""
 
 % Router Node (explicit decision point)
 \node (router) [router, above=1.2cm of meta] {Router\\(Gate 4)};
-\draw[control] (meta.north) -- node[midway, right, font=\tiny, text=hmstRed] {Expert Weights} (router.south);
+\draw[control] (meta.north) -- node[midway, right, font=\tiny, text=mantisRed] {Expert Weights} (router.south);
 
 % Experts Container
 \node (moe_hub) [above=1.2cm of router] {};
@@ -181,22 +181,22 @@ tikz_content = r"""
 
 % Critic (right side, moved further right for Early Exit clearance)
 \node (critic) [critic, right=4.5cm of output, align=center] {Critic Model\\(1B Param)};
-\draw[control] (meta.east) to[out=15, in=250] node[pos=0.7, right, font=\tiny, text=hmstRed] {Gate 5} (critic.south);
+\draw[control] (meta.east) to[out=15, in=250] node[pos=0.7, right, font=\tiny, text=mantisRed] {Gate 5} (critic.south);
 \draw[control, dashed] (critic.west) -- node[midway, above, font=\tiny] {Block/Refine} (output.east);
 
 % Early Exit Path (vertical, far right, bypasses all computation)
 \coordinate (early_exit_start) at ($(meta.east) + (3.5, 0)$);
 \coordinate (early_exit_end) at ($(output.east) + (1.5, 0)$);
-\draw[control, very thick] (meta.east) -- (early_exit_start) |- node[near start, right, font=\tiny, text=hmstRed, align=left] {Gate 1:\\Early Exit} (early_exit_end) -- (output.east);
+\draw[control, very thick] (meta.east) -- (early_exit_start) |- node[near start, right, font=\tiny, text=mantisRed, align=left] {Gate 1:\\Early Exit} (early_exit_end) -- (output.east);
 
 % --- Backgrounds/Grouping ---
 
 \begin{pgfonlayer}{background}
     % Memory Group
-    \node [fit=(episodic) (semantic) (l1), fill=hmstGreen!5, rounded corners, draw=hmstGreen!20, label={[hmstGreen, font=\bfseries]above:Memory System}] {};
+    \node [fit=(episodic) (semantic) (l1), fill=mantisGreen!5, rounded corners, draw=mantisGreen!20, label={[mantisGreen, font=\bfseries]above:Memory System}] {};
 
     % MoE Group
-    \node [fit=(exp1) (exp8), fill=hmstBlue!5, rounded corners, draw=hmstBlue!20, label={[hmstBlue, font=\bfseries]above:Sparse MoE Layer}] {};
+    \node [fit=(exp1) (exp8), fill=mantisBlue!5, rounded corners, draw=mantisBlue!20, label={[mantisBlue, font=\bfseries]above:Sparse MoE Layer}] {};
 \end{pgfonlayer}
 
 \end{tikzpicture}
@@ -205,14 +205,14 @@ tikz_content = r"""
 
 def main():
     """Generate the TikZ LaTeX file."""
-    output_file = "hmst_architecture.tex"
+    output_file = "mantis_architecture.tex"
 
     with open(output_file, "w") as f:
         f.write(tikz_content)
 
     print(f"✓ Successfully created '{output_file}' in {os.getcwd()}")
     print("\nTo compile to PDF:")
-    print("  pdflatex hmst_architecture.tex")
+    print("  pdflatex mantis_architecture.tex")
     print("\nOr upload to Overleaf for easy compilation.")
 
 if __name__ == "__main__":
