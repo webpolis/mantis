@@ -81,6 +81,7 @@ warnings.filterwarnings('ignore', message='.*gemm_and_bias error: CUBLAS_STATUS_
 from mantis.models import BaseMoEModel
 from mantis.configs.model_config import get_micro_config, get_tiny_config, get_small_config, get_base_config
 from mantis.tokenizer import MANTISTokenizer
+from mantis.utils.checkpoints import compat_load
 
 try:
     from datasets import load_from_disk, load_dataset
@@ -123,6 +124,8 @@ class TextDataset(Dataset):
         chunk_size = 1_000_000  # 1MB text chunks
         all_tokens = []
 
+        eos_id = tokenizer.eos_token_id
+
         with open(file_path, 'r', encoding='utf-8') as f:
             pbar = tqdm(total=file_size, desc="Tokenizing", unit='B', unit_scale=True)
 
@@ -133,6 +136,7 @@ class TextDataset(Dataset):
                     if remainder:
                         tokens = tokenizer.encode(remainder, add_special_tokens=False)
                         all_tokens.extend(tokens)
+                        all_tokens.append(eos_id)
                         pbar.update(len(remainder.encode('utf-8')))
                     break
 
@@ -145,6 +149,7 @@ class TextDataset(Dataset):
                 text_to_encode = chunk[:last_nl + 1]
                 tokens = tokenizer.encode(text_to_encode, add_special_tokens=False)
                 all_tokens.extend(tokens)
+                all_tokens.append(eos_id)
                 pbar.update(len(text_to_encode.encode('utf-8')))
 
             pbar.close()
@@ -298,18 +303,24 @@ class HuggingFaceDataset(Dataset):
 
         text = example[self.text_column]
         tokens = self.tokenizer.encode(text, add_special_tokens=False)
+        tokens.append(self.tokenizer.eos_token_id)
 
         # Truncate or pad to seq_len + 1 (for input and label)
+        pad_len = 0
         if len(tokens) < self.seq_len + 1:
-            # Pad with pad token
-            tokens = tokens + [self.tokenizer.pad_token_id] * (self.seq_len + 1 - len(tokens))
+            pad_len = self.seq_len + 1 - len(tokens)
+            tokens = tokens + [self.tokenizer.pad_token_id] * pad_len
         else:
-            # Truncate
             tokens = tokens[:self.seq_len + 1]
 
         # Create input_ids and labels for next-token prediction
         input_ids = tokens[:-1]
         labels = tokens[1:]
+
+        # Mask padding positions in labels so the model doesn't learn to predict pad tokens
+        if pad_len > 0:
+            for i in range(len(labels) - pad_len, len(labels)):
+                labels[i] = -100
 
         return {
             'input_ids': torch.tensor(input_ids, dtype=torch.long),
@@ -392,13 +403,13 @@ def validate(model, dataloader, tokenizer, device, rank=0):
         loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
             labels.view(-1),
-            ignore_index=tokenizer.pad_token_id,
+            ignore_index=-100,
             reduction='sum'
         )
 
         total_loss += loss.item()
-        # Count only non-padding tokens for accurate PPL calculation
-        non_pad_tokens = (labels != tokenizer.pad_token_id).sum().item()
+        # Count only non-masked tokens for accurate PPL calculation
+        non_pad_tokens = (labels != -100).sum().item()
         total_tokens += non_pad_tokens
 
     avg_loss = total_loss / total_tokens if total_tokens > 0 else 0.0
@@ -600,7 +611,7 @@ def train(args):
         if not os.path.exists(args.resume):
             raise FileNotFoundError(f"Checkpoint not found: {args.resume}")
 
-        checkpoint_for_config = torch.load(args.resume, map_location='cpu')
+        checkpoint_for_config = compat_load(args.resume)
         if 'config' not in checkpoint_for_config:
             raise ValueError(f"Checkpoint missing 'config' key: {args.resume}")
 
@@ -738,7 +749,7 @@ def train(args):
         if accelerator.is_main_process:
             print(f"\nResuming from checkpoint: {args.resume}")
 
-        checkpoint = torch.load(args.resume, map_location='cpu')
+        checkpoint = compat_load(args.resume)
 
         # Restore model state using unwrap_model to access actual model beneath Accelerate's wrapper
         unwrapped_model = accelerator.unwrap_model(model)
@@ -821,7 +832,7 @@ def train(args):
                 lm_loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     labels.view(-1),
-                    ignore_index=tokenizer.pad_token_id
+                    ignore_index=-100
                 )
                 total_loss = lm_loss + load_balance_loss
 

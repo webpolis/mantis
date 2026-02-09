@@ -37,11 +37,13 @@ def tokenize_and_chunk(examples, tokenizer, seq_len, stride):
     3. Splits into fixed-length chunks with stride
     4. Creates input_ids and labels for next-token prediction
     """
-    # Tokenize all texts
+    # Tokenize all texts, inserting EOS between documents
     all_tokens = []
+    eos_id = tokenizer.eos_token_id
     for text in examples['text']:
         tokens = tokenizer.encode(text, add_special_tokens=False)
         all_tokens.extend(tokens)
+        all_tokens.append(eos_id)
 
     # Create sequences with stride
     sequences = []

@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mantis import BaseMoEModel
 from mantis.tokenizer import MANTISTokenizer
+from mantis.utils.checkpoints import compat_load
 from evaluation import EvaluationHarness
 
 
@@ -24,7 +25,7 @@ def load_model(checkpoint_path: str, tokenizer_path: str, device: str):
     """Load model from checkpoint."""
     print(f"Loading model from: {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    checkpoint = compat_load(checkpoint_path)
     config = checkpoint['config']
 
     # Load tokenizer

@@ -11,6 +11,7 @@ from typing import List, Dict, Optional
 from tqdm import tqdm
 import os
 import random
+from mantis.utils.checkpoints import compat_load
 
 from mantis.models.base_moe import BaseMoEModel
 from mantis.models.ssm import EpisodicMemorySSM
@@ -160,7 +161,7 @@ def train_memory_stage(args):
     if not os.path.exists(args.resume):
         raise FileNotFoundError(f"Checkpoint not found: {args.resume}")
 
-    checkpoint = torch.load(args.resume, map_location='cpu')
+    checkpoint = compat_load(args.resume)
     if 'config' not in checkpoint:
         raise ValueError(f"Checkpoint missing 'config' key: {args.resume}")
     config = checkpoint['config']

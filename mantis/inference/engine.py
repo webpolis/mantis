@@ -40,6 +40,7 @@ class MANTISInferenceEngine:
         self.state_encoder = state_encoder.to(device)
         self.tokenizer = tokenizer
         self.device = device
+        self.eos_token_id = tokenizer.eos_token_id if tokenizer else None
 
         # Inference statistics
         self.stats = {
@@ -351,8 +352,7 @@ class MANTISInferenceEngine:
             # Append
             generated = torch.cat([generated, next_token.unsqueeze(1)], dim=1)
 
-            # Stop if EOS (assuming token 2 is EOS)
-            if next_token.item() == 2:
+            if self.eos_token_id is not None and next_token.item() == self.eos_token_id:
                 break
 
         return generated

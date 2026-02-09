@@ -2,9 +2,37 @@
 Checkpoint management utilities.
 """
 
+import pickle
 import torch
 import os
 from typing import Dict, Optional
+
+
+class _HmstCompatUnpickler(pickle.Unpickler):
+    """Remaps old 'hmst' module/class names to 'mantis' during checkpoint loading."""
+    _CLASS_RENAMES = {
+        'HMSTConfig': 'MANTISConfig',
+        'HMSTTokenizer': 'MANTISTokenizer',
+        'HMSTInferenceEngine': 'MANTISInferenceEngine',
+    }
+
+    def find_class(self, module, name):
+        if module.startswith('hmst'):
+            module = 'mantis' + module[4:]
+        name = self._CLASS_RENAMES.get(name, name)
+        return super().find_class(module, name)
+
+
+class _CompatPickle:
+    """Pickle module stand-in that uses _HmstCompatUnpickler."""
+    Unpickler = _HmstCompatUnpickler
+    def __getattr__(self, name):
+        return getattr(pickle, name)
+
+
+def compat_load(path, *, map_location='cpu'):
+    """Load a checkpoint, remapping old 'hmst' module paths to 'mantis'."""
+    return torch.load(path, map_location=map_location, weights_only=False, pickle_module=_CompatPickle())
 
 
 def save_checkpoint(
@@ -70,7 +98,7 @@ def load_checkpoint(
     Returns:
         Dict with checkpoint metadata
     """
-    checkpoint = torch.load(path, map_location=device)
+    checkpoint = compat_load(path, map_location=device)
 
     model.load_state_dict(checkpoint['model_state_dict'])
 

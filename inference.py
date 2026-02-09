@@ -70,6 +70,7 @@ warnings.filterwarnings('ignore', message='.*gemm_and_bias error: CUBLAS_STATUS_
 import torch.nn.functional as F
 from mantis.models import BaseMoEModel
 from mantis.tokenizer import MANTISTokenizer
+from mantis.utils.checkpoints import compat_load
 import argparse
 import os
 import sys
@@ -105,7 +106,7 @@ class InferenceEngine:
 
         # Load checkpoint
         try:
-            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+            checkpoint = compat_load(checkpoint_path, map_location=self.device)
         except Exception as e:
             raise RuntimeError(f"Failed to load checkpoint: {e}")
 

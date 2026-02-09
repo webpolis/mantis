@@ -13,6 +13,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 import os
 from typing import Dict, Optional
 from tqdm import tqdm
+from mantis.utils.checkpoints import compat_load
 import wandb
 
 
@@ -261,7 +262,7 @@ class PreTrainer:
 
     def load_checkpoint(self, checkpoint_path: str):
         """Load model checkpoint."""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = compat_load(checkpoint_path, map_location=self.device)
 
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
