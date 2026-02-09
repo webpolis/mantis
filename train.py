@@ -458,6 +458,26 @@ def train(args):
         if args.cpu_offload:
             print("✓ CPU offloading enabled")
 
+    # Adjust batch size based on GPU VRAM (for heterogeneous multi-GPU setups)
+    if accelerator.num_processes > 1 and torch.cuda.is_available():
+        device_id = accelerator.local_process_index
+        gpu_memory_gb = torch.cuda.get_device_properties(device_id).total_memory / (1024**3)
+
+        # Auto-adjust batch size based on VRAM
+        if gpu_memory_gb < 8 and args.batch_size > 1:
+            original_batch_size = args.batch_size
+            args.batch_size = 1
+            print(f"[Rank {accelerator.process_index}] GPU {device_id} ({gpu_memory_gb:.1f}GB): "
+                  f"Reduced batch_size {original_batch_size} → {args.batch_size}")
+        elif gpu_memory_gb >= 10 and args.batch_size < 2:  # Changed from 12 to 10
+            original_batch_size = args.batch_size
+            args.batch_size = 2
+            print(f"[Rank {accelerator.process_index}] GPU {device_id} ({gpu_memory_gb:.1f}GB): "
+                  f"Increased batch_size {original_batch_size} → {args.batch_size}")
+        else:
+            print(f"[Rank {accelerator.process_index}] GPU {device_id} ({gpu_memory_gb:.1f}GB): "
+                  f"Using batch_size={args.batch_size}")
+
     tokenizer = load_or_create_tokenizer(args.tokenizer_path)
 
     # Datasets
