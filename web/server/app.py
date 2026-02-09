@@ -18,6 +18,7 @@ from stream_simulation import (
     parse_protocol_to_ticks,
     serialize_agent_for_frontend,
     serialize_species_for_frontend,
+    split_worlds,
 )
 
 app = Flask(__name__, static_folder=None)
@@ -76,7 +77,11 @@ def handle_start(data=None):
     with open(filepath) as f:
         text = f.read()
 
-    ticks = parse_protocol_to_ticks(text)
+    worlds = split_worlds(text)
+    world_index = max(0, min(data.get("world_index", 0), len(worlds) - 1)) if worlds else 0
+    world_text = worlds[world_index] if worlds else text
+
+    ticks = parse_protocol_to_ticks(world_text)
     if not ticks:
         emit("error", {"message": "No ticks parsed from file."})
         return
@@ -84,6 +89,8 @@ def handle_start(data=None):
     emit("simulation_info", {
         "total_ticks": len(ticks),
         "file": os.path.basename(filepath),
+        "world_index": world_index,
+        "world_count": len(worlds),
     })
 
     for tick in ticks:
@@ -92,11 +99,7 @@ def handle_start(data=None):
 
         species_data = [serialize_species_for_frontend(sp) for sp in tick.species]
 
-        # Agents: group by the @SP context they appeared under
-        agent_data = []
-        for sp in tick.species:
-            for agent in tick.agents:
-                agent_data.append(serialize_agent_for_frontend(agent, sp.sid))
+        agent_data = [serialize_agent_for_frontend(agent) for agent in tick.agents]
 
         emit("tick_update", {
             "tick": tick.number,
@@ -199,6 +202,34 @@ def handle_start_live(data=None):
         socketio.sleep(1.0 / (TICK_RATE * current_speed))
 
     emit("simulation_complete", {"total_ticks": world.tick})
+
+
+@socketio.on("list_datasets")
+def handle_list_datasets():
+    """Scan data/ directory and emit available dataset files."""
+    data_dir = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "..", "data"))
+    files = []
+    if os.path.isdir(data_dir):
+        for f in sorted(os.listdir(data_dir)):
+            if f.endswith(".txt"):
+                fpath = os.path.join(data_dir, f)
+                files.append({"name": f, "size": os.path.getsize(fpath)})
+    emit("dataset_list", files)
+
+
+@socketio.on("list_worlds")
+def handle_list_worlds(data):
+    """Read a dataset file and report how many worlds it contains."""
+    data_dir = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "..", "data"))
+    filename = os.path.basename(data.get("file", ""))
+    filepath = os.path.realpath(os.path.join(data_dir, filename))
+    if not filepath.startswith(data_dir) or not os.path.exists(filepath):
+        emit("error", {"message": f"File not found: {filename}"})
+        return
+    with open(filepath) as f:
+        text = f.read()
+    worlds = split_worlds(text)
+    emit("world_list", {"file": filename, "world_count": len(worlds)})
 
 
 @socketio.on("pause")

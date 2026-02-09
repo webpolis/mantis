@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { io, Socket } from "socket.io-client";
-import type { AgentSnapshot, SpeciesInfo, TickData, SimulationInfo } from "../types/simulation";
+import type { AgentSnapshot, SpeciesInfo, TickData, SimulationInfo, DatasetFile, WorldList } from "../types/simulation";
 
 export function useWebSocket() {
   const socketRef = useRef<Socket | null>(null);
@@ -11,6 +11,10 @@ export function useWebSocket() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [info, setInfo] = useState<SimulationInfo | null>(null);
   const [interpolateDuration, setInterpolateDuration] = useState(66.7);
+  const [datasets, setDatasets] = useState<DatasetFile[]>([]);
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [worldCount, setWorldCount] = useState(0);
+  const [selectedWorld, setSelectedWorld] = useState(0);
 
   useEffect(() => {
     const socket = io(window.location.origin, {
@@ -39,12 +43,36 @@ export function useWebSocket() {
       setIsPlaying(false);
     });
 
+    socket.on("dataset_list", (data: DatasetFile[]) => {
+      setDatasets(data);
+    });
+
+    socket.on("world_list", (data: WorldList) => {
+      setWorldCount(data.world_count);
+      setSelectedWorld(0);
+    });
+
+    socket.on("connect", () => {
+      socket.emit("list_datasets");
+    });
+
     return () => {
       socket.disconnect();
     };
   }, []);
 
-  const play = useCallback((mode: "file" | "live" = "live") => {
+  const selectFile = useCallback((name: string) => {
+    setSelectedFile(name);
+    setWorldCount(0);
+    setSelectedWorld(0);
+    socketRef.current?.emit("list_worlds", { file: name });
+  }, []);
+
+  const selectWorld = useCallback((index: number) => {
+    setSelectedWorld(index);
+  }, []);
+
+  const play = useCallback((mode: "file" | "live" = "live", file?: string, worldIndex?: number) => {
     const socket = socketRef.current;
     if (!socket) return;
     setIsPlaying(true);
@@ -56,7 +84,10 @@ export function useWebSocket() {
         agent_epoch: "ECOSYSTEM",
       });
     } else {
-      socket.emit("start_simulation", {});
+      socket.emit("start_simulation", {
+        file: file ?? undefined,
+        world_index: worldIndex ?? 0,
+      });
     }
   }, []);
 
@@ -86,5 +117,11 @@ export function useWebSocket() {
     pause,
     resume,
     setSpeed,
+    datasets,
+    selectedFile,
+    worldCount,
+    selectedWorld,
+    selectFile,
+    selectWorld,
   };
 }

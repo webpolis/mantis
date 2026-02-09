@@ -29,4 +29,16 @@ export interface SimulationInfo {
   total_ticks: number;
   file?: string;
   mode?: string;
+  world_index?: number;
+  world_count?: number;
+}
+
+export interface DatasetFile {
+  name: string;
+  size: number;
+}
+
+export interface WorldList {
+  file: string;
+  world_count: number;
 }

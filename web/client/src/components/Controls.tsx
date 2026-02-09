@@ -1,12 +1,38 @@
+import type { DatasetFile } from "../types/simulation";
+
 interface Props {
-  onPlay: (mode: "file" | "live") => void;
+  onPlay: (mode: "file" | "live", file?: string, worldIndex?: number) => void;
   onPause: () => void;
   onResume: () => void;
   onSpeed: (speed: number) => void;
   isPlaying: boolean;
+  datasets: DatasetFile[];
+  selectedFile: string | null;
+  worldCount: number;
+  selectedWorld: number;
+  onSelectFile: (name: string) => void;
+  onSelectWorld: (index: number) => void;
 }
 
-export function Controls({ onPlay, onPause, onResume, onSpeed, isPlaying }: Props) {
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}K`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}M`;
+}
+
+export function Controls({
+  onPlay,
+  onPause,
+  onResume,
+  onSpeed,
+  isPlaying,
+  datasets,
+  selectedFile,
+  worldCount,
+  selectedWorld,
+  onSelectFile,
+  onSelectWorld,
+}: Props) {
   return (
     <div
       style={{
@@ -24,8 +50,48 @@ export function Controls({ onPlay, onPause, onResume, onSpeed, isPlaying }: Prop
           <button onClick={() => onPlay("live")} style={btnStyle}>
             Live Simulation
           </button>
-          <button onClick={() => onPlay("file")} style={{ ...btnStyle, background: "#444" }}>
-            From File
+
+          <div style={dividerStyle} />
+
+          <select
+            value={selectedFile ?? ""}
+            onChange={(e) => e.target.value && onSelectFile(e.target.value)}
+            style={selectStyle}
+          >
+            <option value="">Dataset...</option>
+            {datasets.map((d) => (
+              <option key={d.name} value={d.name}>
+                {d.name} ({formatSize(d.size)})
+              </option>
+            ))}
+          </select>
+
+          {worldCount > 0 && (
+            <label style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              World:
+              <input
+                type="number"
+                min={0}
+                max={worldCount - 1}
+                value={selectedWorld}
+                onChange={(e) => onSelectWorld(Number(e.target.value))}
+                style={{ ...selectStyle, width: "60px" }}
+              />
+              <span style={{ color: "#888", fontSize: "12px" }}>/ {worldCount}</span>
+            </label>
+          )}
+
+          <button
+            onClick={() => onPlay("file", selectedFile ?? undefined, selectedWorld)}
+            disabled={!selectedFile}
+            style={{
+              ...btnStyle,
+              background: selectedFile ? "#444" : "#333",
+              opacity: selectedFile ? 1 : 0.5,
+              cursor: selectedFile ? "pointer" : "not-allowed",
+            }}
+          >
+            Play World
           </button>
         </>
       ) : (
@@ -75,4 +141,10 @@ const selectStyle: React.CSSProperties = {
   color: "#eee",
   border: "1px solid #555",
   borderRadius: "4px",
+};
+
+const dividerStyle: React.CSSProperties = {
+  width: "1px",
+  height: "28px",
+  background: "#555",
 };

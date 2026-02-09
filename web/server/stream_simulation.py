@@ -18,6 +18,7 @@ class ParsedAgent:
     state: str = "rest"
     target_aid: int | None = None
     dead: bool = False
+    species_sid: int = 0
 
 
 @dataclass
@@ -184,7 +185,7 @@ def parse_protocol_to_ticks(text: str) -> list[ParsedTick]:
 
 def _agent_to_dict_agent(a: ParsedAgent, species_sid: int) -> ParsedAgent:
     """Attach species SID to parsed agent."""
-    # species_sid is tracked via the current @SP context
+    a.species_sid = species_sid
     return a
 
 
@@ -215,11 +216,20 @@ def _parse_species_header(line: str) -> ParsedSpecies | None:
     return sp
 
 
-def serialize_agent_for_frontend(agent: ParsedAgent, species_sid: int = 0) -> dict:
+def split_worlds(text: str) -> list[str]:
+    """Split a multi-world dataset into individual world texts.
+
+    Worlds are separated by one or more blank lines.
+    """
+    worlds = re.split(r"\n\s*\n(?=\s*=EPOCH:)", text)
+    return [w.strip() for w in worlds if w.strip()]
+
+
+def serialize_agent_for_frontend(agent: ParsedAgent, species_sid: int | None = None) -> dict:
     """Convert ParsedAgent to JSON-serializable dict for Socket.IO."""
     return {
         "aid": agent.aid,
-        "species_sid": species_sid,
+        "species_sid": species_sid if species_sid is not None else agent.species_sid,
         "x": agent.x,
         "y": agent.y,
         "energy": agent.energy,

@@ -15,6 +15,12 @@ function App() {
     pause,
     resume,
     setSpeed,
+    datasets,
+    selectedFile,
+    worldCount,
+    selectedWorld,
+    selectFile,
+    selectWorld,
   } = useWebSocket();
 
   return (
@@ -37,6 +43,12 @@ function App() {
             onResume={resume}
             onSpeed={setSpeed}
             isPlaying={isPlaying}
+            datasets={datasets}
+            selectedFile={selectedFile}
+            worldCount={worldCount}
+            selectedWorld={selectedWorld}
+            onSelectFile={selectFile}
+            onSelectWorld={selectWorld}
           />
           <SimulationCanvas
             agents={agents}
