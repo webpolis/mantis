@@ -18,5 +18,9 @@ from .constants import (
 )
 from .species import BodyPlan, DietVector, Species, TraitDistribution
 from .biome import Biome, BIOME_NAMES
+from .spatial import SpatialHash, VegetationPatch
+from .agent import Agent, AgentManager, EventLog
+from .agent_reconciliation import PopulationReconciler
+from .agent_serializer import AgentSerializerState
 from .engine import World, Interaction, SpotlightEvent, Hero, CulturalMemory
 from .serializer import Serializer

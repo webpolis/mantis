@@ -14,6 +14,8 @@ from typing import Optional
 
 import numpy as np
 
+from .agent import AgentManager, AGENT_MAX_PER_SPECIES, AGENT_TOTAL_MAX
+from .agent_reconciliation import PopulationReconciler
 from .biome import Biome, BIOME_NAMES
 from .constants import (
     BODY_PLANS,
@@ -124,11 +126,18 @@ SPOTLIGHT_OUTCOMES = [
 class World:
     """Self-contained ecological simulation."""
 
-    def __init__(self, wid: int, seed: int):
+    def __init__(self, wid: int, seed: int, enable_agents: bool = False,
+                 agent_epoch: str = "INTELLIGENCE", agent_threshold: float = 15.0):
         self.wid = wid
         self.rng = np.random.default_rng(seed)
         self.tick = 0
         self.epoch = Epoch.PRIMORDIAL
+
+        # Agent configuration
+        self.enable_agents = enable_agents
+        self.agent_epoch = Epoch[agent_epoch] if isinstance(agent_epoch, str) else agent_epoch
+        self.agent_threshold = agent_threshold
+        self.agents_active = False
 
         # Create biomes (2-5)
         n_biomes = int(self.rng.integers(2, 6))
@@ -252,7 +261,13 @@ class World:
         if self.epoch.value >= Epoch.INTELLIGENCE.value:
             self._generate_spotlights(alive)
 
-        # 8. Epoch transition checks
+        # 8. Agent activation and stepping
+        if self.enable_agents:
+            self._activate_agents(alive)
+            if self.agents_active:
+                self._step_agents(alive)
+
+        # 9. Epoch transition checks
         self._check_epoch_transition()
 
         # Age all species
@@ -854,6 +869,115 @@ class World:
                 effect=effect_str,
                 cultural_memories=memories[-3:],  # last 3
             ))
+
+    # ------------------------------------------------------------------
+    # Agent-based simulation
+    # ------------------------------------------------------------------
+
+    def _activate_agents(self, alive: list[Species]) -> None:
+        """Spawn agents for species meeting activation criteria."""
+        if self.epoch.value < self.agent_epoch.value:
+            return
+
+        simple_mode = (self.epoch == Epoch.ECOSYSTEM)
+
+        for sp in alive:
+            if sp.agent_manager is not None:
+                continue
+
+            # Check activation threshold
+            if self.agent_epoch == Epoch.INTELLIGENCE:
+                if sp.spotlight_score() < self.agent_threshold:
+                    continue
+            # ECOSYSTEM: activate all species with population > 50
+            elif self.agent_epoch == Epoch.ECOSYSTEM:
+                if sp.population < 50:
+                    continue
+
+            # Count total agents across all species
+            total_agents = sum(
+                len(s.agent_manager.agents)
+                for s in self.species
+                if s.agent_manager is not None
+            )
+            if total_agents >= AGENT_TOTAL_MAX:
+                continue
+
+            # Determine agent count
+            n_agents = min(
+                AGENT_MAX_PER_SPECIES,
+                sp.population,
+                AGENT_TOTAL_MAX - total_agents,
+            )
+            n_agents = max(20, n_agents)
+
+            # Pick primary biome
+            biomes = self._species_biomes(sp)
+            biome = biomes[0] if biomes else self.biomes[0]
+
+            # Initialize vegetation patches if needed
+            if not biome.vegetation_patches:
+                biome.init_vegetation_patches(self.rng, world_size=1000)
+
+            mgr = AgentManager(
+                species_sid=sp.sid,
+                biome_lid=biome.lid,
+                world_size=1000,
+            )
+            mgr.simple_mode = simple_mode
+            mgr.spawn_agents(n_agents, sp, self.rng)
+            sp.agent_manager = mgr
+            sp.reconciler = PopulationReconciler(sp, n_agents)
+            self.agents_active = True
+
+    def _step_agents(self, alive: list[Species]) -> None:
+        """Step all active agent managers and reconcile with macro population."""
+        # Build manager lookup and prey/predator maps
+        all_managers: dict[int, AgentManager] = {}
+        for sp in alive:
+            if sp.agent_manager is not None:
+                all_managers[sp.sid] = sp.agent_manager
+
+        if not all_managers:
+            return
+
+        # Regenerate vegetation patches
+        for biome in self.biomes:
+            biome.regenerate_patches()
+
+        for sp in alive:
+            mgr = sp.agent_manager
+            if mgr is None:
+                continue
+
+            # Determine prey and predator SIDs from diet
+            prey_sids: set[int] = set()
+            for source in sp.diet.sources():
+                if source.startswith("S"):
+                    try:
+                        prey_sids.add(int(source[1:]))
+                    except ValueError:
+                        pass
+
+            predator_sids: set[int] = set()
+            for other_sp in alive:
+                if other_sp.sid == sp.sid:
+                    continue
+                for source in other_sp.diet.sources():
+                    if source == f"S{sp.sid}":
+                        predator_sids.add(other_sp.sid)
+
+            # Get vegetation patches from species' biome
+            biomes = self._species_biomes(sp)
+            patches = []
+            for b in biomes:
+                patches.extend(b.vegetation_patches)
+
+            mgr.step(all_managers, patches, prey_sids, predator_sids, self.rng)
+
+            # Reconcile with macro population
+            if sp.reconciler is not None:
+                sp.reconciler.reconcile_tick(mgr)
 
     # ------------------------------------------------------------------
     # Epoch transitions

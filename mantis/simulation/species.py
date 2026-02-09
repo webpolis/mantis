@@ -24,6 +24,12 @@ from .constants import (
     TRAIT_TO_TIER,
 )
 
+# TYPE_CHECKING avoids circular import (agent.py imports species types)
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .agent import AgentManager
+    from .agent_reconciliation import PopulationReconciler
+
 
 # ---------------------------------------------------------------------------
 # TraitDistribution
@@ -279,6 +285,10 @@ class Species:
     locations: set[str] = field(default_factory=set)
     age: int = 0
     alive: bool = True
+
+    # Agent-based simulation (None = population-level only)
+    agent_manager: Optional[AgentManager] = field(default=None, repr=False)
+    reconciler: Optional[PopulationReconciler] = field(default=None, repr=False)
 
     # -- derived properties ------------------------------------------------
 

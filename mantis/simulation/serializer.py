@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 
+from .agent_serializer import AgentSerializerState
 from .constants import EPOCH_CONFIG, TRAIT_TO_TIER, ATTRIBUTE_TRIGGERS, Epoch
 from .engine import World, Interaction, SpotlightEvent
 
@@ -25,6 +26,7 @@ class Serializer:
         # Track last keyframe state for delta encoding
         self._last_keyframe: dict[int, dict] = {}  # sid -> snapshot
         self._species_since_keyframe: set[int] = set()  # new species since last keyframe
+        self._agent_serializer = AgentSerializerState()
 
     def serialize_tick(self, world: World) -> str:
         """Serialize one tick of the world. Returns full protocol text block."""
@@ -131,9 +133,14 @@ class Serializer:
         repro = sp.reproduction_strategy()
         repro_rate = sp.traits["repro"].mean if "repro" in sp.traits else 1.0
 
+        # Include agent count in header if agents active
+        agent_info = ""
+        if sp.agent_manager is not None:
+            agent_info = f"({len(sp.agent_manager.agents)} agents)"
+
         header = (
             f"@SP|S{sp.sid}|{locs}|plan={sp.body_plan.name}"
-            f"|pop={sp.population}±{pop_var}|diet={{{diet_str}}}"
+            f"|pop={sp.population}±{pop_var}{agent_info}|diet={{{diet_str}}}"
         )
         lines.append(header)
 
@@ -153,6 +160,13 @@ class Serializer:
             f"  E:in={e_income:.0f},out={e_cost:.0f},store={sp.energy_store:.0f}"
             f"|repro={repro}(rate={repro_rate:.1f})"
         )
+
+        # Agent block (if active)
+        if sp.agent_manager is not None:
+            agent_lines = self._agent_serializer.serialize(
+                sp.sid, sp.agent_manager, is_keyframe=True, rng=world.rng,
+            )
+            lines.extend(agent_lines)
 
         return lines
 
@@ -219,6 +233,16 @@ class Serializer:
                 parts = mut.split("|", 1)
                 if len(parts) == 2:
                     lines.append(f"  {parts[0]}:{parts[1]}")
+
+        # Agent block delta (if active)
+        if sp.agent_manager is not None:
+            agent_lines = self._agent_serializer.serialize(
+                sp.sid, sp.agent_manager, is_keyframe=False, rng=world.rng,
+            )
+            if agent_lines:
+                if not lines:
+                    lines.append(f"@SP|S{sp.sid}")
+                lines.extend(agent_lines)
 
         # Update snapshot
         self._snapshot_species(sp, world)

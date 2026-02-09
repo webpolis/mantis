@@ -42,6 +42,7 @@ LAYER_MARKERS = [
     "@INT",         # Interaction log (2 BPE → 1)
     "@EVT",         # Event line (3 BPE → 1)
     "@SPOT",        # Spotlight block (3 BPE → 1)
+    "@AGENT",       # Agent block for spatial simulation (3 BPE → 1)
     # NOTE: "---" is already a single GPT-2 token (ID 6329). Not re-added.
 ]
 
@@ -182,6 +183,7 @@ LAYER_LOSS_WEIGHTS = {
     "@SP":    1.0,      # Core simulation state
     "@INT":   1.5,      # Interaction dynamics ("the physics")
     "@EVT":   1.5,      # Rare, high-importance events
+    "@AGENT": 0.8,      # Agent spatial data (lower to avoid float precision overfitting)
     "@SPOT":  2.0,      # Intelligence reasoning chains
 }
 

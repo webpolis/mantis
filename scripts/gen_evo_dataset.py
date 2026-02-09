@@ -54,13 +54,16 @@ def _import_simulation():
     return sim_mod
 
 
-def simulate_world(wid: int, seed: int, max_gens: int, keyframe_interval: int):
+def simulate_world(wid: int, seed: int, max_gens: int, keyframe_interval: int,
+                   enable_agents: bool = False, agent_epoch: str = "INTELLIGENCE",
+                   agent_threshold: float = 15.0):
     """Run one world simulation. Standalone function for process pool."""
     sim = _import_simulation()
     World = sim.World
     Serializer = sim.Serializer
 
-    world = World(wid, seed)
+    world = World(wid, seed, enable_agents=enable_agents,
+                  agent_epoch=agent_epoch, agent_threshold=agent_threshold)
     serializer = Serializer(keyframe_interval=keyframe_interval)
 
     blocks = []
@@ -103,11 +106,17 @@ def generate_dataset(args):
     total_species = 0
     total_spotlights = 0
 
+    agent_kwargs = dict(
+        enable_agents=args.enable_agents,
+        agent_epoch=args.agent_epoch,
+        agent_threshold=args.agent_threshold,
+    )
+
     with open(output, "w") as f:
         if args.workers <= 1:
             # Sequential
             for i, (wid, seed) in enumerate(zip(range(args.worlds), world_seeds)):
-                text, stats = simulate_world(wid, seed, args.max_generations, args.keyframe_interval)
+                text, stats = simulate_world(wid, seed, args.max_generations, args.keyframe_interval, **agent_kwargs)
                 f.write(text + "\n")  # blank line = EOS boundary between worlds
 
                 epoch_counts[stats["epoch"]] = epoch_counts.get(stats["epoch"], 0) + 1
@@ -133,7 +142,8 @@ def generate_dataset(args):
 
             with ProcessPoolExecutor(max_workers=args.workers) as pool:
                 futures = {
-                    pool.submit(simulate_world, wid, seed, args.max_generations, args.keyframe_interval): wid
+                    pool.submit(simulate_world, wid, seed, args.max_generations,
+                                args.keyframe_interval, **agent_kwargs): wid
                     for wid, seed in zip(range(args.worlds), world_seeds)
                 }
 
@@ -204,6 +214,13 @@ def main():
                         help="Ticks between full keyframes (default: 20)")
     parser.add_argument("--verbose", action="store_true",
                         help="Print progress during generation")
+    parser.add_argument("--enable-agents", action="store_true",
+                        help="Enable agent-based simulation (spatial individual agents)")
+    parser.add_argument("--agent-epoch", type=str, default="INTELLIGENCE",
+                        choices=["ECOSYSTEM", "INTELLIGENCE"],
+                        help="Epoch at which agents activate (default: INTELLIGENCE)")
+    parser.add_argument("--agent-threshold", type=float, default=15.0,
+                        help="Spotlight score threshold for INTELLIGENCE agent activation (default: 15.0)")
     args = parser.parse_args()
 
     generate_dataset(args)
