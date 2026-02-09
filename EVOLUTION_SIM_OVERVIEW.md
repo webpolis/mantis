@@ -121,6 +121,27 @@ For intelligent species, spotlight blocks add chain-of-thought:
 
 Keyframes dump full state every ~20 generations; intermediate ticks use delta encoding (`Δspeed=+0.3`).
 
+When agent-based simulation is active, species blocks include `@AGENT` sub-blocks with individual organism positions and states:
+
+```
+@SP|S3|L1|plan=omnivore|pop=420±42(200 agents)|diet={S1:0.5,plant:0.3}
+  T:speed=5.1±0.8,intel=4.2±0.6,social=5.8±0.7
+  E:in=8400,out=6200,store=12000|repro=r(rate=0.4)
+  @AGENT|count=420|sample=top200+rand50|quantize=10
+    A0:(120,340,E=45,age=8,forage)
+    A1:(130,350,E=52,age=10,hunt->A3)
+    A5:(90,280,E=38,age=3,flee)
+```
+
+Delta ticks encode only changed agents (moved >5 units or energy changed >2), with `†` for deaths:
+
+```
+  @AGENT|Δpos|quantize=10
+    A0:(125,345,E=43)
+    A2:(140,360,E=48)
+    A5:†
+```
+
 ---
 
 ## Tokenization
@@ -131,7 +152,7 @@ Keyframes dump full state every ~20 generations; intermediate ticks use delta en
 
 **What's added** (87 tokens):
 
-- Layer markers: `=EPOCH @BIO @SP @INT @EVT @SPOT`
+- Layer markers: `=EPOCH @BIO @SP @INT @EVT @SPOT @AGENT`
 - Spotlight logic: `CTX ACTORS INTENT REACT RESOLVE EFFECT`
 - Mutations: `M+ M- Mpoint Mdrift Mleap Mfuse`
 - Body plans: all 9 names
@@ -153,6 +174,7 @@ Keyframes dump full state every ~20 generations; intermediate ticks use delta en
 | `@INT`   | 1.5    | Interaction dynamics   |
 | `@EVT`   | 1.5    | Rare important events  |
 | `@SPOT`  | 2.0    | Intelligence reasoning |
+| `@AGENT` | 0.8    | Agent spatial data     |
 
 Pad tokens get weight 0.0.
 
@@ -160,10 +182,10 @@ Pad tokens get weight 0.0.
 
 ## Training an Evolution Model
 
-### Recommended approach
+### Recommended approach (population-only)
 
 ```bash
-# 1. Generate dataset
+# 1. Generate dataset (no agents)
 python scripts/gen_evo_dataset.py --worlds 10000 --max-generations 200 \
     --output data/evo_train.txt --workers 8 --seed 42
 
@@ -174,7 +196,29 @@ python train.py --stage 1 data/evo_train.txt \
     --warmup-steps 2000 --epochs 10 --mixed-precision --val-split 0.1
 ```
 
+### Recommended approach (with agent simulation)
+
+Agent blocks dramatically increase per-tick token volume. A single agent keyframe tick with 3 species can produce 6,000-14,000 tokens — exceeding `seq_len=4096` entirely. Longer sequences, smaller batches, and adjusted keyframe intervals are required.
+
+```bash
+# 1. Generate dataset (agents enabled, longer keyframe interval)
+python scripts/gen_evo_dataset.py --worlds 10000 --max-generations 200 \
+    --output data/evo_agents_train.txt --workers 8 --seed 42 \
+    --enable-agents --agent-epoch INTELLIGENCE --keyframe-interval 40
+
+# 2. Train (tiny model, 24GB GPU)
+python train.py --stage 1 data/evo_agents_train.txt \
+    --model-size tiny --seq-len 8192 --batch-size 4 \
+    --gradient-accumulation-steps 8 --learning-rate 5e-4 \
+    --warmup-steps 3000 --epochs 10 --mixed-precision \
+    --gradient-checkpointing --val-split 0.1
+```
+
 ### Critical training parameters
+
+Parameters differ based on whether agent simulation is enabled:
+
+**Population-only (no agents):**
 
 | Parameter     | Value                          | Why                                                                  |
 | ------------- | ------------------------------ | -------------------------------------------------------------------- |
@@ -185,26 +229,70 @@ python train.py --stage 1 data/evo_train.txt \
 | Min LR        | 1e-5                           | Never decay to zero — late data is the most complex.                 |
 | Gradient clip | 1.0                            | MoE can produce gradient spikes.                                     |
 
+**With agent simulation:**
+
+| Parameter     | Value                          | Why                                                                       |
+| ------------- | ------------------------------ | ------------------------------------------------------------------------- |
+| `--seq-len`   | 8192 (min), 16384 (ideal)      | Agent keyframe ticks produce 6K-14K tokens. 4096 truncates mid-block.     |
+| `--stride`    | 4096-6144                      | Agent coordinates have weak inter-tick causality; overlap less valuable.   |
+| Warmup        | 3000 steps                     | Agent tokens increase vocabulary diversity; router needs more time.        |
+| Peak LR       | 5e-4 (tiny/small), 1e-4 (base) | Same as population-only.                                                  |
+| Min LR        | 1e-5                           | Same as population-only.                                                  |
+| Gradient clip | 1.0                            | Same as population-only.                                                  |
+| Keyframe interval | 40                         | Halves agent keyframe frequency — reduces token spikes by 2x.             |
+
+**Batch size scaling for agent-enabled training (24GB GPU):**
+
+| Model | `--seq-len` | `--batch-size` | `--gradient-accumulation-steps` | Effective batch |
+| ----- | ----------- | -------------- | ------------------------------- | --------------- |
+| Tiny  | 8192        | 4              | 8                               | 32              |
+| Tiny  | 16384       | 2              | 16                              | 32              |
+| Small | 8192        | 2              | 16                              | 32              |
+| Small | 16384       | 1              | 32                              | 32              |
+
+Use `--gradient-checkpointing` unconditionally with agent-enabled data.
+
+### Token volume comparison
+
+Approximate tokens per tick by epoch (agent-enabled):
+
+| Epoch        | Delta tick   | Keyframe tick   | Notes                                    |
+| ------------ | ------------ | --------------- | ---------------------------------------- |
+| PRIMORDIAL   | 50-100       | 200-400         | No agents, same as population-only.      |
+| CAMBRIAN     | 50-100       | 200-400         | No agents, same as population-only.      |
+| ECOSYSTEM    | 800-2,500    | 8,000-14,000    | 3-5 species with agents (simple mode).   |
+| INTELLIGENCE | 1,000-3,000  | 10,000-14,000   | 1-3 species with agents + spotlight.     |
+
+A 100-gen agent-enabled world produces ~80,000-260,000 tokens (10-20x more than population-only). This has direct implications for curriculum mixing — see below.
+
 ### World boundary handling
 
-Worlds are independent simulations. **Never pack tokens from different worlds into the same sequence.** Pad to `seq_len` at each world boundary (EOS). Waste is <10% for typical worlds.
+Worlds are independent simulations. **Never pack tokens from different worlds into the same sequence.** Pad to `seq_len` at each world boundary (EOS).
+
+Padding waste varies by mode:
+- **Population-only**: <10% waste at `seq_len=4096` (worlds produce ~8K-15K tokens).
+- **Agent-enabled**: <1% waste at `seq_len=8192` (worlds produce ~80K-260K tokens). The bottleneck shifts from padding to compute-per-world.
 
 ### Training curriculum
 
-Don't train sequentially (biology → ecosystems → intelligence) — causes catastrophic forgetting. Instead, mix gradually:
+Don't train sequentially (biology → ecosystems → intelligence) — causes catastrophic forgetting. Instead, mix gradually.
 
-| Progress | Bio traces | Ecosystem | Intelligence |
-| -------- | ---------- | --------- | ------------ |
-| 0-20%    | 100%       | 0%        | 0%           |
-| 20-40%   | 50%        | 50%       | 0%           |
-| 40-60%   | 25%        | 35%       | 40%          |
-| 60-100%  | 20%        | 30%       | 50%          |
+**Important**: Mix by **token count**, not world count. Agent-enabled INTELLIGENCE worlds produce 10-20x more tokens per world than PRIMORDIAL worlds. Mixing by world count causes INTELLIGENCE tokens to dominate (~90% of training), overfitting the model to coordinate prediction at the expense of core ecological dynamics.
 
-Generate three separate files partitioned by max epoch reached and mix with a curriculum sampler.
+| Progress | Bio tokens | Ecosystem tokens | Intelligence tokens |
+| -------- | ---------- | ---------------- | ------------------- |
+| 0-20%    | 100%       | 0%               | 0%                  |
+| 20-40%   | 50%        | 50%              | 0%                  |
+| 40-60%   | 25%        | 35%              | 40%                 |
+| 60-100%  | 20%        | 30%              | 50%                 |
+
+Generate three separate files partitioned by max epoch reached and mix with a curriculum sampler that samples **by token budget per batch**, not by file line count.
 
 ### Evaluation metrics
 
 Perplexity alone is insufficient. Track:
+
+**Core metrics (all modes):**
 
 | Metric              | Target    | Measures                                                  |
 | ------------------- | --------- | --------------------------------------------------------- |
@@ -214,6 +302,16 @@ Perplexity alone is insufficient. Track:
 | Causal consistency  | >95%      | Extinct species stay extinct, taboos referenced correctly |
 | Trait validity      | >99%      | Body plan constraints respected                           |
 | Spotlight coherence | >90%      | EFFECT follows from INTENT + RESOLVE                      |
+
+**Agent-specific metrics (when `--enable-agents`):**
+
+| Metric                  | Target       | Measures                                                           |
+| ----------------------- | ------------ | ------------------------------------------------------------------ |
+| Spatial coherence       | <20 units/tick | Agents don't teleport between delta frames                       |
+| Behavioral consistency  | >85%         | Foragers near vegetation, fleers move away from predators          |
+| Agent-population sync   | <10% drift   | Agent births/deaths track macro population changes                 |
+| Dead-agent permanence   | 100%         | `†`-marked agents never reappear in subsequent ticks               |
+| State commitment        | >80%         | Hysteresis periods respected (no forage→hunt→forage in 3 ticks)   |
 
 ### Model size guide
 
@@ -226,4 +324,4 @@ Perplexity alone is insufficient. Track:
 
 ### What the trained model can do
 
-Given a partial simulation trace, the model autoregressively continues it — predicting population changes, trait mutations, energy flows, species interactions, body plan transitions, and (for intelligent species) individual-level spotlight scenes with chain-of-thought reasoning. A game engine can sample from this model to run an evolving universe in real time.
+Given a partial simulation trace, the model autoregressively continues it — predicting population changes, trait mutations, energy flows, species interactions, body plan transitions, individual agent behaviors and positions, and (for intelligent species) spotlight scenes with chain-of-thought reasoning. A game engine can sample from this model to run an evolving universe in real time.
