@@ -87,6 +87,10 @@ class Biome:
         """Serialize biome state for protocol output."""
         return f"L{self.lid}:{self.name}(veg={self.vegetation:.1f},det={self.detritus:.0f})"
 
+    def serialize_header_compact(self) -> str:
+        """Serialize biome state in compact v2 format: L{lid} {name} {veg×100} {det}."""
+        return f"L{self.lid} {self.name} {int(round(self.vegetation * 100))} {int(round(self.detritus))}"
+
     @staticmethod
     def create_random(lid: int, rng: np.random.Generator, n_env_axes: int = 4) -> Biome:
         """Create a biome with random initial conditions."""

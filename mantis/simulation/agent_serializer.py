@@ -29,6 +29,7 @@ def serialize_agents_keyframe(
     manager: AgentManager,
     rng: Optional[np.random.Generator] = None,
     max_sample: int = 250,
+    compact: bool = False,
 ) -> list[str]:
     """Full agent state dump for a keyframe tick."""
     agents = manager.sample_for_serialization(max_sample, rng)
@@ -40,11 +41,16 @@ def serialize_agents_keyframe(
     rand_n = max_sample - top_n
 
     lines = []
-    lines.append(
-        f"  @AGENT|count={total}"
-        f"|sample=top{min(top_n, total)}+rand{min(rand_n, max(0, total - top_n))}"
-        f"|quantize={QUANTIZE_GRID}"
-    )
+    sample_str = f"top{min(top_n, total)}+rand{min(rand_n, max(0, total - top_n))}"
+
+    if compact:
+        lines.append(f"  @AGENT {total} {sample_str} {QUANTIZE_GRID}")
+    else:
+        lines.append(
+            f"  @AGENT|count={total}"
+            f"|sample={sample_str}"
+            f"|quantize={QUANTIZE_GRID}"
+        )
 
     for a in agents:
         qx = quantize_position(a.x)
@@ -57,7 +63,10 @@ def serialize_agents_keyframe(
         elif a.state == "flee":
             state_str = "flee"
 
-        lines.append(f"    A{a.aid}:({qx},{qy},E={e},age={a.age},{state_str})")
+        if compact:
+            lines.append(f"   A{a.aid} {qx} {qy} {e} {a.age} {state_str}")
+        else:
+            lines.append(f"    A{a.aid}:({qx},{qy},E={e},age={a.age},{state_str})")
 
     return lines
 
@@ -67,6 +76,7 @@ def serialize_agents_delta(
     prev_snapshot: dict[int, tuple[int, int, int]],
     rng: Optional[np.random.Generator] = None,
     max_sample: int = 250,
+    compact: bool = False,
 ) -> tuple[list[str], dict[int, tuple[int, int, int]]]:
     """Delta encoding: only changed agents.
 
@@ -93,23 +103,35 @@ def serialize_agents_delta(
             state_str = a.state
             if a.state == "hunt" and a.target_aid is not None:
                 state_str = f"hunt->A{a.target_aid}"
-            changed_lines.append(f"    A{a.aid}:({qx},{qy},E={e},age={a.age},{state_str})")
+            if compact:
+                changed_lines.append(f"   A{a.aid} {qx} {qy} {e} {a.age} {state_str}")
+            else:
+                changed_lines.append(f"    A{a.aid}:({qx},{qy},E={e},age={a.age},{state_str})")
         else:
             px, py, pe = prev
             moved = abs(qx - px) > 5 or abs(qy - py) > 5
             energy_changed = abs(e - pe) > 2
             if moved or energy_changed:
-                changed_lines.append(f"    A{a.aid}:({qx},{qy},E={e})")
+                if compact:
+                    changed_lines.append(f"   A{a.aid} {qx} {qy} {e}")
+                else:
+                    changed_lines.append(f"    A{a.aid}:({qx},{qy},E={e})")
 
     # Dead agents
     for dead_aid in manager.event_log.deaths:
         if dead_aid in prev_snapshot:
-            changed_lines.append(f"    A{dead_aid}:\u2020")  # dagger
+            if compact:
+                changed_lines.append(f"   A{dead_aid} \u2020")
+            else:
+                changed_lines.append(f"    A{dead_aid}:\u2020")  # dagger
 
     if not changed_lines:
         return [], new_snapshot
 
-    lines = [f"  @AGENT|\u0394pos|quantize={QUANTIZE_GRID}"]
+    if compact:
+        lines = [f"  @AGENT \u0394 {QUANTIZE_GRID}"]
+    else:
+        lines = [f"  @AGENT|\u0394pos|quantize={QUANTIZE_GRID}"]
     lines.extend(changed_lines)
     return lines, new_snapshot
 
@@ -126,13 +148,14 @@ class AgentSerializerState:
         manager: AgentManager,
         is_keyframe: bool,
         rng: Optional[np.random.Generator] = None,
+        compact: bool = False,
     ) -> list[str]:
         """Serialize agent block for a species. Returns protocol lines."""
         if not manager.agents and not manager.event_log.deaths:
             return []
 
         if is_keyframe:
-            lines = serialize_agents_keyframe(manager, rng)
+            lines = serialize_agents_keyframe(manager, rng, compact=compact)
             # Build snapshot
             snapshot = {}
             for a in manager.agents:
@@ -145,6 +168,6 @@ class AgentSerializerState:
             return lines
         else:
             prev = self._snapshots.get(species_sid, {})
-            lines, new_snap = serialize_agents_delta(manager, prev, rng)
+            lines, new_snap = serialize_agents_delta(manager, prev, rng, compact=compact)
             self._snapshots[species_sid] = new_snap
             return lines

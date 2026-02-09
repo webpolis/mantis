@@ -1,5 +1,8 @@
 """
 Parse MANTIS protocol text into structured tick data for the frontend.
+
+Supports both v1 (pipe-delimited) and v2 (compact space-separated) formats.
+Auto-detects format from the first =EPOCH line.
 """
 
 from __future__ import annotations
@@ -42,12 +45,16 @@ class ParsedTick:
     interactions: list[dict] = field(default_factory=list)
 
 
+# ------------------------------------------------------------------
+# v1 agent parsing
+# ------------------------------------------------------------------
+
 _AGENT_RE = re.compile(r"A(\d+):\(([^)]+)\)")
 _AGENT_DEAD_RE = re.compile(r"A(\d+):\u2020")
 
 
 def parse_agent_line(line: str) -> ParsedAgent | None:
-    """Parse a single agent line from @AGENT block."""
+    """Parse a single v1 agent line from @AGENT block."""
     line = line.strip()
 
     dead_match = _AGENT_DEAD_RE.match(line)
@@ -91,18 +98,187 @@ def parse_agent_line(line: str) -> ParsedAgent | None:
     )
 
 
-def parse_agent_block(lines: list[str]) -> list[ParsedAgent]:
+# ------------------------------------------------------------------
+# v2 compact agent parsing
+# ------------------------------------------------------------------
+
+_COMPACT_AGENT_RE = re.compile(r"A(\d+)\s+(.+)")
+_COMPACT_AGENT_DEAD_RE = re.compile(r"A(\d+)\s+\u2020")
+
+
+def _parse_compact_agent_line(line: str) -> ParsedAgent | None:
+    """Parse a single v2 compact agent line: A0 120 340 45 8 forage."""
+    line = line.strip()
+
+    dead_match = _COMPACT_AGENT_DEAD_RE.match(line)
+    if dead_match:
+        return ParsedAgent(aid=int(dead_match.group(1)), x=0, y=0, energy=0, dead=True)
+
+    match = _COMPACT_AGENT_RE.match(line)
+    if not match:
+        return None
+
+    aid = int(match.group(1))
+    tokens = match.group(2).split()
+    if len(tokens) < 3:
+        return None
+
+    x = float(tokens[0])
+    y = float(tokens[1])
+    energy = float(tokens[2])
+    age = 0
+    state = "rest"
+    target_aid = None
+
+    if len(tokens) >= 4:
+        try:
+            age = int(tokens[3])
+        except ValueError:
+            pass
+    if len(tokens) >= 5:
+        state_str = tokens[4]
+        if state_str.startswith("hunt->A"):
+            state = "hunt"
+            try:
+                target_aid = int(state_str[7:])
+            except ValueError:
+                pass
+        elif state_str in ("forage", "rest", "mate", "flock", "flee", "hunt"):
+            state = state_str
+
+    return ParsedAgent(
+        aid=aid, x=x, y=y, energy=energy, age=age,
+        state=state, target_aid=target_aid,
+    )
+
+
+def parse_agent_block(lines: list[str], compact: bool = False) -> list[ParsedAgent]:
     """Parse an @AGENT block into agent list."""
     agents = []
+    parser = _parse_compact_agent_line if compact else parse_agent_line
     for line in lines:
-        agent = parse_agent_line(line)
+        agent = parser(line)
         if agent is not None:
             agents.append(agent)
     return agents
 
 
+# ------------------------------------------------------------------
+# Format detection
+# ------------------------------------------------------------------
+
+def _detect_format(text: str) -> str:
+    """Detect protocol format from first =EPOCH line. Returns 'v1' or 'v2'."""
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("=EPOCH"):
+            if ":" in stripped[:10]:
+                return "v1"
+            return "v2"
+    return "v1"
+
+
+# ------------------------------------------------------------------
+# v1 species header parsing
+# ------------------------------------------------------------------
+
+def _parse_species_header(line: str) -> ParsedSpecies | None:
+    """Parse v1 @SP|S{sid}|... header."""
+    parts = line.split("|")
+    if len(parts) < 2:
+        return None
+
+    sid_match = re.match(r"S(\d+)", parts[1])
+    if not sid_match:
+        return None
+    sid = int(sid_match.group(1))
+    sp = ParsedSpecies(sid=sid)
+
+    for part in parts[2:]:
+        if part.startswith("plan="):
+            sp.plan = part[5:]
+        elif part.startswith("pop="):
+            pop_str = part[4:].split("\u00b1")[0].split("(")[0]
+            try:
+                sp.population = int(pop_str)
+            except ValueError:
+                pass
+        elif part.startswith("L") or "," in part:
+            sp.locations = [p.strip() for p in part.split(",")]
+
+    return sp
+
+
+# ------------------------------------------------------------------
+# v2 compact species header parsing
+# ------------------------------------------------------------------
+
+def _parse_compact_species_header(line: str) -> ParsedSpecies | None:
+    """Parse v2 @SP S{sid} L0 scavenger 6565 D det 51 plt 35 ..."""
+    tokens = line.split()
+    if len(tokens) < 2:
+        return None
+
+    # tokens[0] = "@SP", tokens[1] = "S0", ...
+    sid_match = re.match(r"S(\d+)", tokens[1])
+    if not sid_match:
+        return None
+    sid = int(sid_match.group(1))
+    sp = ParsedSpecies(sid=sid)
+
+    # Gather location tokens (L-prefixed) until we hit a non-L token
+    idx = 2
+    locs = []
+    while idx < len(tokens) and tokens[idx].startswith("L"):
+        locs.append(tokens[idx])
+        idx += 1
+    sp.locations = locs
+
+    # Body plan name (not a keyword or number)
+    if idx < len(tokens) and tokens[idx] not in ("D", "pop", "locs") and not tokens[idx][0].isdigit():
+        sp.plan = tokens[idx]
+        idx += 1
+
+    # Population (direct int for keyframe, "pop N" for delta)
+    if idx < len(tokens):
+        tok = tokens[idx]
+        if tok == "pop":
+            idx += 1
+            if idx < len(tokens):
+                try:
+                    sp.population = int(tokens[idx])
+                    idx += 1
+                except ValueError:
+                    pass
+        else:
+            try:
+                sp.population = int(tok)
+                idx += 1
+            except ValueError:
+                pass
+
+    # Delta may also have "locs L0 L1 ..."
+    if idx < len(tokens) and tokens[idx] == "locs":
+        idx += 1
+        while idx < len(tokens) and tokens[idx].startswith("L"):
+            sp.locations.append(tokens[idx])
+            idx += 1
+
+    return sp
+
+
+# ------------------------------------------------------------------
+# Main parser
+# ------------------------------------------------------------------
+
 def parse_protocol_to_ticks(text: str) -> list[ParsedTick]:
-    """Parse full protocol text into list of tick snapshots."""
+    """Parse full protocol text into list of tick snapshots.
+
+    Auto-detects v1 (pipe-delimited) and v2 (compact space-separated) formats.
+    """
+    fmt = _detect_format(text)
+    compact = fmt == "v2"
+
     ticks: list[ParsedTick] = []
     current_tick = ParsedTick(number=0)
     tick_num = 0
@@ -117,14 +293,24 @@ def parse_protocol_to_ticks(text: str) -> list[ParsedTick]:
             continue
 
         # Epoch header
-        if stripped.startswith("=EPOCH:"):
-            parts = stripped.split("|")
-            for p in parts:
-                if p.startswith("=EPOCH:"):
+        if stripped.startswith("=EPOCH"):
+            if compact:
+                # v2: =EPOCH 1 1000 W0
+                tokens = stripped.split()
+                if len(tokens) >= 2:
                     try:
-                        current_epoch = int(p.split(":")[1])
+                        current_epoch = int(tokens[1])
                     except (ValueError, IndexError):
                         pass
+            else:
+                # v1: =EPOCH:1|TICK_SCALE:1000gen|W0
+                parts = stripped.split("|")
+                for p in parts:
+                    if p.startswith("=EPOCH:"):
+                        try:
+                            current_epoch = int(p.split(":")[1])
+                        except (ValueError, IndexError):
+                            pass
             current_tick.epoch = current_epoch
             continue
 
@@ -132,7 +318,7 @@ def parse_protocol_to_ticks(text: str) -> list[ParsedTick]:
         if stripped == "---":
             # Flush agent block
             if in_agent_block and current_species is not None:
-                parsed = parse_agent_block(agent_lines)
+                parsed = parse_agent_block(agent_lines, compact=compact)
                 current_tick.agents.extend(
                     _agent_to_dict_agent(a, current_species.sid) for a in parsed
                 )
@@ -160,7 +346,7 @@ def parse_protocol_to_ticks(text: str) -> list[ParsedTick]:
             else:
                 # End of agent block
                 if current_species is not None:
-                    parsed = parse_agent_block(agent_lines)
+                    parsed = parse_agent_block(agent_lines, compact=compact)
                     current_tick.agents.extend(
                         _agent_to_dict_agent(a, current_species.sid) for a in parsed
                     )
@@ -168,15 +354,23 @@ def parse_protocol_to_ticks(text: str) -> list[ParsedTick]:
                 agent_lines = []
 
         # Species header
-        if stripped.startswith("@SP|"):
-            sp = _parse_species_header(stripped)
-            if sp:
-                current_species = sp
-                current_tick.species.append(sp)
-            continue
+        if compact:
+            if stripped.startswith("@SP "):
+                sp = _parse_compact_species_header(stripped)
+                if sp:
+                    current_species = sp
+                    current_tick.species.append(sp)
+                continue
+        else:
+            if stripped.startswith("@SP|"):
+                sp = _parse_species_header(stripped)
+                if sp:
+                    current_species = sp
+                    current_tick.species.append(sp)
+                continue
 
         # Interaction
-        if stripped.startswith("@INT|"):
+        if stripped.startswith("@INT"):
             current_tick.interactions.append({"raw": stripped})
             continue
 
@@ -189,39 +383,12 @@ def _agent_to_dict_agent(a: ParsedAgent, species_sid: int) -> ParsedAgent:
     return a
 
 
-def _parse_species_header(line: str) -> ParsedSpecies | None:
-    """Parse @SP|S{sid}|... header."""
-    parts = line.split("|")
-    if len(parts) < 2:
-        return None
-
-    sid_match = re.match(r"S(\d+)", parts[1])
-    if not sid_match:
-        return None
-    sid = int(sid_match.group(1))
-    sp = ParsedSpecies(sid=sid)
-
-    for part in parts[2:]:
-        if part.startswith("plan="):
-            sp.plan = part[5:]
-        elif part.startswith("pop="):
-            pop_str = part[4:].split("±")[0].split("(")[0]
-            try:
-                sp.population = int(pop_str)
-            except ValueError:
-                pass
-        elif part.startswith("L") or "," in part:
-            sp.locations = [p.strip() for p in part.split(",")]
-
-    return sp
-
-
 def split_worlds(text: str) -> list[str]:
     """Split a multi-world dataset into individual world texts.
 
     Worlds are separated by one or more blank lines.
     """
-    worlds = re.split(r"\n\s*\n(?=\s*=EPOCH:)", text)
+    worlds = re.split(r"\n\s*\n(?=\s*=EPOCH)", text)
     return [w.strip() for w in worlds if w.strip()]
 
 

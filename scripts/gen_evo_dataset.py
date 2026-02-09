@@ -56,7 +56,7 @@ def _import_simulation():
 
 def simulate_world(wid: int, seed: int, max_gens: int, keyframe_interval: int,
                    enable_agents: bool = False, agent_epoch: str = "INTELLIGENCE",
-                   agent_threshold: float = 15.0):
+                   agent_threshold: float = 15.0, compact: bool = False):
     """Run one world simulation. Standalone function for process pool."""
     sim = _import_simulation()
     World = sim.World
@@ -64,7 +64,7 @@ def simulate_world(wid: int, seed: int, max_gens: int, keyframe_interval: int,
 
     world = World(wid, seed, enable_agents=enable_agents,
                   agent_epoch=agent_epoch, agent_threshold=agent_threshold)
-    serializer = Serializer(keyframe_interval=keyframe_interval)
+    serializer = Serializer(keyframe_interval=keyframe_interval, compact=compact)
 
     blocks = []
     for _ in range(max_gens):
@@ -110,6 +110,7 @@ def generate_dataset(args):
         enable_agents=args.enable_agents,
         agent_epoch=args.agent_epoch,
         agent_threshold=args.agent_threshold,
+        compact=args.compact,
     )
 
     with open(output, "w") as f:
@@ -216,11 +217,13 @@ def main():
                         help="Print progress during generation")
     parser.add_argument("--enable-agents", action="store_true",
                         help="Enable agent-based simulation (spatial individual agents)")
-    parser.add_argument("--agent-epoch", type=str, default="INTELLIGENCE",
+    parser.add_argument("--agent-epoch", type=str, default="ECOSYSTEM",
                         choices=["ECOSYSTEM", "INTELLIGENCE"],
-                        help="Epoch at which agents activate (default: INTELLIGENCE)")
+                        help="Epoch at which agents activate (default: ECOSYSTEM)")
     parser.add_argument("--agent-threshold", type=float, default=15.0,
                         help="Spotlight score threshold for INTELLIGENCE agent activation (default: 15.0)")
+    parser.add_argument("--compact", action="store_true",
+                        help="Use compact v2 format (int-scaled, space-separated, ~50%% fewer tokens)")
     args = parser.parse_args()
 
     generate_dataset(args)
