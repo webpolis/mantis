@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `mantis/simulation` is an ecological evolution simulator (~3,250 lines) that generates synthetic training data for the MANTIS LLM. It models populations of species competing for energy through food webs, evolving traits across 5 tiers, transitioning body plans, and (in the INTELLIGENCE epoch) running individual-based agents with spatial behaviors and cultural memories.
 
-The output is protocol-formatted text consumed by `mantis/tokenizer.py` (87 custom tokens on top of GPT-2 BPE) for next-token prediction training.
+The output is protocol-formatted text consumed by `mantis/tokenizer.py` (282 domain tokens in a custom trie-based tokenizer, 512 total with reserved slots) for next-token prediction training.
 
 ## Generating Data
 
@@ -97,7 +97,7 @@ Output tokens processed by `mantis/tokenizer.py` with per-block loss weights:
 ## Gotchas
 
 - **Import path**: Always import via `from mantis.simulation import ...` or use the `importlib` trick in `gen_evo_dataset.py`. Never import `mantis` top-level in contexts without CUDA (it pulls in `mamba_ssm`).
-- **Trait names are GPT-2 tokens**: Common English words like "speed", "size", "armor" are already single GPT-2 tokens. The tokenizer does NOT re-add them — it only adds protocol markers and rare compound terms.
+- **All domain words are atomic tokens**: Trait names ("speed", "size", "armor"), body plans, biome names, and protocol markers are all single tokens in the trie-based tokenizer. Numbers are digit-by-digit.
 - **`constants.py` is the single source of truth**: All trait lists, body plan rules, epoch thresholds, and energy constants live here. Don't scatter magic numbers into other modules.
 - **Agent max limits**: 250 agents/species (`AGENT_MAX_PER_SPECIES`), enforced in `AgentManager`. `SpatialHash` cell size (100 units) matches max sense range.
 - **RNG discipline**: `World` takes a seed and creates `self.rng = np.random.default_rng(seed)`. All randomness must flow through `self.rng` for reproducibility. Never use `np.random` module-level.

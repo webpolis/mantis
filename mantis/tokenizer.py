@@ -32,7 +32,7 @@ Vocabulary (~300 tokens, padded to 512):
     Symbols (20):       ± Δ + - = | : ( ) { } * . , / -> † ...
     Whitespace (3):     space newline 2-space-indent
     Letters (52):       a-z A-Z (character fallback)
-    Agent tokens (10):  grid+ forage rest flock flee mate ...
+    Agent tokens (12):  grid+ forage rest flock flee mate fl fk ...
 """
 
 from typing import List, Union, Optional, Dict, Set
@@ -131,7 +131,7 @@ CULTURAL_EVENT_TOKENS = [
 
 REASON_TOKENS = ["environmental_pressure", "survival_instinct"]
 
-DIET_TOKENS = ["det", "plt", "sol"]
+DIET_TOKENS = ["det", "plt", "sol", "chemical", "none"]
 
 REPRO_TOKENS = ["sexual", "asexual"]
 
@@ -142,11 +142,13 @@ GLUE_TOKENS = [
     "low_var", "low_variance",
     "grid+",
     "gen",
+    "loc+=", "locs", "inf",
 ]
 
 # Agent behavior tokens
-AGENT_BEHAVIOR_TOKENS = ["forage", "rest", "flock", "flee", "mate"]
+AGENT_BEHAVIOR_TOKENS = ["forage", "rest", "flock", "flee", "mate", "fl", "fk"]
 # NOTE: "hunt" already in INTERACTION_TOKENS — shared token
+# NOTE: "fl"/"fk" are abbreviations for flee/flock used in agent grid behavior counts
 
 SYMBOLS = [
     "±", "Δ", "+", "-", "=", "|", ":", "(", ")", "{", "}", "*",

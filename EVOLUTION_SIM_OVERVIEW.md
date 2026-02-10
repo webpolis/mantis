@@ -198,22 +198,44 @@ Behavior abbreviations: `r`=rest, `f`=forage, `h`=hunt, `m`=mate, `fl`=flee, `fk
 
 ## Tokenization
 
-`MANTISTokenizer` extends GPT-2 BPE (50,257 tokens) with 87 atomic protocol tokens → 50,345 total.
+`MANTISTokenizer` is a custom trie-based longest-match tokenizer with 282 domain tokens padded to 512 for tensor core alignment. No GPT-2 / BPE / `transformers` dependency.
 
-**Why**: GPT-2 BPE fractures protocol syntax. `theory_of_mind` → 6 BPE tokens. `@SPOT` → 3 tokens. Adding them as atomic tokens reduces per-frame token count by ~30-40%.
+**Why custom over GPT-2 BPE**: The simulation format is ~98% structured protocol — not English. GPT-2's 50,257-token vocabulary wastes 1.5+ GB VRAM on dead embedding weights (at d=2048), runs softmax over 50K logits when only ~300 matter, and splits numbers inconsistently (`"2429"` → `["24","29"]` but `"2430"` differently). The custom tokenizer fixes all three:
 
-**What's added** (87 tokens):
+| Metric              | GPT-2 BPE (old) | Custom trie (new) |
+| ------------------- | ---------------- | ----------------- |
+| Vocab size          | 50,345           | 512               |
+| Embedding params    | 103M (d=2048)    | 1.05M             |
+| Embedding VRAM      | 1.65 GB          | 16.8 MB           |
+| Softmax width       | 50,345           | 512               |
+| `"2429"` encoding   | 2 tokens (varies) | 4 tokens (always `2` `4` `2` `9`) |
+| `"@SPOT"` encoding  | 3 tokens          | 1 token           |
+| Vocab utilization   | ~2-5%            | ~60-90%           |
 
-- Layer markers: `=EPOCH @BIO @SP @INT @EVT @SPOT @AGENT`
-- Spotlight logic: `CTX ACTORS INTENT REACT RESOLVE EFFECT`
-- Mutations: `M+ M- Mpoint Mdrift Mleap Mfuse`
-- Body plans: all 9 names
-- Fractured traits: `venom camo metab repro theory_of_mind` etc. (32 total)
-- Glue prefixes: `pop= plan= diet={ rate=` etc.
+**Vocabulary (282 real + 230 reserved = 512)**:
 
-**What's NOT added**: tokens already single in GPT-2 (`---`, `±`, `->`, `speed`, `size`, `armor`, `intel`, `memory`, `language`, `trade`, `science`, `engineering`, `hunt`, `Mother`).
+- Special (4): `<pad>` `<eos>` `<bos>` `<unk>`
+- Digits (10): `0`–`9` (numbers always digit-by-digit)
+- Whitespace (3): space, newline, 2-space indent
+- Protocol markers (8): `=EPOCH` `@BIO` `@SP` `@INT` `@EVT` `@SPOT` `@AGENT` `---`
+- Spotlight logic (6): `CTX` `ACTORS` `INTENT` `REACT` `RESOLVE` `EFFECT`
+- Mutations (6): `M+` `M-` `Mpoint` `Mdrift` `Mleap` `Mfuse`
+- Body plans (9): all 9 names (`sessile_autotroph` .. `decomposer`)
+- Traits (45): 35 base + 10 fused
+- Biomes (15): all 15 names
+- Interactions (7): `hunt` `graze` `compete` `scavenge` `parasitize` `pollinate` `symbiosis`
+- Spotlight narrative (~50): roles, actions, reactions, resolutions, outcomes, reasons, meme types, cultural events
+- Events/diseases/catastrophes (~25): `speciation` `extinction` `plague` `volcanic_winter` etc.
+- Diet (5): `det` `plt` `sol` `chemical` `none`
+- Agent behaviors (7): `forage` `rest` `flock` `flee` `mate` `fl` `fk`
+- Glue prefixes (15): `pop` `plan=` `inf+=` `loc+=` `locs` `outcome=` `reason=` `Cmem` `grid+` etc.
+- Symbols (18): `±` `Δ` `+` `-` `=` `|` `:` `(` `)` `{` `}` `*` `.` `,` `/` `->` `†` `_`
+- ID prefixes (12): `S` `L` `H` `W` `G` `A` `N` `T` `E` `K` `D` `P`
+- Letters (52): `a`–`z` `A`–`Z` (character fallback for rare/unknown text)
 
-**Longest-match disambiguation**: `@SP` vs `@SPOT` — HuggingFace's trie tokenizer matches longest first, so `@SPOT` always wins when present.
+**Trie-based longest-match**: Multi-character tokens (`@SP`, `sessile_autotroph`, `inf+=`) are matched greedily before falling through to single characters. Handles `@SP` vs `@SPOT` and `inf` vs `inf+=` disambiguation automatically — the trie always matches the longest candidate.
+
+**v1 (verbose) format compatibility**: All v1-only keywords (`TICK_SCALE`, `success=`, `rate=`, `diet=`, etc.) are tokenized via character-level fallback through the LETTERS list. 0% UNK, but ~1.8x more tokens than v2 compact. Always use `--compact` for training data.
 
 **Per-token loss weights** use a state machine: layer markers (`@SP`, `@INT`, etc.) set the weight, subsequent tokens inherit it until the next marker.
 
@@ -241,16 +263,16 @@ Pad tokens get weight 0.0.
 python scripts/gen_evo_dataset.py --worlds 10000 --max-generations 200 \
     --output data/evo_train.txt --workers 8 --seed 42 --compact
 
-# 2. Train (tiny model, single GPU)
+# 2. Train (tiny model, single GPU, 12GB VRAM)
 python train.py --stage 1 data/evo_train.txt \
-    --model-size tiny --seq-len 2048 --batch-size 16 \
-    --gradient-accumulation-steps 2 --learning-rate 5e-4 \
+    --model-size tiny --seq-len 2048 --stride 1024 --batch-size 8 \
+    --gradient-accumulation-steps 4 --learning-rate 5e-4 \
     --warmup-steps 2000 --epochs 10 --mixed-precision --val-split 0.1
 ```
 
 ### Recommended approach (with agent simulation)
 
-Agent blocks use grid+notable hybrid format to keep token volume manageable. A single ECOSYSTEM agent keyframe tick has a median of ~2,500 tokens (v2 compact). Standard sequence lengths work with adjusted keyframe intervals.
+Agent blocks use grid+notable hybrid format to keep token volume manageable. A single ECOSYSTEM agent keyframe tick has a median of ~721 tokens (p95 = 6,139) with the 512-token trie tokenizer. Standard sequence lengths work with adjusted keyframe intervals.
 
 ```bash
 # 1. Generate dataset (agents enabled, compact v2 format)
@@ -268,14 +290,16 @@ python train.py --stage 1 data/evo_agents_train.txt \
 
 ### Critical training parameters
 
-All values below assume **v2 compact format** (`--compact`). v1 format requires roughly 1.7x the seq-len for equivalent coverage.
+All values below assume **v2 compact format** (`--compact`) and the **custom 512-token trie tokenizer**. v1 (verbose) format requires ~1.8x the seq-len for equivalent coverage due to character-level fallback on verbose keywords.
+
+The 512-token vocabulary saves ~1.6 GB VRAM on embedding/projection weights compared to GPT-2's 50K vocab (at d=2048). This headroom can be traded for larger batch sizes or longer sequences.
 
 **Population-only (no agents):**
 
 | Parameter     | Value                          | Why                                                                              |
 | ------------- | ------------------------------ | -------------------------------------------------------------------------------- |
-| `--seq-len`   | 2048                           | p95 keyframe tick = 1,933 tokens. 20-tick window median = 3,574.                |
-| `--stride`    | 1024                           | 50% overlap ensures no causal chain falls on a boundary.                         |
+| `--seq-len`   | 2048                           | INTELLIGENCE delta p95 = 1,604 fits within 2048. Keyframes (median 3K–21K) are too large for any single window — learned via overlapping views. |
+| `--stride`    | 1024                           | 50% overlap ensures every token appears in ~2 windows. Keyframes span ~3–21 windows each, giving full coverage.                                  |
 | Warmup        | 2000 steps                     | MoE router needs stabilization time.                                             |
 | Peak LR       | 5e-4 (tiny/small), 1e-4 (base) | Standard for MoE.                                                                |
 | Min LR        | 1e-5                           | Never decay to zero — late data is the most complex.                             |
@@ -285,7 +309,7 @@ All values below assume **v2 compact format** (`--compact`). v1 format requires 
 
 | Parameter     | Value                          | Why                                                                              |
 | ------------- | ------------------------------ | -------------------------------------------------------------------------------- |
-| `--seq-len`   | 4096 (24GB), 8192 (48GB+)     | Median agent keyframe ~2,500 tokens. p95 ~4,500.                                |
+| `--seq-len`   | 4096 (24GB), 8192 (48GB+)     | ECOSYSTEM agent keyframe p95 = 6,139. INTELLIGENCE p95 = 4,813.                 |
 | `--stride`    | 2048 (24GB), 4096 (48GB+)     | 50% overlap. Grid cells have weak inter-tick causality.                          |
 | Warmup        | 3000 steps                     | Agent tokens increase vocabulary diversity; router needs more time.               |
 | Peak LR       | 5e-4 (tiny/small), 1e-4 (base) | Same as population-only.                                                         |
@@ -293,11 +317,13 @@ All values below assume **v2 compact format** (`--compact`). v1 format requires 
 | Gradient clip | 1.0                            | Same as population-only.                                                         |
 | Keyframe interval | 40                         | Halves agent keyframe frequency — reduces token spikes by 2x.                    |
 
-**Batch size scaling for agent-enabled training (24GB GPU):**
+**Batch size scaling (24GB GPU):**
+
+The 512-token vocab frees ~1.6 GB VRAM vs GPT-2, allowing +1-2 batch size headroom at equivalent seq-len.
 
 | Model | `--seq-len` | `--batch-size` | `--gradient-accumulation-steps` | Effective batch |
 | ----- | ----------- | -------------- | ------------------------------- | --------------- |
-| Tiny  | 4096        | 8              | 4                               | 32              |
+| Tiny  | 4096        | 10             | 3                               | 30              |
 | Tiny  | 8192        | 4              | 8                               | 32              |
 | Small | 4096        | 4              | 8                               | 32              |
 | Small | 8192        | 2              | 16                              | 32              |
@@ -306,26 +332,30 @@ Use `--gradient-checkpointing` unconditionally with agent-enabled data.
 
 ### Token volume comparison
 
-Empirically measured tokens per tick by epoch (v2 compact format, agent-enabled, kf=20, n=30 worlds × 200 ticks):
+Empirically measured tokens per tick with the **512-token trie tokenizer** (v2 compact format, kf=20, n=10 worlds, ~28.5M total tokens):
 
-| Epoch        | Delta (median) | Delta (p95) | Keyframe (median) | Keyframe (p95) | Notes                                    |
-| ------------ | -------------- | ----------- | ------------------ | -------------- | ---------------------------------------- |
-| PRIMORDIAL   | 184            | 541         | 590                | 1,348          | No agents, same as population-only.      |
-| CAMBRIAN     | 101            | 389         | 655                | 1,713          | No agents, same as population-only.      |
-| ECOSYSTEM    | 350            | 900         | 2,500              | 4,500          | Grid+notable format, 3-5 species.        |
+**Population-only (no agents):**
 
-Per-world totals (v2 compact, agent-enabled): median = 42,000 tokens, p95 = 180,000.
-Population-only: median = 35,199, p95 = 111,358, max = 159,197.
+| Epoch        | Delta (median) | Delta (p95) | Keyframe (median) | Keyframe (p95) | Notes                                              |
+| ------------ | -------------- | ----------- | ------------------ | -------------- | -------------------------------------------------- |
+| PRIMORDIAL   | 42             | 252         | 1,114              | 2,095          | Compact; few species, fast ticks.                  |
+| CAMBRIAN     | 911            | 1,160       | 913                | 1,162          | Brief transitional epoch (n=5 in sample).          |
+| ECOSYSTEM    | 162            | 1,302       | 2,981              | 23,288         | Many species; keyframes grow with species count.   |
+| INTELLIGENCE | 773            | 1,604       | 21,029             | 23,044         | Spotlight blocks dominate keyframes.               |
 
-Agent-enabled worlds produce ~1.2-1.6x more tokens than population-only with grid+notable format.
+Delta blocks (between `---` markers) across all epochs: median=164, P90=429, P95=559, P99=1,609.
+
+Keyframes in ECOSYSTEM/INTELLIGENCE are 3K–23K tokens — far too large for any single training window. The model learns keyframe structure across multiple overlapping windows via stride-based sliding. Delta blocks (the vast majority of training data) fit comfortably within seq-len=2048.
+
+**With agent simulation (estimated):**
+
+Agent `@AGENT` sub-blocks add ~50-75% more tokens to ECOSYSTEM/INTELLIGENCE keyframes. Use `--seq-len 4096` minimum with `--gradient-checkpointing`.
 
 ### World boundary handling
 
 Worlds are independent simulations. **Never pack tokens from different worlds into the same sequence.** Pad to `seq_len` at each world boundary (EOS).
 
-Padding waste varies by mode (v2 compact):
-- **Population-only**: <6% waste at `seq_len=2048` (worlds produce median 35K tokens, ~17 sequences per world).
-- **Agent-enabled**: <3% waste at `seq_len=4096` (worlds produce median 42K tokens, ~10 sequences per world).
+Note: `TextDataset` currently concatenates all worlds into a single flat token stream and applies a sliding window — it does **not** enforce world boundaries. Cross-world sequences are rare (one per world boundary, ~10 in a 10-world dataset vs ~27K total sequences), so the impact is negligible for training. A future improvement could mask cross-world positions in the loss.
 
 ### Training curriculum
 

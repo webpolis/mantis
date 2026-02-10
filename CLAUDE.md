@@ -152,7 +152,7 @@ mantis/
 │   └── engine.py        # Dynamic routing and generation
 ├── configs/             # Configuration management
 │   └── model_config.py  # Presets: micro/tiny/small/base
-└── tokenizer.py         # MANTISTokenizer (GPT-2 BPE wrapper)
+└── tokenizer.py         # MANTISTokenizer (trie-based, 512 tokens)
 
 evaluation/              # Evaluation harness
 ├── benchmarks.py        # MMLU, TruthfulQA, HumanEval, GSM8K
@@ -222,7 +222,7 @@ Model sizes are defined in `mantis/configs/model_config.py`:
 - **small**: ~1B parameters (4 experts) - experimentation
 - **base**: ~12B parameters (8 experts) - production target
 
-**Vocabulary**: All models use 50304 tokens (GPT-2 standard vocabulary size).
+**Vocabulary**: All models use 512 tokens (custom domain-specific trie tokenizer, synced at runtime via `len(tokenizer)`).
 
 **Critical alignment requirements** (validated in `MANTISConfig.__post_init__`):
 - `MetaControllerConfig.d_model` must match `BaseMoEConfig.d_model`
