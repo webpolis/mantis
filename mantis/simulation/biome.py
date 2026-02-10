@@ -104,9 +104,10 @@ class Biome:
         return f"L{self.lid} {self.name} {int(round(self.vegetation * 100))} {int(round(self.detritus))}"
 
     @staticmethod
-    def create_random(lid: int, rng: np.random.Generator, n_env_axes: int = 4) -> Biome:
+    def create_random(lid: int, rng: np.random.Generator, n_env_axes: int = 4,
+                      name: str | None = None) -> Biome:
         """Create a biome with random initial conditions."""
-        name = BIOME_NAMES[lid % len(BIOME_NAMES)]
+        name = name or BIOME_NAMES[lid % len(BIOME_NAMES)]
         axes = list(rng.choice(ENV_AXES, size=min(n_env_axes, len(ENV_AXES)), replace=False))
         env = {ax: float(rng.uniform(0.1, 0.9)) for ax in axes}
 

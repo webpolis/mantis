@@ -2,6 +2,7 @@ import { useWebSocket } from "./hooks/useWebSocket";
 import { SimulationCanvas } from "./components/SimulationCanvas";
 import { Controls } from "./components/Controls";
 import { SpeciesPanel } from "./components/SpeciesPanel";
+import { Timeline } from "./components/Timeline";
 
 function App() {
   const {
@@ -26,6 +27,12 @@ function App() {
     selectedModel,
     selectModel,
     biomes,
+    historyLength,
+    viewIndex,
+    isFollowing,
+    seekTo,
+    followLatest,
+    epochs,
   } = useWebSocket();
 
   return (
@@ -58,6 +65,15 @@ function App() {
             models={models}
             selectedModel={selectedModel}
             onSelectModel={selectModel}
+          />
+          <Timeline
+            historyLength={historyLength}
+            viewIndex={viewIndex}
+            currentEpoch={epoch}
+            isFollowing={isFollowing}
+            epochs={epochs}
+            onSeek={seekTo}
+            onFollowLatest={followLatest}
           />
           <SimulationCanvas
             agents={agents}

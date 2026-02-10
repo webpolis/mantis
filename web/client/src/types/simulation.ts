@@ -41,6 +41,14 @@ export interface BiomeData {
   patches: VegetationPatchData[];
 }
 
+export interface HistoryFrame {
+  tick: number;
+  epoch: number;
+  species: SpeciesInfo[];
+  agents: AgentSnapshot[];
+  biomes: BiomeData[];
+}
+
 export interface SimulationInfo {
   total_ticks: number;
   file?: string;

@@ -143,10 +143,9 @@ class World:
         n_biomes = int(self.rng.integers(2, 6))
         biome_indices = self.rng.choice(len(BIOME_NAMES), size=n_biomes, replace=False)
         self.biomes: list[Biome] = [
-            Biome.create_random(i, self.rng) for i in range(n_biomes)
+            Biome.create_random(i, self.rng, name=BIOME_NAMES[idx])
+            for i, idx in enumerate(biome_indices)
         ]
-        for biome, idx in zip(self.biomes, biome_indices):
-            biome.name = BIOME_NAMES[idx]
 
         # Create initial species (3-8, primordial body plans)
         n_species = int(self.rng.integers(3, 9))
