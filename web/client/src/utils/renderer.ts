@@ -1,4 +1,4 @@
-import type { AgentSnapshot, SpeciesInfo, BiomeData } from "../types/simulation";
+import type { AgentSnapshot, SpeciesInfo, BiomeData, VegetationPatchData } from "../types/simulation";
 
 export interface Camera {
   zoom: number;
@@ -389,6 +389,57 @@ export function findAgentAt(
     }
   }
   return closest;
+}
+
+export function findVegetationAt(
+  canvasX: number,
+  canvasY: number,
+  biomes: BiomeData[],
+  worldSize: number,
+  canvasSize: number
+): { patch: VegetationPatchData; biome: BiomeData } | null {
+  const scale = canvasSize / worldSize;
+  let closest: { patch: VegetationPatchData; biome: BiomeData } | null = null;
+  let closestDist = Infinity;
+
+  for (const biome of biomes) {
+    for (const patch of biome.patches) {
+      if (patch.density < 0.01) continue;
+      const px = patch.x * scale;
+      const py = patch.y * scale;
+      const r = patch.radius * scale;
+      const dx = canvasX - px;
+      const dy = canvasY - py;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist <= r * 0.6 && dist < closestDist) {
+        closest = { patch, biome };
+        closestDist = dist;
+      }
+    }
+  }
+  return closest;
+}
+
+export function findBiomeAt(
+  canvasX: number,
+  canvasY: number,
+  biomes: BiomeData[],
+  canvasSize: number
+): BiomeData | null {
+  if (biomes.length === 0) return null;
+  const centers = biomeCenters(biomes, canvasSize);
+  let bestLid = biomes[0].lid;
+  let bestDist = Infinity;
+  for (const [lid, [cx, cy]] of centers.entries()) {
+    const dx = canvasX - cx;
+    const dy = canvasY - cy;
+    const d = dx * dx + dy * dy;
+    if (d < bestDist) {
+      bestDist = d;
+      bestLid = lid;
+    }
+  }
+  return biomes.find((b) => b.lid === bestLid) ?? null;
 }
 
 export function renderGrid(

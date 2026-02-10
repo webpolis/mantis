@@ -28,6 +28,16 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 is_playing = False
 current_speed = 1.0
 TICK_RATE = 15  # Server updates at 15 ticks/sec
+_sim_gen = 0  # Incremented on each new simulation; lets old loops exit cleanly
+
+
+def _wait_or_abort(gen: int) -> bool:
+    """Spin-wait while paused. Returns False if a new simulation superseded us."""
+    while not is_playing:
+        if _sim_gen != gen:
+            return False
+        socketio.sleep(0.1)
+    return _sim_gen == gen
 
 # Cached model inference engine (lazily loaded)
 _engine_cache: dict = {"path": None, "engine": None}
@@ -51,7 +61,9 @@ def assets(filename):
 @socketio.on("start_simulation")
 def handle_start(data=None):
     """Stream simulation ticks to client at reduced rate."""
-    global is_playing
+    global is_playing, _sim_gen
+    _sim_gen += 1
+    my_gen = _sim_gen
     is_playing = True
 
     data = data or {}
@@ -106,8 +118,8 @@ def handle_start(data=None):
             break
 
     for tick in ticks:
-        if not is_playing:
-            break
+        if not _wait_or_abort(my_gen):
+            return
 
         species_data = [serialize_species_for_frontend(sp) for sp in tick.species]
 
@@ -123,13 +135,16 @@ def handle_start(data=None):
 
         socketio.sleep(1.0 / (TICK_RATE * current_speed))
 
-    emit("simulation_complete", {"total_ticks": len(ticks)})
+    if _sim_gen == my_gen:
+        emit("simulation_complete", {"total_ticks": len(ticks)})
 
 
 @socketio.on("start_live")
 def handle_start_live(data=None):
     """Run a live simulation and stream ticks in real-time."""
-    global is_playing
+    global is_playing, _sim_gen
+    _sim_gen += 1
+    my_gen = _sim_gen
     is_playing = True
 
     data = data or {}
@@ -191,8 +206,8 @@ def handle_start_live(data=None):
 
     veg_update_counter = 0
     for gen in range(max_gens):
-        if not is_playing:
-            break
+        if not _wait_or_abort(my_gen):
+            return
 
         world.step()
 
@@ -246,7 +261,8 @@ def handle_start_live(data=None):
 
         socketio.sleep(1.0 / (TICK_RATE * current_speed))
 
-    emit("simulation_complete", {"total_ticks": world.tick})
+    if _sim_gen == my_gen:
+        emit("simulation_complete", {"total_ticks": world.tick})
 
 
 @socketio.on("list_datasets")
@@ -331,7 +347,9 @@ def _get_engine(checkpoint_rel: str):
 @socketio.on("start_model")
 def handle_start_model(data=None):
     """Run model inference and stream parsed ticks to client."""
-    global is_playing
+    global is_playing, _sim_gen
+    _sim_gen += 1
+    my_gen = _sim_gen
     is_playing = True
 
     data = data or {}
@@ -357,8 +375,8 @@ def handle_start_model(data=None):
         max_length=max_tokens,
         temperature=temperature,
     ):
-        if not is_playing:
-            break
+        if not _wait_or_abort(my_gen):
+            return
 
         text_buffer += token_text
 
@@ -399,14 +417,13 @@ def handle_start_model(data=None):
                 ticks_sent += 1
                 socketio.sleep(1.0 / (TICK_RATE * current_speed))
 
-                if not is_playing:
-                    break
+                if not _wait_or_abort(my_gen):
+                    return
 
         text_buffer = incomplete
-        if not is_playing:
-            break
 
-    emit("simulation_complete", {"total_ticks": ticks_sent})
+    if _sim_gen == my_gen:
+        emit("simulation_complete", {"total_ticks": ticks_sent})
 
 
 @socketio.on("pause")

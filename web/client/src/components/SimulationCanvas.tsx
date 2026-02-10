@@ -1,11 +1,13 @@
 import { useEffect, useRef, useCallback, useState } from "react";
-import type { AgentSnapshot, SpeciesInfo, BiomeData } from "../types/simulation";
+import type { AgentSnapshot, SpeciesInfo, BiomeData, VegetationPatchData } from "../types/simulation";
 import { useInterpolation } from "../hooks/useInterpolation";
 import {
   renderAgents,
   renderGrid,
   renderHUD,
   findAgentAt,
+  findVegetationAt,
+  findBiomeAt,
   withCamera,
   screenToBase,
   DEFAULT_CAMERA,
@@ -26,6 +28,11 @@ interface Props {
   biomes: BiomeData[];
 }
 
+type HoveredEntity =
+  | { type: "agent"; agent: AgentSnapshot; species?: SpeciesInfo }
+  | { type: "vegetation"; patch: VegetationPatchData; biome: BiomeData }
+  | { type: "biome"; biome: BiomeData };
+
 const CANVAS_SIZE = 800;
 const MIN_ZOOM = 1;
 const MAX_ZOOM = 20;
@@ -44,13 +51,13 @@ export function SimulationCanvas({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rafRef = useRef<number>(0);
   const { updateSnapshot, getInterpolated } = useInterpolation();
-  const [hovered, setHovered] = useState<AgentSnapshot | null>(null);
+  const [hovered, setHovered] = useState<HoveredEntity | null>(null);
 
   // Cached biome texture
   const biomeTextureRef = useRef<HTMLCanvasElement | null>(null);
   const biomeKeyRef = useRef<string>("");
   const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 });
-  const hoveredRef = useRef<AgentSnapshot | null>(null);
+  const hoveredRef = useRef<HoveredEntity | null>(null);
 
   // Camera state as ref to avoid re-creating render callback on every zoom/pan
   const camRef = useRef<Camera>({ ...DEFAULT_CAMERA });
@@ -157,11 +164,28 @@ export function SimulationCanvas({
       const [bx, by] = screenToBase(cx, cy, camRef.current);
 
       const currentAgents = isPlaying ? getInterpolated() : agents;
+      const speciesMap = new Map(species.map((s) => [s.sid, s]));
+
+      // Priority: agent > vegetation > biome
       const agent = findAgentAt(bx, by, currentAgents, worldSize, CANVAS_SIZE);
-      setHovered(agent);
+      if (agent) {
+        setHovered({ type: "agent", agent, species: speciesMap.get(agent.species_sid) });
+      } else {
+        const veg = findVegetationAt(bx, by, biomes, worldSize, CANVAS_SIZE);
+        if (veg) {
+          setHovered({ type: "vegetation", patch: veg.patch, biome: veg.biome });
+        } else {
+          const biome = findBiomeAt(bx, by, biomes, CANVAS_SIZE);
+          if (biome) {
+            setHovered({ type: "biome", biome });
+          } else {
+            setHovered(null);
+          }
+        }
+      }
       setTooltipPos({ x: e.clientX - rect.left, y: e.clientY - rect.top });
     },
-    [agents, worldSize, isPlaying, getInterpolated]
+    [agents, species, biomes, worldSize, isPlaying, getInterpolated]
   );
 
   const handleMouseLeave = useCallback(() => {
@@ -193,7 +217,8 @@ export function SimulationCanvas({
       }
       renderGrid(ctx, worldSize);
       renderVegetation(ctx, biomes, worldSize);
-      renderAgents(ctx, interpolated, species, worldSize, hoveredRef.current?.aid);
+      const hovAid = hoveredRef.current?.type === "agent" ? hoveredRef.current.agent.aid : undefined;
+      renderAgents(ctx, interpolated, species, worldSize, hovAid);
     });
 
     renderHUD(ctx, tick, epoch, interpolated.length, species.length, cam.zoom);
@@ -233,15 +258,14 @@ export function SimulationCanvas({
         }
         renderGrid(ctx, worldSize);
         renderVegetation(ctx, biomes, worldSize);
-        renderAgents(ctx, agents, species, worldSize, hoveredRef.current?.aid);
+        const hovAid = hoveredRef.current?.type === "agent" ? hoveredRef.current.agent.aid : undefined;
+        renderAgents(ctx, agents, species, worldSize, hovAid);
       });
 
       renderHUD(ctx, tick, epoch, agents.length, species.length, cam.zoom);
     }
   }, [agents, species, worldSize, tick, epoch, isPlaying, camSnapshot, biomes]);
 
-  const speciesMap = new Map(species.map((s) => [s.sid, s]));
-  const hoveredSpecies = hovered ? speciesMap.get(hovered.species_sid) : null;
   const isZoomed = camSnapshot.zoom > 1;
 
   return (
@@ -285,45 +309,102 @@ export function SimulationCanvas({
             zIndex: 10,
           }}
         >
-          <div style={{ fontWeight: "bold", color: "#fff", marginBottom: "2px" }}>
-            Agent #{hovered.aid}
-          </div>
-          <div>
-            <span style={{ color: "#999" }}>Species:</span>{" "}
-            S{hovered.species_sid}
-            {hoveredSpecies && (
-              <span style={{ color: "#aaa" }}> ({hoveredSpecies.plan})</span>
-            )}
-          </div>
-          <div>
-            <span style={{ color: "#999" }}>Energy:</span>{" "}
-            <span style={{ color: hovered.energy < 20 ? "#ff4" : "#eee" }}>
-              {Math.round(hovered.energy)}
-            </span>
-          </div>
-          <div>
-            <span style={{ color: "#999" }}>Age:</span> {hovered.age}
-          </div>
-          <div>
-            <span style={{ color: "#999" }}>State:</span>{" "}
-            <span style={{ color: "#8cf" }}>{hovered.state}</span>
-          </div>
-          {hovered.target_aid != null && (
-            <div>
-              <span style={{ color: "#999" }}>Target:</span> #{hovered.target_aid}
-            </div>
-          )}
-          <div>
-            <span style={{ color: "#999" }}>Pos:</span>{" "}
-            ({Math.round(hovered.x)}, {Math.round(hovered.y)})
-          </div>
-          {hovered.count > 1 && (
-            <div>
-              <span style={{ color: "#999" }}>Count:</span> {hovered.count}
-            </div>
-          )}
+          {hovered.type === "agent" && <AgentTooltip entity={hovered} />}
+          {hovered.type === "vegetation" && <VegetationTooltip entity={hovered} />}
+          {hovered.type === "biome" && <BiomeTooltip entity={hovered} />}
         </div>
       )}
     </div>
+  );
+}
+
+function AgentTooltip({ entity }: { entity: Extract<HoveredEntity, { type: "agent" }> }) {
+  const { agent, species: sp } = entity;
+  return (
+    <>
+      <div style={{ fontWeight: "bold", color: "#fff", marginBottom: "2px" }}>
+        Agent #{agent.aid}
+      </div>
+      <div>
+        <span style={{ color: "#999" }}>Species:</span>{" "}
+        S{agent.species_sid}
+        {sp && <span style={{ color: "#aaa" }}> ({sp.plan})</span>}
+      </div>
+      <div>
+        <span style={{ color: "#999" }}>Energy:</span>{" "}
+        <span style={{ color: agent.energy < 20 ? "#ff4" : "#eee" }}>
+          {Math.round(agent.energy)}
+        </span>
+      </div>
+      <div>
+        <span style={{ color: "#999" }}>Age:</span> {agent.age}
+      </div>
+      <div>
+        <span style={{ color: "#999" }}>State:</span>{" "}
+        <span style={{ color: "#8cf" }}>{agent.state}</span>
+      </div>
+      {agent.target_aid != null && (
+        <div>
+          <span style={{ color: "#999" }}>Target:</span> #{agent.target_aid}
+        </div>
+      )}
+      <div>
+        <span style={{ color: "#999" }}>Pos:</span>{" "}
+        ({Math.round(agent.x)}, {Math.round(agent.y)})
+      </div>
+      {agent.count > 1 && (
+        <div>
+          <span style={{ color: "#999" }}>Count:</span> {agent.count}
+        </div>
+      )}
+    </>
+  );
+}
+
+function VegetationTooltip({ entity }: { entity: Extract<HoveredEntity, { type: "vegetation" }> }) {
+  const { patch, biome } = entity;
+  return (
+    <>
+      <div style={{ fontWeight: "bold", color: "#6c6", marginBottom: "2px" }}>
+        Vegetation Patch
+      </div>
+      <div>
+        <span style={{ color: "#999" }}>Biome:</span>{" "}
+        {biome.name} (L{biome.lid})
+      </div>
+      <div>
+        <span style={{ color: "#999" }}>Density:</span>{" "}
+        {(patch.density * 100).toFixed(0)}%
+      </div>
+      <div>
+        <span style={{ color: "#999" }}>Radius:</span> {Math.round(patch.radius)}
+      </div>
+      <div>
+        <span style={{ color: "#999" }}>Pos:</span>{" "}
+        ({Math.round(patch.x)}, {Math.round(patch.y)})
+      </div>
+    </>
+  );
+}
+
+function BiomeTooltip({ entity }: { entity: Extract<HoveredEntity, { type: "biome" }> }) {
+  const { biome } = entity;
+  return (
+    <>
+      <div style={{ fontWeight: "bold", color: "#8cf", marginBottom: "2px" }}>
+        {biome.name}
+      </div>
+      <div>
+        <span style={{ color: "#999" }}>ID:</span> L{biome.lid}
+      </div>
+      <div>
+        <span style={{ color: "#999" }}>Vegetation:</span>{" "}
+        {(biome.vegetation * 100).toFixed(0)}%
+      </div>
+      <div>
+        <span style={{ color: "#999" }}>Detritus:</span>{" "}
+        {Math.round(biome.detritus)}
+      </div>
+    </>
   );
 }
