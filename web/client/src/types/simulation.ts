@@ -26,6 +26,21 @@ export interface TickData {
   interpolate_duration: number;
 }
 
+export interface VegetationPatchData {
+  x: number;
+  y: number;
+  radius: number;
+  density: number;
+}
+
+export interface BiomeData {
+  lid: number;
+  name: string;
+  vegetation: number;
+  detritus: number;
+  patches: VegetationPatchData[];
+}
+
 export interface SimulationInfo {
   total_ticks: number;
   file?: string;

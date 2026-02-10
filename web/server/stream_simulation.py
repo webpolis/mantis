@@ -38,12 +38,21 @@ class ParsedSpecies:
 
 
 @dataclass
+class ParsedBiome:
+    lid: int
+    name: str
+    vegetation: float
+    detritus: float
+
+
+@dataclass
 class ParsedTick:
     number: int
     epoch: int = 1
     species: list[ParsedSpecies] = field(default_factory=list)
     agents: list[ParsedAgent] = field(default_factory=list)
     interactions: list[dict] = field(default_factory=list)
+    biomes: list[ParsedBiome] = field(default_factory=list)
 
 
 # ------------------------------------------------------------------
@@ -385,6 +394,53 @@ def _parse_compact_species_header(line: str) -> ParsedSpecies | None:
 
 
 # ------------------------------------------------------------------
+# Biome parsing
+# ------------------------------------------------------------------
+
+_BIO_V1_RE = re.compile(r"L(\d+):(\w+)\(veg=([\d.]+),det=([\d.]+)\)")
+
+
+def _parse_bio_line(line: str, compact: bool) -> list[ParsedBiome]:
+    """Parse a @BIO line into biome list.
+
+    v2: @BIO L0 shallows 80 120 L1 forest 30 0
+    v1: @BIO|L0:shallows(veg=0.8,det=120)|L1:forest(veg=0.3,det=0)
+    """
+    biomes: list[ParsedBiome] = []
+    if compact:
+        # Strip "@BIO " prefix, then groups of 4 tokens
+        tokens = line.split()
+        idx = 1  # skip "@BIO"
+        while idx + 3 < len(tokens):
+            lid_tok = tokens[idx]
+            if not lid_tok.startswith("L"):
+                idx += 1
+                continue
+            try:
+                lid = int(lid_tok[1:])
+                name = tokens[idx + 1]
+                veg = float(tokens[idx + 2]) / 100.0
+                det = float(tokens[idx + 3])
+                biomes.append(ParsedBiome(lid=lid, name=name, vegetation=veg, detritus=det))
+            except (ValueError, IndexError):
+                pass
+            idx += 4
+    else:
+        # v1: pipe-delimited
+        parts = line.split("|")
+        for part in parts[1:]:  # skip "@BIO"
+            m = _BIO_V1_RE.match(part.strip())
+            if m:
+                biomes.append(ParsedBiome(
+                    lid=int(m.group(1)),
+                    name=m.group(2),
+                    vegetation=float(m.group(3)),
+                    detritus=float(m.group(4)),
+                ))
+    return biomes
+
+
+# ------------------------------------------------------------------
 # Main parser
 # ------------------------------------------------------------------
 
@@ -486,6 +542,11 @@ def parse_protocol_to_ticks(text: str) -> list[ParsedTick]:
                     current_tick.species.append(sp)
                 continue
 
+        # Biome data
+        if stripped.startswith("@BIO"):
+            current_tick.biomes = _parse_bio_line(stripped, compact)
+            continue
+
         # Interaction
         if stripped.startswith("@INT"):
             current_tick.interactions.append({"raw": stripped})
@@ -532,4 +593,15 @@ def serialize_species_for_frontend(sp: ParsedSpecies) -> dict:
         "plan": sp.plan,
         "population": sp.population,
         "locations": sp.locations,
+    }
+
+
+def serialize_biome_for_frontend(biome: ParsedBiome, patches: list[dict] | None = None) -> dict:
+    """Convert ParsedBiome to JSON-serializable dict."""
+    return {
+        "lid": biome.lid,
+        "name": biome.name,
+        "vegetation": biome.vegetation,
+        "detritus": biome.detritus,
+        "patches": patches or [],
     }

@@ -24,6 +24,7 @@ function App() {
     models,
     selectedModel,
     selectModel,
+    biomes,
   } = useWebSocket();
 
   return (
@@ -64,6 +65,7 @@ function App() {
             epoch={epoch}
             interpolateDuration={interpolateDuration}
             isPlaying={isPlaying}
+            biomes={biomes}
           />
         </div>
         <SpeciesPanel species={species} />

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback, useState } from "react";
-import type { AgentSnapshot, SpeciesInfo } from "../types/simulation";
+import type { AgentSnapshot, SpeciesInfo, BiomeData } from "../types/simulation";
 import { useInterpolation } from "../hooks/useInterpolation";
 import {
   renderAgents,
@@ -9,6 +9,9 @@ import {
   withCamera,
   screenToBase,
   DEFAULT_CAMERA,
+  buildBiomeTexture,
+  renderBiomeBackground,
+  renderVegetation,
 } from "../utils/renderer";
 import type { Camera } from "../utils/renderer";
 
@@ -20,6 +23,7 @@ interface Props {
   epoch: number;
   interpolateDuration: number;
   isPlaying: boolean;
+  biomes: BiomeData[];
 }
 
 const CANVAS_SIZE = 800;
@@ -35,11 +39,16 @@ export function SimulationCanvas({
   epoch,
   interpolateDuration,
   isPlaying,
+  biomes,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rafRef = useRef<number>(0);
   const { updateSnapshot, getInterpolated } = useInterpolation();
   const [hovered, setHovered] = useState<AgentSnapshot | null>(null);
+
+  // Cached biome texture
+  const biomeTextureRef = useRef<HTMLCanvasElement | null>(null);
+  const biomeKeyRef = useRef<string>("");
   const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 });
   const hoveredRef = useRef<AgentSnapshot | null>(null);
 
@@ -61,6 +70,15 @@ export function SimulationCanvas({
       updateSnapshot(agents, interpolateDuration);
     }
   }, [agents, interpolateDuration, updateSnapshot]);
+
+  // Rebuild biome texture when biome set changes
+  useEffect(() => {
+    const key = biomes.map((b) => `${b.lid}:${b.name}`).join(",");
+    if (key !== biomeKeyRef.current) {
+      biomeKeyRef.current = key;
+      biomeTextureRef.current = buildBiomeTexture(biomes, CANVAS_SIZE);
+    }
+  }, [biomes]);
 
   // --- Zoom (wheel) ---
   useEffect(() => {
@@ -163,14 +181,18 @@ export function SimulationCanvas({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    ctx.fillStyle = "#16213e";
+    ctx.fillStyle = "#0d1117";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
     const cam = camRef.current;
     const interpolated = getInterpolated();
 
     withCamera(ctx, cam, () => {
+      if (biomeTextureRef.current) {
+        renderBiomeBackground(ctx, biomeTextureRef.current);
+      }
       renderGrid(ctx, worldSize);
+      renderVegetation(ctx, biomes, worldSize);
       renderAgents(ctx, interpolated, species, worldSize, hoveredRef.current?.aid);
     });
 
@@ -179,7 +201,7 @@ export function SimulationCanvas({
     if (isPlaying) {
       rafRef.current = requestAnimationFrame(render);
     }
-  }, [getInterpolated, species, worldSize, tick, epoch, isPlaying]);
+  }, [getInterpolated, species, worldSize, tick, epoch, isPlaying, biomes]);
 
   useEffect(() => {
     if (isPlaying) {
@@ -200,19 +222,23 @@ export function SimulationCanvas({
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
 
-      ctx.fillStyle = "#16213e";
+      ctx.fillStyle = "#0d1117";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
       const cam = camRef.current;
 
       withCamera(ctx, cam, () => {
+        if (biomeTextureRef.current) {
+          renderBiomeBackground(ctx, biomeTextureRef.current);
+        }
         renderGrid(ctx, worldSize);
+        renderVegetation(ctx, biomes, worldSize);
         renderAgents(ctx, agents, species, worldSize, hoveredRef.current?.aid);
       });
 
       renderHUD(ctx, tick, epoch, agents.length, species.length, cam.zoom);
     }
-  }, [agents, species, worldSize, tick, epoch, isPlaying, camSnapshot]);
+  }, [agents, species, worldSize, tick, epoch, isPlaying, camSnapshot, biomes]);
 
   const speciesMap = new Map(species.map((s) => [s.sid, s]));
   const hoveredSpecies = hovered ? speciesMap.get(hovered.species_sid) : null;

@@ -1,6 +1,32 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { io, Socket } from "socket.io-client";
-import type { AgentSnapshot, SpeciesInfo, TickData, SimulationInfo, DatasetFile, WorldList, ModelFile } from "../types/simulation";
+import type { AgentSnapshot, SpeciesInfo, TickData, SimulationInfo, DatasetFile, WorldList, ModelFile, BiomeData, VegetationPatchData } from "../types/simulation";
+
+/** Mulberry32 seeded PRNG for deterministic vegetation patches. */
+function mulberry32(seed: number): () => number {
+  let s = seed | 0;
+  return () => {
+    s = (s + 0x6d2b79f5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function generateDeterministicPatches(lid: number, vegetation: number): VegetationPatchData[] {
+  const rng = mulberry32(lid * 7919 + 137);
+  const count = 5 + Math.floor(rng() * 4); // 5-8 patches
+  const patches: VegetationPatchData[] = [];
+  for (let i = 0; i < count; i++) {
+    patches.push({
+      x: rng() * 1000,
+      y: rng() * 1000,
+      radius: 80 + rng() * 40,
+      density: vegetation * (0.5 + rng() * 0.5),
+    });
+  }
+  return patches;
+}
 
 export function useWebSocket() {
   const socketRef = useRef<Socket | null>(null);
@@ -17,6 +43,7 @@ export function useWebSocket() {
   const [selectedWorld, setSelectedWorld] = useState(0);
   const [models, setModels] = useState<ModelFile[]>([]);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [biomes, setBiomes] = useState<BiomeData[]>([]);
 
   useEffect(() => {
     const socket = io(window.location.origin, {
@@ -58,6 +85,27 @@ export function useWebSocket() {
       setModels(data);
     });
 
+    socket.on("environment_init", (data: { biomes: BiomeData[] }) => {
+      const enriched = data.biomes.map((b) => ({
+        ...b,
+        patches: b.patches.length > 0 ? b.patches : generateDeterministicPatches(b.lid, b.vegetation),
+      }));
+      setBiomes(enriched);
+    });
+
+    socket.on("vegetation_update", (data: { patches: Array<{ lid: number; x: number; y: number; density: number }> }) => {
+      setBiomes((prev) => {
+        const updated = prev.map((b) => ({ ...b, patches: [...b.patches] }));
+        for (const upd of data.patches) {
+          const biome = updated.find((b) => b.lid === upd.lid);
+          if (!biome) continue;
+          const patch = biome.patches.find((p) => Math.abs(p.x - upd.x) < 1 && Math.abs(p.y - upd.y) < 1);
+          if (patch) patch.density = upd.density;
+        }
+        return updated;
+      });
+    });
+
     socket.on("connect", () => {
       socket.emit("list_datasets");
       socket.emit("list_models");
@@ -87,6 +135,7 @@ export function useWebSocket() {
     const socket = socketRef.current;
     if (!socket) return;
     setIsPlaying(true);
+    setBiomes([]);
     if (mode === "model") {
       socket.emit("start_model", {
         model: selectedModel,
@@ -143,5 +192,6 @@ export function useWebSocket() {
     models,
     selectedModel,
     selectModel,
+    biomes,
   };
 }

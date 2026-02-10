@@ -18,6 +18,7 @@ from stream_simulation import (
     parse_protocol_to_ticks,
     serialize_agent_for_frontend,
     serialize_species_for_frontend,
+    serialize_biome_for_frontend,
     split_worlds,
 )
 
@@ -96,6 +97,14 @@ def handle_start(data=None):
         "world_count": len(worlds),
     })
 
+    # Emit biome data from first tick that has it (patches empty — frontend generates)
+    for t in ticks:
+        if t.biomes:
+            emit("environment_init", {
+                "biomes": [serialize_biome_for_frontend(b) for b in t.biomes],
+            })
+            break
+
     for tick in ticks:
         if not is_playing:
             break
@@ -162,6 +171,25 @@ def handle_start_live(data=None):
         "mode": "live",
     })
 
+    # Initialize vegetation patches and emit biome data with real patch positions
+    biome_data = []
+    for biome in world.biomes:
+        if not biome.vegetation_patches:
+            biome.init_vegetation_patches(world.rng, world_size=1000)
+        patches = [
+            {"x": p.x, "y": p.y, "radius": p.radius, "density": p.density}
+            for p in biome.vegetation_patches
+        ]
+        biome_data.append({
+            "lid": biome.lid,
+            "name": biome.name,
+            "vegetation": biome.vegetation,
+            "detritus": biome.detritus,
+            "patches": patches,
+        })
+    emit("environment_init", {"biomes": biome_data})
+
+    veg_update_counter = 0
     for gen in range(max_gens):
         if not is_playing:
             break
@@ -201,6 +229,20 @@ def handle_start_live(data=None):
             "agents": agent_data,
             "interpolate_duration": 1000 / TICK_RATE,
         })
+
+        # Periodic vegetation density update
+        veg_update_counter += 1
+        if veg_update_counter >= 10:
+            veg_update_counter = 0
+            patch_updates = []
+            for biome in world.biomes:
+                for p in biome.vegetation_patches:
+                    patch_updates.append({
+                        "lid": biome.lid,
+                        "x": p.x, "y": p.y,
+                        "density": p.density,
+                    })
+            emit("vegetation_update", {"patches": patch_updates})
 
         socketio.sleep(1.0 / (TICK_RATE * current_speed))
 
@@ -304,6 +346,7 @@ def handle_start_model(data=None):
     emit("simulation_info", {"total_ticks": 0, "mode": "model"})
 
     ticks_sent = 0
+    biomes_sent = False
     for token_text in engine.generate_streaming(
         prompt=seed_prompt,
         max_length=max_tokens,
@@ -333,6 +376,12 @@ def handle_start_model(data=None):
                 continue
             ticks = parse_protocol_to_ticks(chunk + "\n---")
             for tick_data in ticks:
+                # Emit biome data from first tick that has it
+                if tick_data.biomes and not biomes_sent:
+                    emit("environment_init", {
+                        "biomes": [serialize_biome_for_frontend(b) for b in tick_data.biomes],
+                    })
+                    biomes_sent = True
                 species_data = [serialize_species_for_frontend(sp) for sp in tick_data.species]
                 agent_data = [serialize_agent_for_frontend(agent) for agent in tick_data.agents]
                 emit("tick_update", {
