@@ -24,6 +24,7 @@ export interface TickData {
   species: SpeciesInfo[];
   agents: AgentSnapshot[];
   interpolate_duration: number;
+  events?: SimulationEvent[];
 }
 
 export interface VegetationPatchData {
@@ -38,7 +39,15 @@ export interface BiomeData {
   name: string;
   vegetation: number;
   detritus: number;
+  nitrogen: number;
+  phosphorus: number;
   patches: VegetationPatchData[];
+}
+
+export interface SimulationEvent {
+  target: string;
+  event_type: string;
+  detail: string;
 }
 
 export interface HistoryFrame {
@@ -47,6 +56,7 @@ export interface HistoryFrame {
   species: SpeciesInfo[];
   agents: AgentSnapshot[];
   biomes: BiomeData[];
+  events: SimulationEvent[];
 }
 
 export interface SimulationInfo {

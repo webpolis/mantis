@@ -3,6 +3,7 @@ import { SimulationCanvas } from "./components/SimulationCanvas";
 import { Controls } from "./components/Controls";
 import { SpeciesPanel } from "./components/SpeciesPanel";
 import { Timeline } from "./components/Timeline";
+import { EventLog } from "./components/EventLog";
 
 function App() {
   const {
@@ -27,6 +28,8 @@ function App() {
     selectedModel,
     selectModel,
     biomes,
+    events,
+    eventLog,
     historyLength,
     viewIndex,
     isFollowing,
@@ -84,9 +87,13 @@ function App() {
             interpolateDuration={interpolateDuration}
             isPlaying={isPlaying}
             biomes={biomes}
+            events={events}
           />
         </div>
-        <SpeciesPanel species={species} />
+        <div>
+          <SpeciesPanel species={species} />
+          <EventLog eventLog={eventLog} />
+        </div>
       </div>
     </div>
   );

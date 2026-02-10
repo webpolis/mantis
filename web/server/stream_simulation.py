@@ -43,6 +43,15 @@ class ParsedBiome:
     name: str
     vegetation: float
     detritus: float
+    nitrogen: float = 0.5
+    phosphorus: float = 0.3
+
+
+@dataclass
+class ParsedEvent:
+    target: str       # "WORLD" or "S3"
+    event_type: str   # "catastrophe", "catastrophe_end", "disease", "symbiogenesis", etc.
+    detail: str       # remaining payload
 
 
 @dataclass
@@ -53,6 +62,7 @@ class ParsedTick:
     agents: list[ParsedAgent] = field(default_factory=list)
     interactions: list[dict] = field(default_factory=list)
     biomes: list[ParsedBiome] = field(default_factory=list)
+    events: list[ParsedEvent] = field(default_factory=list)
 
 
 # ------------------------------------------------------------------
@@ -397,7 +407,7 @@ def _parse_compact_species_header(line: str) -> ParsedSpecies | None:
 # Biome parsing
 # ------------------------------------------------------------------
 
-_BIO_V1_RE = re.compile(r"L(\d+):(\w+)\(veg=([\d.]+),det=([\d.]+)\)")
+_BIO_V1_RE = re.compile(r"L(\d+):(\w+)\(veg=([\d.]+),det=([\d.]+)(?:,N=([\d.]+),P=([\d.]+))?\)")
 
 
 def _parse_bio_line(line: str, compact: bool) -> list[ParsedBiome]:
@@ -408,7 +418,7 @@ def _parse_bio_line(line: str, compact: bool) -> list[ParsedBiome]:
     """
     biomes: list[ParsedBiome] = []
     if compact:
-        # Strip "@BIO " prefix, then groups of 4 tokens
+        # Strip "@BIO " prefix, then groups of 4+ tokens per biome
         tokens = line.split()
         idx = 1  # skip "@BIO"
         while idx + 3 < len(tokens):
@@ -421,23 +431,64 @@ def _parse_bio_line(line: str, compact: bool) -> list[ParsedBiome]:
                 name = tokens[idx + 1]
                 veg = float(tokens[idx + 2]) / 100.0
                 det = float(tokens[idx + 3])
-                biomes.append(ParsedBiome(lid=lid, name=name, vegetation=veg, detritus=det))
+                idx += 4
+                # Peek for optional N/P tokens (e.g. N7 P3 → 0.7, 0.3)
+                nitrogen = 0.5
+                phosphorus = 0.3
+                if idx < len(tokens) and tokens[idx].startswith("N") and tokens[idx][1:].isdigit():
+                    nitrogen = int(tokens[idx][1:]) / 10.0
+                    idx += 1
+                    if idx < len(tokens) and tokens[idx].startswith("P") and tokens[idx][1:].isdigit():
+                        phosphorus = int(tokens[idx][1:]) / 10.0
+                        idx += 1
+                biomes.append(ParsedBiome(lid=lid, name=name, vegetation=veg, detritus=det,
+                                          nitrogen=nitrogen, phosphorus=phosphorus))
             except (ValueError, IndexError):
-                pass
-            idx += 4
+                idx += 4
     else:
         # v1: pipe-delimited
         parts = line.split("|")
         for part in parts[1:]:  # skip "@BIO"
             m = _BIO_V1_RE.match(part.strip())
             if m:
+                nitrogen = float(m.group(5)) if m.group(5) else 0.5
+                phosphorus = float(m.group(6)) if m.group(6) else 0.3
                 biomes.append(ParsedBiome(
                     lid=int(m.group(1)),
                     name=m.group(2),
                     vegetation=float(m.group(3)),
                     detritus=float(m.group(4)),
+                    nitrogen=nitrogen,
+                    phosphorus=phosphorus,
                 ))
     return biomes
+
+
+# ------------------------------------------------------------------
+# Event parsing
+# ------------------------------------------------------------------
+
+def _parse_event_line(line: str, compact: bool) -> ParsedEvent | None:
+    """Parse an @EVT line into a ParsedEvent.
+
+    v2: @EVT WORLD catastrophe meteor_impact dur=5
+    v1: @EVT|WORLD|catastrophe|meteor_impact dur=5
+    """
+    if compact:
+        tokens = line.split()
+        if len(tokens) < 3:
+            return None
+        target = tokens[1]
+        event_type = tokens[2]
+        detail = " ".join(tokens[3:]) if len(tokens) > 3 else ""
+    else:
+        parts = line.split("|")
+        if len(parts) < 3:
+            return None
+        target = parts[1].strip()
+        event_type = parts[2].strip()
+        detail = "|".join(parts[3:]).strip() if len(parts) > 3 else ""
+    return ParsedEvent(target=target, event_type=event_type, detail=detail)
 
 
 # ------------------------------------------------------------------
@@ -542,6 +593,13 @@ def parse_protocol_to_ticks(text: str) -> list[ParsedTick]:
                     current_tick.species.append(sp)
                 continue
 
+        # Events
+        if stripped.startswith("@EVT"):
+            evt = _parse_event_line(stripped, compact)
+            if evt:
+                current_tick.events.append(evt)
+            continue
+
         # Biome data
         if stripped.startswith("@BIO"):
             current_tick.biomes = _parse_bio_line(stripped, compact)
@@ -603,5 +661,16 @@ def serialize_biome_for_frontend(biome: ParsedBiome, patches: list[dict] | None 
         "name": biome.name,
         "vegetation": biome.vegetation,
         "detritus": biome.detritus,
+        "nitrogen": biome.nitrogen,
+        "phosphorus": biome.phosphorus,
         "patches": patches or [],
+    }
+
+
+def serialize_event_for_frontend(evt: ParsedEvent) -> dict:
+    """Convert ParsedEvent to JSON-serializable dict."""
+    return {
+        "target": evt.target,
+        "event_type": evt.event_type,
+        "detail": evt.detail,
     }

@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { io, Socket } from "socket.io-client";
-import type { AgentSnapshot, SpeciesInfo, TickData, SimulationInfo, DatasetFile, WorldList, ModelFile, BiomeData, VegetationPatchData, HistoryFrame } from "../types/simulation";
+import type { AgentSnapshot, SpeciesInfo, TickData, SimulationInfo, DatasetFile, WorldList, ModelFile, BiomeData, VegetationPatchData, HistoryFrame, SimulationEvent } from "../types/simulation";
+
+export interface EventLogEntry {
+  tick: number;
+  event: SimulationEvent;
+}
 
 /** Mulberry32 seeded PRNG for deterministic vegetation patches. */
 function mulberry32(seed: number): () => number {
@@ -45,6 +50,9 @@ export function useWebSocket() {
   const [models, setModels] = useState<ModelFile[]>([]);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
   const [biomes, setBiomes] = useState<BiomeData[]>([]);
+  const [events, setEvents] = useState<SimulationEvent[]>([]);
+  const eventLogRef = useRef<EventLogEntry[]>([]);
+  const [eventLog, setEventLog] = useState<EventLogEntry[]>([]);
   const historyRef = useRef<HistoryFrame[]>([]);
   const [historyLength, setHistoryLength] = useState(0);
   const [viewIndex, setViewIndex] = useState<number | null>(null);
@@ -62,6 +70,14 @@ export function useWebSocket() {
       const prevSpecies = historyRef.current.length > 0
         ? historyRef.current[historyRef.current.length - 1].species
         : [];
+      const tickEvents = data.events ?? [];
+
+      // Append to event log
+      if (tickEvents.length > 0) {
+        const newEntries = tickEvents.map((e) => ({ tick: data.tick, event: e }));
+        eventLogRef.current = [...eventLogRef.current, ...newEntries].slice(-200);
+        setEventLog([...eventLogRef.current]);
+      }
 
       const frame: HistoryFrame = {
         tick: data.tick,
@@ -69,6 +85,7 @@ export function useWebSocket() {
         species: sp ?? prevSpecies,
         agents: data.agents,
         biomes: biomesRef.current.map((b) => ({ ...b, patches: [...b.patches] })),
+        events: tickEvents,
       };
       historyRef.current.push(frame);
       setHistoryLength(historyRef.current.length);
@@ -79,6 +96,7 @@ export function useWebSocket() {
         setEpoch(data.epoch);
         if (sp) setSpecies(sp);
         setAgents(data.agents);
+        setEvents(tickEvents);
         setInterpolateDuration(data.interpolate_duration);
       }
     });
@@ -113,6 +131,8 @@ export function useWebSocket() {
     socket.on("environment_init", (data: { biomes: BiomeData[] }) => {
       const enriched = data.biomes.map((b) => ({
         ...b,
+        nitrogen: b.nitrogen ?? 0.5,
+        phosphorus: b.phosphorus ?? 0.3,
         patches: b.patches.length > 0 ? b.patches : generateDeterministicPatches(b.lid, b.vegetation),
       }));
       biomesRef.current = enriched;
@@ -176,6 +196,9 @@ export function useWebSocket() {
     if (!socket) return;
     historyRef.current = [];
     setHistoryLength(0);
+    eventLogRef.current = [];
+    setEventLog([]);
+    setEvents([]);
     viewIndexRef.current = null;
     setViewIndex(null);
     setIsPlaying(true);
@@ -226,6 +249,7 @@ export function useWebSocket() {
     setSpecies(frame.species);
     setAgents(frame.agents);
     setBiomes(frame.biomes);
+    setEvents(frame.events);
   }, []);
 
   const followLatest = useCallback(() => {
@@ -238,6 +262,7 @@ export function useWebSocket() {
       setSpecies(last.species);
       setAgents(last.agents);
       setBiomes(last.biomes);
+      setEvents(last.events);
     }
   }, []);
 
@@ -281,6 +306,8 @@ export function useWebSocket() {
     selectedModel,
     selectModel,
     biomes,
+    events,
+    eventLog,
     historyLength,
     viewIndex,
     isFollowing,

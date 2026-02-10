@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback, useState } from "react";
-import type { AgentSnapshot, SpeciesInfo, BiomeData, VegetationPatchData } from "../types/simulation";
+import type { AgentSnapshot, SpeciesInfo, BiomeData, VegetationPatchData, SimulationEvent } from "../types/simulation";
 import { useInterpolation } from "../hooks/useInterpolation";
 import {
   renderAgents,
@@ -26,6 +26,7 @@ interface Props {
   interpolateDuration: number;
   isPlaying: boolean;
   biomes: BiomeData[];
+  events: SimulationEvent[];
 }
 
 type HoveredEntity =
@@ -47,6 +48,7 @@ export function SimulationCanvas({
   interpolateDuration,
   isPlaying,
   biomes,
+  events,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rafRef = useRef<number>(0);
@@ -290,6 +292,7 @@ export function SimulationCanvas({
             : "default",
         }}
       />
+      <CatastropheBanner events={events} />
       {hovered && !dragRef.current.active && (
         <div
           style={{
@@ -405,6 +408,57 @@ function BiomeTooltip({ entity }: { entity: Extract<HoveredEntity, { type: "biom
         <span style={{ color: "#999" }}>Detritus:</span>{" "}
         {Math.round(biome.detritus)}
       </div>
+      <div>
+        <span style={{ color: "#999" }}>Nitrogen:</span>{" "}
+        <span style={{ color: biome.nitrogen < 0.2 ? "#ff4" : "#eee" }}>
+          {((biome.nitrogen ?? 0.5) * 100).toFixed(0)}%
+        </span>
+      </div>
+      <div>
+        <span style={{ color: "#999" }}>Phosphorus:</span>{" "}
+        <span style={{ color: biome.phosphorus < 0.1 ? "#ff4" : "#eee" }}>
+          {((biome.phosphorus ?? 0.3) * 100).toFixed(0)}%
+        </span>
+      </div>
     </>
+  );
+}
+
+const CATASTROPHE_COLORS: Record<string, string> = {
+  volcanic_winter: "rgba(255, 100, 30, 0.25)",
+  meteor_impact: "rgba(255, 40, 40, 0.25)",
+  ice_age: "rgba(60, 120, 255, 0.25)",
+};
+
+function CatastropheBanner({ events }: { events: SimulationEvent[] }) {
+  const active = events.find(
+    (e) => e.event_type === "catastrophe" || (e.event_type.startsWith("catastrophe") && e.event_type !== "catastrophe_end")
+  );
+  if (!active) return null;
+
+  const kind = active.detail.split("|")[0];
+  const bg = CATASTROPHE_COLORS[kind] ?? "rgba(255, 100, 30, 0.2)";
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        top: 0,
+        left: 0,
+        right: 0,
+        padding: "6px 12px",
+        background: bg,
+        color: "#fff",
+        fontFamily: "monospace",
+        fontSize: "13px",
+        fontWeight: "bold",
+        textAlign: "center",
+        pointerEvents: "none",
+        borderRadius: "4px 4px 0 0",
+        textShadow: "0 1px 3px rgba(0,0,0,0.6)",
+      }}
+    >
+      {kind.replace(/_/g, " ").toUpperCase()}
+    </div>
   );
 }

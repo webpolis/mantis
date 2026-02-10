@@ -19,6 +19,7 @@ from stream_simulation import (
     serialize_agent_for_frontend,
     serialize_species_for_frontend,
     serialize_biome_for_frontend,
+    serialize_event_for_frontend,
     split_worlds,
 )
 
@@ -122,21 +123,37 @@ def handle_start(data=None):
             return
 
         species_data = [serialize_species_for_frontend(sp) for sp in tick.species]
-
         agent_data = [serialize_agent_for_frontend(agent) for agent in tick.agents]
+        event_data = [serialize_event_for_frontend(evt) for evt in tick.events]
 
-        emit("tick_update", {
+        tick_payload = {
             "tick": tick.number,
             "epoch": tick.epoch,
             "species": species_data,
             "agents": agent_data,
             "interpolate_duration": 1000 / TICK_RATE,
-        })
+        }
+        if event_data:
+            tick_payload["events"] = event_data
+        emit("tick_update", tick_payload)
 
         socketio.sleep(1.0 / (TICK_RATE * current_speed))
 
     if _sim_gen == my_gen:
         emit("simulation_complete", {"total_ticks": len(ticks)})
+
+
+def _classify_live_event(target: str, raw: str) -> dict | None:
+    """Convert a raw event string from the simulation engine into a frontend event dict.
+
+    Event strings look like: "catastrophe:meteor_impact|dur=5", "disease:plague|pop-=150",
+    "symbiogenesis:S0+S1->S2|gained=speed,armor", "evo_trap:low_variance",
+    "catastrophe_end:meteor_impact", "extinction:starvation", etc.
+    """
+    if ":" not in raw:
+        return None
+    event_type, _, detail = raw.partition(":")
+    return {"target": target, "event_type": event_type, "detail": detail}
 
 
 @socketio.on("start_live")
@@ -200,6 +217,8 @@ def handle_start_live(data=None):
             "name": biome.name,
             "vegetation": biome.vegetation,
             "detritus": biome.detritus,
+            "nitrogen": getattr(biome, "nitrogen", 0.5),
+            "phosphorus": getattr(biome, "phosphorus", 0.3),
             "patches": patches,
         })
     emit("environment_init", {"biomes": biome_data})
@@ -237,13 +256,28 @@ def handle_start_live(data=None):
                         "dead": not a.alive,
                     })
 
-        emit("tick_update", {
+        # Collect events from world
+        event_data = []
+        for raw in getattr(world, "world_events", []):
+            evt = _classify_live_event("WORLD", raw)
+            if evt:
+                event_data.append(evt)
+        for sid, evts in getattr(world, "events", {}).items():
+            for raw in evts:
+                evt = _classify_live_event(f"S{sid}", raw)
+                if evt:
+                    event_data.append(evt)
+
+        tick_payload = {
             "tick": world.tick,
             "epoch": world.epoch.value,
             "species": species_data,
             "agents": agent_data,
             "interpolate_duration": 1000 / TICK_RATE,
-        })
+        }
+        if event_data:
+            tick_payload["events"] = event_data
+        emit("tick_update", tick_payload)
 
         # Periodic vegetation density update
         veg_update_counter += 1
@@ -407,13 +441,17 @@ def handle_start_model(data=None):
                     biomes_sent = True
                 species_data = [serialize_species_for_frontend(sp) for sp in tick_data.species]
                 agent_data = [serialize_agent_for_frontend(agent) for agent in tick_data.agents]
-                emit("tick_update", {
+                event_data = [serialize_event_for_frontend(evt) for evt in tick_data.events]
+                model_tick = {
                     "tick": ticks_sent,
                     "epoch": tick_data.epoch,
                     "species": species_data,
                     "agents": agent_data,
                     "interpolate_duration": 1000 / TICK_RATE,
-                })
+                }
+                if event_data:
+                    model_tick["events"] = event_data
+                emit("tick_update", model_tick)
                 ticks_sent += 1
                 socketio.sleep(1.0 / (TICK_RATE * current_speed))
 
