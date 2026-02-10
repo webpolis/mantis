@@ -40,6 +40,7 @@ export function useWebSocket() {
   const [datasets, setDatasets] = useState<DatasetFile[]>([]);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [worldCount, setWorldCount] = useState(0);
+  const [worldsWithAgents, setWorldsWithAgents] = useState<number[]>([]);
   const [selectedWorld, setSelectedWorld] = useState(0);
   const [models, setModels] = useState<ModelFile[]>([]);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
@@ -78,6 +79,7 @@ export function useWebSocket() {
 
     socket.on("world_list", (data: WorldList) => {
       setWorldCount(data.world_count);
+      setWorldsWithAgents(data.worlds_with_agents ?? []);
       setSelectedWorld(0);
     });
 
@@ -119,12 +121,19 @@ export function useWebSocket() {
   const selectFile = useCallback((name: string) => {
     setSelectedFile(name);
     setWorldCount(0);
+    setWorldsWithAgents([]);
     setSelectedWorld(0);
     socketRef.current?.emit("list_worlds", { file: name });
   }, []);
 
   const selectWorld = useCallback((index: number) => {
     setSelectedWorld(index);
+    setAgents([]);
+    setSpecies([]);
+    setBiomes([]);
+    setTick(0);
+    setEpoch(1);
+    setInfo(null);
   }, []);
 
   const selectModel = useCallback((name: string) => {
@@ -186,6 +195,7 @@ export function useWebSocket() {
     datasets,
     selectedFile,
     worldCount,
+    worldsWithAgents,
     selectedWorld,
     selectFile,
     selectWorld,

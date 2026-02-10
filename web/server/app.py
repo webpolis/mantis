@@ -274,7 +274,12 @@ def handle_list_worlds(data):
     with open(filepath) as f:
         text = f.read()
     worlds = split_worlds(text)
-    emit("world_list", {"file": filename, "world_count": len(worlds)})
+    worlds_with_agents = [i for i, w in enumerate(worlds) if "@AGENT" in w]
+    emit("world_list", {
+        "file": filename,
+        "world_count": len(worlds),
+        "worlds_with_agents": worlds_with_agents,
+    })
 
 
 @socketio.on("list_models")

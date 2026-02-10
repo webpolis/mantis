@@ -18,6 +18,7 @@ function App() {
     datasets,
     selectedFile,
     worldCount,
+    worldsWithAgents,
     selectedWorld,
     selectFile,
     selectWorld,
@@ -50,6 +51,7 @@ function App() {
             datasets={datasets}
             selectedFile={selectedFile}
             worldCount={worldCount}
+            worldsWithAgents={worldsWithAgents}
             selectedWorld={selectedWorld}
             onSelectFile={selectFile}
             onSelectWorld={selectWorld}

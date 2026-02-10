@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { DatasetFile, ModelFile } from "../types/simulation";
 
 interface Props {
@@ -9,6 +10,7 @@ interface Props {
   datasets: DatasetFile[];
   selectedFile: string | null;
   worldCount: number;
+  worldsWithAgents: number[];
   selectedWorld: number;
   onSelectFile: (name: string) => void;
   onSelectWorld: (index: number) => void;
@@ -32,6 +34,7 @@ export function Controls({
   datasets,
   selectedFile,
   worldCount,
+  worldsWithAgents,
   selectedWorld,
   onSelectFile,
   onSelectWorld,
@@ -39,6 +42,33 @@ export function Controls({
   selectedModel,
   onSelectModel,
 }: Props) {
+  const [filterAgents, setFilterAgents] = useState(false);
+
+  const handleFilterToggle = () => {
+    const next = !filterAgents;
+    setFilterAgents(next);
+    if (next && worldsWithAgents.length > 0 && !worldsWithAgents.includes(selectedWorld)) {
+      onSelectWorld(worldsWithAgents[0]);
+    }
+  };
+
+  const handleWorldChange = (value: number) => {
+    if (filterAgents) {
+      const clamped = Math.max(0, Math.min(value, worldCount - 1));
+      // Snap to nearest world with agents
+      if (worldsWithAgents.includes(clamped)) {
+        onSelectWorld(clamped);
+      } else {
+        const direction = value >= selectedWorld ? 1 : -1;
+        const next = direction === 1
+          ? worldsWithAgents.find((i) => i >= clamped)
+          : [...worldsWithAgents].reverse().find((i) => i <= clamped);
+        if (next !== undefined) onSelectWorld(next);
+      }
+    } else {
+      onSelectWorld(value);
+    }
+  };
   return (
     <div
       style={{
@@ -80,10 +110,24 @@ export function Controls({
                 min={0}
                 max={worldCount - 1}
                 value={selectedWorld}
-                onChange={(e) => onSelectWorld(Number(e.target.value))}
+                onChange={(e) => handleWorldChange(Number(e.target.value))}
                 style={{ ...selectStyle, width: "60px" }}
               />
-              <span style={{ color: "#888", fontSize: "12px" }}>/ {worldCount}</span>
+              <span style={{ color: "#888", fontSize: "12px" }}>
+                / {filterAgents ? worldsWithAgents.length : worldCount}
+              </span>
+              <label
+                style={{ display: "flex", alignItems: "center", gap: "4px", cursor: "pointer" }}
+                title="Only show worlds that contain agents"
+              >
+                <input
+                  type="checkbox"
+                  checked={filterAgents}
+                  onChange={handleFilterToggle}
+                  style={{ accentColor: "#e94560" }}
+                />
+                <span style={{ fontSize: "12px", color: "#aaa" }}>Has agents</span>
+              </label>
             </label>
           )}
 

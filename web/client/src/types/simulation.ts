@@ -57,6 +57,7 @@ export interface DatasetFile {
 export interface WorldList {
   file: string;
   world_count: number;
+  worlds_with_agents: number[];
 }
 
 export interface ModelFile {
