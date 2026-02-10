@@ -96,6 +96,23 @@ export function useWebSocket() {
         setEventLog([...eventLogRef.current]);
       }
 
+      // Update biome stats when tick includes @BIO data (keyframe ticks)
+      if (data.biomes && data.biomes.length > 0) {
+        const updated = biomesRef.current.map((b) => {
+          const fresh = data.biomes!.find((fb) => fb.lid === b.lid);
+          if (!fresh) return b;
+          return {
+            ...b,
+            vegetation: fresh.vegetation,
+            detritus: fresh.detritus,
+            nitrogen: fresh.nitrogen ?? b.nitrogen,
+            phosphorus: fresh.phosphorus ?? b.phosphorus,
+          };
+        });
+        biomesRef.current = updated;
+        if (viewIndexRef.current === null) setBiomes(updated);
+      }
+
       const frame: HistoryFrame = {
         tick: data.tick,
         epoch: data.epoch,
@@ -157,7 +174,10 @@ export function useWebSocket() {
       setBiomes(enriched);
     });
 
-    socket.on("vegetation_update", (data: { patches: Array<{ lid: number; x: number; y: number; density: number }> }) => {
+    socket.on("vegetation_update", (data: {
+      patches: Array<{ lid: number; x: number; y: number; density: number }>;
+      biome_stats?: Array<{ lid: number; vegetation: number; detritus: number; nitrogen: number; phosphorus: number }>;
+    }) => {
       // Always update the ref (latest biome state for future frames)
       const updated = biomesRef.current.map((b) => ({ ...b, patches: [...b.patches] }));
       for (const upd of data.patches) {
@@ -165,6 +185,17 @@ export function useWebSocket() {
         if (!biome) continue;
         const patch = biome.patches.find((p) => Math.abs(p.x - upd.x) < 1 && Math.abs(p.y - upd.y) < 1);
         if (patch) patch.density = upd.density;
+      }
+      // Merge biome-level stats (vegetation, detritus, N, P)
+      if (data.biome_stats) {
+        for (const stat of data.biome_stats) {
+          const biome = updated.find((b) => b.lid === stat.lid);
+          if (!biome) continue;
+          biome.vegetation = stat.vegetation;
+          biome.detritus = stat.detritus;
+          biome.nitrogen = stat.nitrogen ?? biome.nitrogen;
+          biome.phosphorus = stat.phosphorus ?? biome.phosphorus;
+        }
       }
       biomesRef.current = updated;
       // Update the latest history frame's biome snapshot

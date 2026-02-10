@@ -25,6 +25,7 @@ export interface TickData {
   agents: AgentSnapshot[];
   interpolate_duration: number;
   events?: SimulationEvent[];
+  biomes?: BiomeData[];
 }
 
 export interface VegetationPatchData {

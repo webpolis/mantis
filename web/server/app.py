@@ -135,6 +135,8 @@ def handle_start(data=None):
         }
         if event_data:
             tick_payload["events"] = event_data
+        if tick.biomes:
+            tick_payload["biomes"] = [serialize_biome_for_frontend(b) for b in tick.biomes]
         emit("tick_update", tick_payload)
 
         socketio.sleep(1.0 / (TICK_RATE * current_speed))
@@ -284,6 +286,7 @@ def handle_start_live(data=None):
         if veg_update_counter >= 10:
             veg_update_counter = 0
             patch_updates = []
+            biome_stats = []
             for biome in world.biomes:
                 for p in biome.vegetation_patches:
                     patch_updates.append({
@@ -291,7 +294,14 @@ def handle_start_live(data=None):
                         "x": p.x, "y": p.y,
                         "density": p.density,
                     })
-            emit("vegetation_update", {"patches": patch_updates})
+                biome_stats.append({
+                    "lid": biome.lid,
+                    "vegetation": biome.vegetation,
+                    "detritus": biome.detritus,
+                    "nitrogen": getattr(biome, "nitrogen", 0.5),
+                    "phosphorus": getattr(biome, "phosphorus", 0.3),
+                })
+            emit("vegetation_update", {"patches": patch_updates, "biome_stats": biome_stats})
 
         socketio.sleep(1.0 / (TICK_RATE * current_speed))
 
@@ -453,6 +463,8 @@ def handle_start_model(data=None):
                 }
                 if event_data:
                     model_tick["events"] = event_data
+                if tick_data.biomes:
+                    model_tick["biomes"] = [serialize_biome_for_frontend(b) for b in tick_data.biomes]
                 emit("tick_update", model_tick)
                 ticks_sent += 1
                 socketio.sleep(1.0 / (TICK_RATE * current_speed))
