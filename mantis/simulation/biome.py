@@ -13,7 +13,10 @@ from typing import Optional
 
 import numpy as np
 
-from .constants import ENV_AXES, NUTRIENT_RELEASE_N, NUTRIENT_RELEASE_P, NUTRIENT_UPTAKE_RATE
+from .constants import (
+    ENV_AXES, NUTRIENT_RELEASE_N, NUTRIENT_RELEASE_P, NUTRIENT_UPTAKE_RATE,
+    NUTRIENT_LEACH_N, NUTRIENT_LEACH_P, NUTRIENT_CAP_N_PER_TICK, NUTRIENT_CAP_P_PER_TICK,
+)
 from .spatial import VegetationPatch
 
 
@@ -53,6 +56,10 @@ class Biome:
         if self.vegetation < self.VEG_SEED_BANK:
             self.vegetation = self.VEG_SEED_BANK
 
+        # Concentration-dependent leaching: nutrient-rich soils lose more to runoff
+        self.nitrogen *= (1.0 - NUTRIENT_LEACH_N * (1.0 + 3.0 * self.nitrogen))
+        self.phosphorus *= (1.0 - NUTRIENT_LEACH_P * (1.0 + 3.0 * self.phosphorus))
+
         # Nutrient-limited logistic regrowth: dV/dt = r * V * (1 - V/K) * min(N, P, 1)
         nutrient_factor = min(self.nitrogen, self.phosphorus, 1.0)
         effective_rate = self.veg_growth_rate * veg_growth_mult
@@ -65,15 +72,18 @@ class Biome:
         self.phosphorus = float(np.clip(self.phosphorus - growth * NUTRIENT_UPTAKE_RATE, 0.0, 1.0))
 
         # Detritus decays slowly — releases nutrients back
+        # Cap per-tick release to prevent mass die-off nutrient spikes
         detritus_decay = self.detritus * 0.05
         self.detritus = max(0.0, self.detritus * 0.95 + rng.normal(0, 0.5))
-        self.nitrogen = float(np.clip(self.nitrogen + detritus_decay * NUTRIENT_RELEASE_N, 0.0, 1.0))
-        self.phosphorus = float(np.clip(self.phosphorus + detritus_decay * NUTRIENT_RELEASE_P, 0.0, 1.0))
+        n_from_detritus = min(detritus_decay * NUTRIENT_RELEASE_N, NUTRIENT_CAP_N_PER_TICK)
+        p_from_detritus = min(detritus_decay * NUTRIENT_RELEASE_P, NUTRIENT_CAP_P_PER_TICK)
+        self.nitrogen = float(np.clip(self.nitrogen + n_from_detritus, 0.0, 1.0))
+        self.phosphorus = float(np.clip(self.phosphorus + p_from_detritus, 0.0, 1.0))
 
         # Geological buffer: slow baseline nutrient release prevents permanent
         # nutrient lockup if all decomposers die
-        self.nitrogen = float(np.clip(self.nitrogen + 0.002, 0.0, 1.0))
-        self.phosphorus = float(np.clip(self.phosphorus + 0.001, 0.0, 1.0))
+        self.nitrogen = float(np.clip(self.nitrogen + 0.0003, 0.0, 1.0))
+        self.phosphorus = float(np.clip(self.phosphorus + 0.0002, 0.0, 1.0))
 
     def drift_env(self, rng: np.random.Generator, sigma: float = 0.02) -> None:
         """Small random perturbation of environmental axes."""
@@ -98,8 +108,10 @@ class Biome:
 
     def release_nutrients(self, detritus_consumed: float) -> None:
         """Release nutrients from decomposer activity on detritus."""
-        self.nitrogen = float(np.clip(self.nitrogen + detritus_consumed * NUTRIENT_RELEASE_N, 0.0, 1.0))
-        self.phosphorus = float(np.clip(self.phosphorus + detritus_consumed * NUTRIENT_RELEASE_P, 0.0, 1.0))
+        n_release = min(detritus_consumed * NUTRIENT_RELEASE_N, NUTRIENT_CAP_N_PER_TICK)
+        p_release = min(detritus_consumed * NUTRIENT_RELEASE_P, NUTRIENT_CAP_P_PER_TICK)
+        self.nitrogen = float(np.clip(self.nitrogen + n_release, 0.0, 1.0))
+        self.phosphorus = float(np.clip(self.phosphorus + p_release, 0.0, 1.0))
 
     def init_vegetation_patches(self, rng: np.random.Generator, world_size: int, n_patches: int = 8) -> None:
         """Create spatial vegetation patches for agent-based simulation."""

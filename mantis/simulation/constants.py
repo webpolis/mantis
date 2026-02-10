@@ -305,9 +305,13 @@ REPRODUCTION_ENERGY_FRACTION = 0.3 # fraction of surplus allocated to reproducti
 # Nutrient cycling
 # ---------------------------------------------------------------------------
 
-NUTRIENT_RELEASE_N = 0.08    # N released per unit detritus decay
-NUTRIENT_RELEASE_P = 0.03    # P released per unit detritus decay (slower)
-NUTRIENT_UPTAKE_RATE = 0.04  # N/P consumed per unit vegetation growth
+NUTRIENT_RELEASE_N = 0.05    # N released per unit detritus decay
+NUTRIENT_RELEASE_P = 0.02    # P released per unit detritus decay (slower)
+NUTRIENT_UPTAKE_RATE = 1.2   # N/P consumed per unit vegetation growth
+NUTRIENT_LEACH_N = 0.005     # fraction of N lost per tick (runoff/volatilization)
+NUTRIENT_LEACH_P = 0.003     # fraction of P lost per tick (slower — bound to soil)
+NUTRIENT_CAP_N_PER_TICK = 0.015  # max N released from detritus per tick
+NUTRIENT_CAP_P_PER_TICK = 0.008  # max P released from detritus per tick
 
 # ---------------------------------------------------------------------------
 # Disease
