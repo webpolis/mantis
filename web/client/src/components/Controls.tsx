@@ -47,14 +47,15 @@ export function Controls({
   const [filterAgents, setFilterAgents] = useState(false);
   const [filterSpotlights, setFilterSpotlights] = useState(false);
 
-  // Compute the set of worlds matching all active filters
-  const filteredWorlds = (() => {
-    if (!filterAgents && !filterSpotlights) return null;
-    let set = new Set(Array.from({ length: worldCount }, (_, i) => i));
-    if (filterAgents) set = new Set([...set].filter((i) => worldsWithAgents.includes(i)));
-    if (filterSpotlights) set = new Set([...set].filter((i) => worldsWithSpotlights.includes(i)));
-    return [...set].sort((a, b) => a - b);
-  })();
+  const computeFiltered = (agents: boolean, spotlights: boolean): number[] | null => {
+    if (!agents && !spotlights) return null;
+    const all = Array.from({ length: worldCount }, (_, i) => i);
+    return all.filter(
+      (i) => (!agents || worldsWithAgents.includes(i)) && (!spotlights || worldsWithSpotlights.includes(i))
+    );
+  };
+
+  const filteredWorlds = computeFiltered(filterAgents, filterSpotlights);
 
   const handleFilterToggle = (kind: "agents" | "spotlights") => {
     const nextAgents = kind === "agents" ? !filterAgents : filterAgents;
@@ -62,15 +63,9 @@ export function Controls({
     if (kind === "agents") setFilterAgents(nextAgents);
     else setFilterSpotlights(nextSpotlights);
 
-    // Compute new filtered set and snap if needed
-    if (nextAgents || nextSpotlights) {
-      let set = new Set(Array.from({ length: worldCount }, (_, i) => i));
-      if (nextAgents) set = new Set([...set].filter((i) => worldsWithAgents.includes(i)));
-      if (nextSpotlights) set = new Set([...set].filter((i) => worldsWithSpotlights.includes(i)));
-      const sorted = [...set].sort((a, b) => a - b);
-      if (sorted.length > 0 && !sorted.includes(selectedWorld)) {
-        onSelectWorld(sorted[0]);
-      }
+    const next = computeFiltered(nextAgents, nextSpotlights);
+    if (next && next.length > 0 && !next.includes(selectedWorld)) {
+      onSelectWorld(next[0]);
     }
   };
 

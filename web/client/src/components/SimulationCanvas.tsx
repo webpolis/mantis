@@ -431,9 +431,7 @@ const CATASTROPHE_COLORS: Record<string, string> = {
 };
 
 function CatastropheBanner({ events }: { events: SimulationEvent[] }) {
-  const active = events.find(
-    (e) => e.event_type === "catastrophe" || (e.event_type.startsWith("catastrophe") && e.event_type !== "catastrophe_end")
-  );
+  const active = events.find((e) => e.event_type === "catastrophe");
   if (!active) return null;
 
   const kind = active.detail.split("|")[0];

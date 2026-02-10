@@ -101,12 +101,18 @@ export function useWebSocket() {
         const updated = biomesRef.current.map((b) => {
           const fresh = data.biomes!.find((fb) => fb.lid === b.lid);
           if (!fresh) return b;
+          // Scale patch densities proportionally to vegetation change
+          const vegRatio = b.vegetation > 0.001 ? fresh.vegetation / b.vegetation : 1;
+          const patches = vegRatio !== 1
+            ? b.patches.map((p) => ({ ...p, density: Math.min(1, p.density * vegRatio) }))
+            : b.patches;
           return {
             ...b,
             vegetation: fresh.vegetation,
             detritus: fresh.detritus,
             nitrogen: fresh.nitrogen ?? b.nitrogen,
             phosphorus: fresh.phosphorus ?? b.phosphorus,
+            patches,
           };
         });
         biomesRef.current = updated;
