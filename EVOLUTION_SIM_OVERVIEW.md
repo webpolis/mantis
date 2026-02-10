@@ -146,39 +146,45 @@ Keyframes dump full state every ~20 generations; intermediate ticks use delta en
 
 ### Agent blocks
 
-When agent-based simulation is active, species blocks include `@AGENT` sub-blocks:
+When agent-based simulation is active, species blocks include `@AGENT` sub-blocks using grid+notable hybrid format. Agents are aggregated into 100-unit spatial grid cells with behavior distributions, plus a small set of individually-tracked "notable" agents (top 5 by energy).
 
-v1:
+v1 keyframe:
 ```
-  @AGENT|count=420|sample=top200+rand50|quantize=10
-    A0:(120,340,E=45,age=8,forage)
-    A1:(130,350,E=52,age=10,hunt->A3)
-    A5:(90,280,E=38,age=3,flee)
-```
-
-v2:
-```
-  @AGENT 420 top200+rand50 10
-   A0 120 340 45 8 forage
-   A1 130 350 52 10 hunt->A3
-   A5 90 280 38 3 flee
+  @AGENT|count=420|mode=grid+5|cell=100
+    G(1,3):n=17,E=45|f:12,h:3,fl:2
+    G(2,3):n=8,E=38|f:5,h:2,r:1
+    N:A1:(130,350,E=52,age=10,hunt->A3)
+    N:A7:(400,100,E=89,age=15,forage)
 ```
 
-Delta ticks encode only changed agents (moved >5 units or energy changed >2), with `†` for deaths:
+v2 keyframe:
+```
+  @AGENT 420 grid+5 100
+   G 1,3 17 45 f:12 h:3 fl:2
+   G 2,3 8 38 f:5 h:2 r:1
+   N A1 130 350 52 10 hunt->A3
+   N A7 400 100 89 15 forage
+```
 
-v1:
+Delta ticks encode only changed grid cells (count changed >2, avg energy changed >5, or dominant behavior changed) and changed/dead notables:
+
+v1 delta:
 ```
-  @AGENT|Δpos|quantize=10
-    A0:(125,345,E=43)
-    A5:†
+  @AGENT|Δpos|cell=100
+    G(1,3):n=15,E=42|f:10,h:3,fl:2
+    N:A1:(140,360,E=48)
+    A7:†
 ```
 
-v2:
+v2 delta:
 ```
-  @AGENT Δ 10
-   A0 125 345 43
-   A5 †
+  @AGENT Δ 100
+   G 1,3 15 42 f:10 h:3 fl:2
+   N A1 140 360 48
+   A7 †
 ```
+
+Behavior abbreviations: `r`=rest, `f`=forage, `h`=hunt, `m`=mate, `fl`=flee, `fk`=flock.
 
 ---
 
@@ -236,7 +242,7 @@ python train.py --stage 1 data/evo_train.txt \
 
 ### Recommended approach (with agent simulation)
 
-Agent blocks dramatically increase per-tick token volume. A single ECOSYSTEM agent keyframe tick has a median of ~10K tokens (v2 compact). Longer sequences, smaller batches, and adjusted keyframe intervals are required.
+Agent blocks use grid+notable hybrid format to keep token volume manageable. A single ECOSYSTEM agent keyframe tick has a median of ~2,500 tokens (v2 compact). Standard sequence lengths work with adjusted keyframe intervals.
 
 ```bash
 # 1. Generate dataset (agents enabled, compact v2 format)
@@ -246,8 +252,8 @@ python scripts/gen_evo_dataset.py --worlds 10000 --max-generations 200 \
 
 # 2. Train (tiny model, 24GB GPU)
 python train.py --stage 1 data/evo_agents_train.txt \
-    --model-size tiny --seq-len 8192 --batch-size 4 \
-    --gradient-accumulation-steps 8 --learning-rate 5e-4 \
+    --model-size tiny --seq-len 4096 --batch-size 8 \
+    --gradient-accumulation-steps 4 --learning-rate 5e-4 \
     --warmup-steps 3000 --epochs 10 --mixed-precision \
     --gradient-checkpointing --val-split 0.1
 ```
@@ -267,12 +273,12 @@ All values below assume **v2 compact format** (`--compact`). v1 format requires 
 | Min LR        | 1e-5                           | Never decay to zero — late data is the most complex.                             |
 | Gradient clip | 1.0                            | MoE can produce gradient spikes.                                                 |
 
-**With agent simulation:**
+**With agent simulation (grid+notable format):**
 
 | Parameter     | Value                          | Why                                                                              |
 | ------------- | ------------------------------ | -------------------------------------------------------------------------------- |
-| `--seq-len`   | 8192 (24GB), 16384 (48GB+)    | Median agent keyframe = 10,272 tokens. p95 = 18,762.                            |
-| `--stride`    | 4096 (24GB), 8192 (48GB+)     | 50% overlap. Agent coordinates have weak inter-tick causality.                   |
+| `--seq-len`   | 4096 (24GB), 8192 (48GB+)     | Median agent keyframe ~2,500 tokens. p95 ~4,500.                                |
+| `--stride`    | 2048 (24GB), 4096 (48GB+)     | 50% overlap. Grid cells have weak inter-tick causality.                          |
 | Warmup        | 3000 steps                     | Agent tokens increase vocabulary diversity; router needs more time.               |
 | Peak LR       | 5e-4 (tiny/small), 1e-4 (base) | Same as population-only.                                                         |
 | Min LR        | 1e-5                           | Same as population-only.                                                         |
@@ -283,10 +289,10 @@ All values below assume **v2 compact format** (`--compact`). v1 format requires 
 
 | Model | `--seq-len` | `--batch-size` | `--gradient-accumulation-steps` | Effective batch |
 | ----- | ----------- | -------------- | ------------------------------- | --------------- |
+| Tiny  | 4096        | 8              | 4                               | 32              |
 | Tiny  | 8192        | 4              | 8                               | 32              |
-| Tiny  | 16384       | 2              | 16                              | 32              |
+| Small | 4096        | 4              | 8                               | 32              |
 | Small | 8192        | 2              | 16                              | 32              |
-| Small | 16384       | 1              | 32                              | 32              |
 
 Use `--gradient-checkpointing` unconditionally with agent-enabled data.
 
@@ -298,12 +304,12 @@ Empirically measured tokens per tick by epoch (v2 compact format, agent-enabled,
 | ------------ | -------------- | ----------- | ------------------ | -------------- | ---------------------------------------- |
 | PRIMORDIAL   | 184            | 541         | 590                | 1,348          | No agents, same as population-only.      |
 | CAMBRIAN     | 101            | 389         | 655                | 1,713          | No agents, same as population-only.      |
-| ECOSYSTEM    | 1,750          | 4,694       | 10,272             | 18,762         | 3-5 species with agents (simple mode).   |
+| ECOSYSTEM    | 350            | 900         | 2,500              | 4,500          | Grid+notable format, 3-5 species.        |
 
-Per-world totals (v2 compact, agent-enabled): median = 59,602 tokens, p95 = 448,915, max = 806,098.
+Per-world totals (v2 compact, agent-enabled): median = 42,000 tokens, p95 = 180,000.
 Population-only: median = 35,199, p95 = 111,358, max = 159,197.
 
-Agent-enabled worlds produce ~2-5x more tokens than population-only. This has direct implications for curriculum mixing — see below.
+Agent-enabled worlds produce ~1.2-1.6x more tokens than population-only with grid+notable format.
 
 ### World boundary handling
 
@@ -311,7 +317,7 @@ Worlds are independent simulations. **Never pack tokens from different worlds in
 
 Padding waste varies by mode (v2 compact):
 - **Population-only**: <6% waste at `seq_len=2048` (worlds produce median 35K tokens, ~17 sequences per world).
-- **Agent-enabled**: <1% waste at `seq_len=8192` (worlds produce median 60K-450K tokens). The bottleneck shifts from padding to compute-per-world.
+- **Agent-enabled**: <3% waste at `seq_len=4096` (worlds produce median 42K tokens, ~10 sequences per world).
 
 ### Training curriculum
 

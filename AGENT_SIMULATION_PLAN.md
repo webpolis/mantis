@@ -336,23 +336,13 @@ class AgentManager:
         self._resolve_local_interactions(world)
         self._prune_dead()
 
-    def sample_for_serialization(self, n: int) -> list[Agent]:
-        """Return top-N agents by energy (80%) + random (20%) for diversity."""
-        if len(self.agents) <= n:
-            return self.agents
-        sorted_by_energy = sorted(self.agents, key=lambda a: a.energy, reverse=True)
-        top = sorted_by_energy[:int(n * 0.8)]
-        remaining = [a for a in self.agents if a not in top]
-        if remaining:
-            top.extend(rng.choice(remaining, size=min(int(n * 0.2), len(remaining)), replace=False))
-        return top
 ```
 
 **Key Points**:
 - One `AgentManager` per species (not global)
 - Owns `SpatialHash` for efficient neighbor queries
 - `spawn_agents()` creates agents at world start or speciation
-- `sample_for_serialization()` avoids outputting all 10K agents
+- Serialization uses grid+notable hybrid format (see Serialization Format section)
 
 ---
 
@@ -723,65 +713,56 @@ LOSS_WEIGHTS = {
 
 ### Serialization Format
 
-#### Quantized Coordinates
+#### Grid+Notable Hybrid
 
-**Critical Design Choice**: Agents simulate in **continuous float space** (120.5, 340.2) but serialize to **10-unit quantized grid** (120, 340).
+**Critical Design Choice**: Instead of serializing individual agents (up to 250 per species), agents are aggregated into 100-unit spatial grid cells plus a small set of individually-tracked "notable" agents (top 5 by energy).
 
 **Why?**
-- Reduces token entropy: `120` vs `120.5` → fewer BPE tokens, easier for model to predict
-- Maintains smooth movement: Agents still move continuously, only output is quantized
-- Acceptable precision loss: 10-unit grid (1000/10 = 100×100 cells) sufficient for spatial reasoning
-- Avoids "teleporting" artifacts: Model learns "predator at (120, 340) chases prey at (130, 350)" not pixel-perfect regression
+- Reduces keyframe tokens per species from ~1,750 to ~220-400
+- Total ECOSYSTEM keyframe tick drops from ~10K to ~2,500 tokens, fitting in `--seq-len 4096`
+- Grid cells capture spatial density and behavior distributions — what matters for ecological dynamics
+- Notable agents preserve individual-level narratives (hunts, chases) for the model to learn from
 
-```python
-def quantize_position(x: float) -> int:
-    """Round to nearest 10 units for serialization."""
-    return int(round(x / 10.0)) * 10
-```
+**Behavior abbreviations**: `r`=rest, `f`=forage, `h`=hunt, `m`=mate, `fl`=flee, `fk`=flock
 
 #### Keyframe (every 20 ticks)
 
 ```
-=EPOCH:4|TICK_SCALE:1gen|W0
-@BIO|L0:meadow(veg=0.6,det=120)|L1:forest(veg=0.8,det=80)
-@SP|S3|L0|plan=predator|pop=450(250 agents)|diet={S1:0.7,plant:0.2}
-  @AGENT|count=250|sample=top200+rand50|quantize=10
-    A0:(120,340,E=45,age=12,hunt->A123)
-    A1:(90,200,E=72,age=8,forage)
-    A2:(340,100,E=12,age=3,flee<-A0)
-    A3:(500,610,E=59,age=6,rest)
-    ...
+@SP|S3|L0|plan=predator|pop=450|diet={S1:0.7,plant:0.2}
+  @AGENT|count=420|mode=grid+5|cell=100
+    G(1,3):n=17,E=45|f:12,h:3,fl:2
+    G(2,3):n=8,E=38|f:5,h:2,r:1
+    N:A1:(130,350,E=52,age=10,hunt->A3)
+    N:A7:(400,100,E=89,age=15,forage)
   T:speed=6.2±0.9,intel=3.5±0.5
   E:in=4200,out=2800,store=11250|repro=K(rate=1.8)
 ---
 ```
 
 **Format breakdown**:
-- `@AGENT|count=250|sample=top200+rand50|quantize=10` — Metadata (10-unit grid)
-- `A{aid}:(x,y,E={energy},age={age},{state}->A{target})` — Compact agent state (integers)
-- Energy also quantized (rounded to nearest integer)
-- States: `forage`, `hunt->A{target}`, `flee<-A{predator}`, `rest`, `mate`
+- `@AGENT|count=420|mode=grid+5|cell=100` — Total agents, 5 notables, 100-unit grid cells
+- `G(col,row):n={count},E={avg_energy}|{behavior_abbrev}:{count},...` — Grid cell aggregate
+- `N:A{aid}:(x,y,E={energy},age={age},{state})` — Notable agent (10-unit quantized position)
+- Behaviors sorted by count descending
 
 ---
 
 #### Delta (intermediate ticks)
 
 ```
-@SP|S3|pop=448  # 2 agents died
-  @AGENT|Δpos|quantize=10
-    A0:(120,340,E=43)  # moved, lost energy (quantized)
-    A1:(90,210,E=68)
-    A2:(340,100,E=8)
-    A123:†  # died (killed by A0)
+@SP|S3|pop=418
+  @AGENT|Δpos|cell=100
+    G(1,3):n=15,E=42|f:10,h:3,fl:2
+    N:A1:(140,360,E=48)
+    A7:†
 ---
 ```
 
 **Delta encoding**:
-- Only changed agents serialized (position moved >5 units OR energy changed >2)
-- Dead agents marked with `†`
-- Positions/energy updated (quantized to 10-unit grid)
-- States omitted if unchanged
-- **Bandwidth savings**: ~80% reduction vs full keyframes (only 20-50 agents change per tick)
+- Grid cell emitted if count changed >2, avg energy changed >5, or dominant behavior changed
+- Notable agents tracked by same IDs from last keyframe (no replacements until next keyframe)
+- Dead notable agents marked with `†`
+- Empty cells skipped
 
 ---
 

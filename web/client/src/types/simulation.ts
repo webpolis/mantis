@@ -8,6 +8,7 @@ export interface AgentSnapshot {
   state: string;
   target_aid: number | null;
   dead: boolean;
+  count: number;
 }
 
 export interface SpeciesInfo {

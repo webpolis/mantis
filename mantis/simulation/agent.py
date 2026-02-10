@@ -356,24 +356,3 @@ class AgentManager:
                     self.event_log.deaths.append(a.aid)
         self.agents = survivors
 
-    def sample_for_serialization(self, n: int = 250, rng: Optional[np.random.Generator] = None) -> list[Agent]:
-        """Return top-N agents by energy (80%) + random (20%) for diversity."""
-        if len(self.agents) <= n:
-            return list(self.agents)
-
-        top_n = int(n * 0.8)
-        rand_n = n - top_n
-
-        sorted_by_energy = sorted(self.agents, key=lambda a: a.energy, reverse=True)
-        top = sorted_by_energy[:top_n]
-        top_set = set(a.aid for a in top)
-
-        remaining = [a for a in self.agents if a.aid not in top_set]
-        if remaining and rng is not None:
-            rand_count = min(rand_n, len(remaining))
-            indices = rng.choice(len(remaining), size=rand_count, replace=False)
-            top.extend(remaining[i] for i in indices)
-        elif remaining:
-            top.extend(remaining[:rand_n])
-
-        return top

@@ -205,7 +205,7 @@ class Serializer:
         # Agent block (if active)
         if sp.agent_manager is not None:
             agent_lines = self._agent_serializer.serialize(
-                sp.sid, sp.agent_manager, is_keyframe=True, rng=world.rng,
+                sp.sid, sp.agent_manager, is_keyframe=True,
                 compact=c,
             )
             lines.extend(agent_lines)
@@ -302,7 +302,7 @@ class Serializer:
         # Agent block delta (if active)
         if sp.agent_manager is not None:
             agent_lines = self._agent_serializer.serialize(
-                sp.sid, sp.agent_manager, is_keyframe=False, rng=world.rng,
+                sp.sid, sp.agent_manager, is_keyframe=False,
                 compact=c,
             )
             if agent_lines:

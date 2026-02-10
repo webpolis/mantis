@@ -38,6 +38,7 @@ export class AgentInterpolator {
         state: next.state,
         target_aid: next.target_aid,
         dead: next.dead,
+        count: next.count,
       });
     }
 

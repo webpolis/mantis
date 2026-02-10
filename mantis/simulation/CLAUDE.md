@@ -52,7 +52,7 @@ Data flows in one direction: **constants → species/biome → agent/behavior/sp
 - **`agent_reconciliation.py`** — `PopulationReconciler`: dual-layer accounting. Discrete events (birth/death) map 1:1. Continuous energy scales by population/agent_count ratio.
 - **`engine.py`** — `World` orchestrator. Per-tick pipeline: energy flows → interactions → mutations → body plan transitions → speciation → extinction → epoch check → agent stepping → spotlights.
 - **`serializer.py`** — Converts `World` state to protocol text (`=EPOCH`, `@BIO`, `@SP`, `@INT`, `@EVT`, `@SPOT` blocks). Keyframe every 20 ticks, delta encoding between.
-- **`agent_serializer.py`** — `@AGENT` blocks with quantized coordinates (10-unit grid), keyframe/delta encoding.
+- **`agent_serializer.py`** — `@AGENT` blocks using grid+notable hybrid format: 100-unit grid cell aggregation + top-5 notable agents with 10-unit quantized positions.
 
 ## Simulation Pipeline (per tick)
 
@@ -87,7 +87,7 @@ Output tokens processed by `mantis/tokenizer.py` with per-block loss weights:
 - **Body plans constrain evolution**: Each of 9 body plans blocks/caps certain traits. A `sessile_autotroph` can't evolve `speed`. Transitions happen when diet changes enough (e.g., grazer → omnivore when meat intake exceeds threshold).
 - **Dual-layer simulation**: Population-level dynamics (always on) + optional agent-level individuals (activated per-epoch). `PopulationReconciler` prevents the two layers from diverging.
 - **Hysteresis in behavior**: Agents commit to actions for multiple ticks (flee: 10, hunt: 8, forage: 3) to prevent oscillation. Emergency energy override breaks commitment.
-- **Keyframe + delta serialization**: Full state every 20 ticks, only changes between. Agent coordinates quantized to 10-unit grid to reduce token entropy.
+- **Keyframe + delta serialization**: Full state every 20 ticks, only changes between. Agent blocks use grid+notable hybrid: 100-unit spatial grid cells (count, avg energy, behavior distribution) + top-5 notable agents (10-unit quantized positions). Reduces keyframe tokens per species from ~1,750 to ~220-400.
 
 ## Gotchas
 

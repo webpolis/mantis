@@ -38,7 +38,8 @@ export function renderAgents(
     const y = agent.y * scale;
 
     const color = BODY_PLAN_COLORS[bodyPlan] || "#aaaaaa";
-    const radius = Math.max(2, 4);
+    const agentCount = agent.count || 1;
+    const radius = Math.max(2, Math.min(8, Math.sqrt(agentCount) * 2));
 
     // State indicator border
     const borderColor = STATE_BORDER_COLORS[agent.state];

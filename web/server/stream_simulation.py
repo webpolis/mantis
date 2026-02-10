@@ -22,6 +22,7 @@ class ParsedAgent:
     target_aid: int | None = None
     dead: bool = False
     species_sid: int = 0
+    count: int = 1
 
 
 @dataclass
@@ -152,14 +153,130 @@ def _parse_compact_agent_line(line: str) -> ParsedAgent | None:
     )
 
 
+# ------------------------------------------------------------------
+# Grid+notable agent parsing
+# ------------------------------------------------------------------
+
+_ABBREV_TO_BEHAVIOR = {
+    "r": "rest",
+    "f": "forage",
+    "h": "hunt",
+    "m": "mate",
+    "fl": "flee",
+    "fk": "flock",
+}
+
+
+def _parse_grid_line(line: str, compact: bool, cell_size: int = 100) -> list[ParsedAgent]:
+    """Parse a grid cell line into pseudo-agents at the cell center.
+
+    v2: G col,row count avg_energy beh:count ...
+    v1: G(col,row):n=N,E=avg|beh:count,...
+    """
+    line = line.strip()
+    if compact:
+        # v2: G 1,3 17 45 f:12 h:3 fl:2
+        parts = line.split()
+        if len(parts) < 4:
+            return []
+        coords = parts[1].split(",")
+        if len(coords) != 2:
+            return []
+        try:
+            col, row = int(coords[0]), int(coords[1])
+            count = int(parts[2])
+            avg_energy = float(parts[3])
+        except (ValueError, IndexError):
+            return []
+
+        # Find dominant behavior from remaining tokens
+        dominant = "rest"
+        max_beh_count = 0
+        for tok in parts[4:]:
+            if ":" in tok:
+                beh_abbrev, beh_count_str = tok.split(":", 1)
+                try:
+                    beh_count = int(beh_count_str)
+                    if beh_count > max_beh_count:
+                        max_beh_count = beh_count
+                        dominant = _ABBREV_TO_BEHAVIOR.get(beh_abbrev, beh_abbrev)
+                except ValueError:
+                    pass
+    else:
+        # v1: G(col,row):n=N,E=avg|beh:count,...
+        m = re.match(r"G\((\d+),(\d+)\):n=(\d+),E=(\d+)\|(.+)", line)
+        if not m:
+            return []
+        col, row = int(m.group(1)), int(m.group(2))
+        count = int(m.group(3))
+        avg_energy = float(m.group(4))
+        beh_str = m.group(5)
+        dominant = "rest"
+        max_beh_count = 0
+        for pair in beh_str.split(","):
+            if ":" in pair:
+                beh_abbrev, beh_count_str = pair.split(":", 1)
+                try:
+                    beh_count = int(beh_count_str)
+                    if beh_count > max_beh_count:
+                        max_beh_count = beh_count
+                        dominant = _ABBREV_TO_BEHAVIOR.get(beh_abbrev, beh_abbrev)
+                except ValueError:
+                    pass
+
+    # Create pseudo-agent at cell center with stable negative ID
+    center_x = col * cell_size + cell_size // 2
+    center_y = row * cell_size + cell_size // 2
+    aid = -(col * 1000 + row + 1)
+
+    return [ParsedAgent(
+        aid=aid,
+        x=float(center_x),
+        y=float(center_y),
+        energy=avg_energy,
+        state=dominant,
+        count=count,
+    )]
+
+
+def _parse_notable_line(line: str, compact: bool) -> ParsedAgent | None:
+    """Parse a notable agent line.
+
+    v2: N A1 130 350 52 10 hunt->A3
+    v1: N:A1:(130,350,E=52,age=10,hunt->A3)
+    """
+    line = line.strip()
+    if compact:
+        # Strip "N " prefix, delegate to compact parser
+        if line.startswith("N "):
+            return _parse_compact_agent_line(line[2:])
+    else:
+        # Strip "N:" prefix, delegate to v1 parser
+        if line.startswith("N:"):
+            return parse_agent_line(line[2:])
+    return None
+
+
 def parse_agent_block(lines: list[str], compact: bool = False) -> list[ParsedAgent]:
-    """Parse an @AGENT block into agent list."""
+    """Parse an @AGENT block into agent list.
+
+    Dispatches lines by prefix: G (grid), N (notable), A (death/legacy).
+    """
     agents = []
-    parser = _parse_compact_agent_line if compact else parse_agent_line
     for line in lines:
-        agent = parser(line)
-        if agent is not None:
-            agents.append(agent)
+        stripped = line.strip()
+        if stripped.startswith("G"):
+            agents.extend(_parse_grid_line(stripped, compact))
+        elif stripped.startswith("N"):
+            agent = _parse_notable_line(stripped, compact)
+            if agent is not None:
+                agents.append(agent)
+        elif stripped.startswith("A"):
+            # Death markers or legacy per-agent lines
+            parser = _parse_compact_agent_line if compact else parse_agent_line
+            agent = parser(stripped)
+            if agent is not None:
+                agents.append(agent)
     return agents
 
 
@@ -338,9 +455,9 @@ def parse_protocol_to_ticks(text: str) -> list[ParsedTick]:
             agent_lines = []
             continue
 
-        # Agent lines (indented, start with A)
+        # Agent lines (indented, start with G, N, or A)
         if in_agent_block:
-            if stripped.startswith("A"):
+            if stripped[0] in ("G", "N", "A"):
                 agent_lines.append(stripped)
                 continue
             else:
@@ -404,6 +521,7 @@ def serialize_agent_for_frontend(agent: ParsedAgent, species_sid: int | None = N
         "state": agent.state,
         "target_aid": agent.target_aid,
         "dead": agent.dead,
+        "count": agent.count,
     }
 
 
