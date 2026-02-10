@@ -42,3 +42,8 @@ export interface WorldList {
   file: string;
   world_count: number;
 }
+
+export interface ModelFile {
+  name: string;
+  size: number;
+}

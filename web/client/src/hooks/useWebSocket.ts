@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { io, Socket } from "socket.io-client";
-import type { AgentSnapshot, SpeciesInfo, TickData, SimulationInfo, DatasetFile, WorldList } from "../types/simulation";
+import type { AgentSnapshot, SpeciesInfo, TickData, SimulationInfo, DatasetFile, WorldList, ModelFile } from "../types/simulation";
 
 export function useWebSocket() {
   const socketRef = useRef<Socket | null>(null);
@@ -15,6 +15,8 @@ export function useWebSocket() {
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [worldCount, setWorldCount] = useState(0);
   const [selectedWorld, setSelectedWorld] = useState(0);
+  const [models, setModels] = useState<ModelFile[]>([]);
+  const [selectedModel, setSelectedModel] = useState<string | null>(null);
 
   useEffect(() => {
     const socket = io(window.location.origin, {
@@ -52,8 +54,13 @@ export function useWebSocket() {
       setSelectedWorld(0);
     });
 
+    socket.on("model_list", (data: ModelFile[]) => {
+      setModels(data);
+    });
+
     socket.on("connect", () => {
       socket.emit("list_datasets");
+      socket.emit("list_models");
     });
 
     return () => {
@@ -72,11 +79,21 @@ export function useWebSocket() {
     setSelectedWorld(index);
   }, []);
 
-  const play = useCallback((mode: "file" | "live" = "live", file?: string, worldIndex?: number) => {
+  const selectModel = useCallback((name: string) => {
+    setSelectedModel(name);
+  }, []);
+
+  const play = useCallback((mode: "file" | "live" | "model" = "live", file?: string, worldIndex?: number) => {
     const socket = socketRef.current;
     if (!socket) return;
     setIsPlaying(true);
-    if (mode === "live") {
+    if (mode === "model") {
+      socket.emit("start_model", {
+        model: selectedModel,
+        temperature: 0.8,
+        max_tokens: 4096,
+      });
+    } else if (mode === "live") {
       socket.emit("start_live", {
         max_generations: 200,
         seed: Math.floor(Math.random() * 2147483647),
@@ -89,7 +106,7 @@ export function useWebSocket() {
         world_index: worldIndex ?? 0,
       });
     }
-  }, []);
+  }, [selectedModel]);
 
   const pause = useCallback(() => {
     socketRef.current?.emit("pause");
@@ -123,5 +140,8 @@ export function useWebSocket() {
     selectedWorld,
     selectFile,
     selectWorld,
+    models,
+    selectedModel,
+    selectModel,
   };
 }

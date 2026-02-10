@@ -1,7 +1,7 @@
-import type { DatasetFile } from "../types/simulation";
+import type { DatasetFile, ModelFile } from "../types/simulation";
 
 interface Props {
-  onPlay: (mode: "file" | "live", file?: string, worldIndex?: number) => void;
+  onPlay: (mode: "file" | "live" | "model", file?: string, worldIndex?: number) => void;
   onPause: () => void;
   onResume: () => void;
   onSpeed: (speed: number) => void;
@@ -12,6 +12,9 @@ interface Props {
   selectedWorld: number;
   onSelectFile: (name: string) => void;
   onSelectWorld: (index: number) => void;
+  models: ModelFile[];
+  selectedModel: string | null;
+  onSelectModel: (name: string) => void;
 }
 
 function formatSize(bytes: number): string {
@@ -32,6 +35,9 @@ export function Controls({
   selectedWorld,
   onSelectFile,
   onSelectWorld,
+  models,
+  selectedModel,
+  onSelectModel,
 }: Props) {
   return (
     <div
@@ -93,6 +99,38 @@ export function Controls({
           >
             Play World
           </button>
+
+          {models.length > 0 && (
+            <>
+              <div style={dividerStyle} />
+
+              <select
+                value={selectedModel ?? ""}
+                onChange={(e) => e.target.value && onSelectModel(e.target.value)}
+                style={selectStyle}
+              >
+                <option value="">Model...</option>
+                {models.map((m) => (
+                  <option key={m.name} value={m.name}>
+                    {m.name} ({formatSize(m.size)})
+                  </option>
+                ))}
+              </select>
+
+              <button
+                onClick={() => onPlay("model")}
+                disabled={!selectedModel}
+                style={{
+                  ...btnStyle,
+                  background: selectedModel ? "#16a34a" : "#333",
+                  opacity: selectedModel ? 1 : 0.5,
+                  cursor: selectedModel ? "pointer" : "not-allowed",
+                }}
+              >
+                Model Inference
+              </button>
+            </>
+          )}
         </>
       ) : (
         <button onClick={onPause} style={btnStyle}>

@@ -28,6 +28,9 @@ is_playing = False
 current_speed = 1.0
 TICK_RATE = 15  # Server updates at 15 ticks/sec
 
+# Cached model inference engine (lazily loaded)
+_engine_cache: dict = {"path": None, "engine": None}
+
 
 @app.route("/")
 def index():
@@ -230,6 +233,126 @@ def handle_list_worlds(data):
         text = f.read()
     worlds = split_worlds(text)
     emit("world_list", {"file": filename, "world_count": len(worlds)})
+
+
+@socketio.on("list_models")
+def handle_list_models():
+    """Scan checkpoints/ directory for .pt files."""
+    base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ckpt_dir = os.path.join(base, "checkpoints")
+    files = []
+    if os.path.isdir(ckpt_dir):
+        for root, _dirs, fnames in os.walk(ckpt_dir):
+            for fname in sorted(fnames):
+                if fname.endswith(".pt"):
+                    fpath = os.path.join(root, fname)
+                    rel = os.path.relpath(fpath, ckpt_dir)
+                    files.append({"name": rel, "size": os.path.getsize(fpath)})
+    emit("model_list", files)
+
+
+def _build_seed_prompt() -> str:
+    """Return a minimal v1 protocol seed to prime model generation."""
+    return (
+        "=EPOCH:1|TICK_SCALE:1000gen|W0\n"
+        "@SP|S0|plan=herbivore|pop=120|L0,L1\n"
+    )
+
+
+def _get_engine(checkpoint_rel: str):
+    """Lazily load InferenceEngine, caching by checkpoint path."""
+    base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ckpt_dir = os.path.join(base, "checkpoints")
+    full_path = os.path.realpath(os.path.join(ckpt_dir, checkpoint_rel))
+    if not full_path.startswith(os.path.realpath(ckpt_dir)):
+        raise ValueError("Invalid checkpoint path")
+    if not os.path.exists(full_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_rel}")
+
+    if _engine_cache["path"] == full_path and _engine_cache["engine"] is not None:
+        return _engine_cache["engine"]
+
+    # Lazy import to avoid torch/nvidia-smi overhead at server startup
+    sys.path.insert(0, base) if base not in sys.path else None
+    from inference import InferenceEngine
+    engine = InferenceEngine(full_path)
+    _engine_cache["path"] = full_path
+    _engine_cache["engine"] = engine
+    return engine
+
+
+@socketio.on("start_model")
+def handle_start_model(data=None):
+    """Run model inference and stream parsed ticks to client."""
+    global is_playing
+    is_playing = True
+
+    data = data or {}
+    model_name = data.get("model", "")
+    temperature = float(data.get("temperature", 0.8))
+    max_tokens = int(data.get("max_tokens", 4096))
+
+    try:
+        engine = _get_engine(model_name)
+    except (ValueError, FileNotFoundError, RuntimeError) as e:
+        emit("error", {"message": str(e)})
+        return
+
+    seed_prompt = _build_seed_prompt()
+    text_buffer = seed_prompt
+
+    emit("simulation_info", {"total_ticks": 0, "mode": "model"})
+
+    ticks_sent = 0
+    for token_text in engine.generate_streaming(
+        prompt=seed_prompt,
+        max_length=max_tokens,
+        temperature=temperature,
+    ):
+        if not is_playing:
+            break
+
+        text_buffer += token_text
+
+        # Buffer overflow guard
+        if len(text_buffer) > 10000:
+            break
+
+        # Try to parse completed ticks (delimited by ---)
+        if "---" not in text_buffer:
+            continue
+
+        # Split on --- and keep the incomplete tail
+        parts = text_buffer.split("---")
+        incomplete = parts[-1]
+        completed_chunks = parts[:-1]
+
+        for chunk in completed_chunks:
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            ticks = parse_protocol_to_ticks(chunk + "\n---")
+            for tick_data in ticks:
+                species_data = [serialize_species_for_frontend(sp) for sp in tick_data.species]
+                agent_data = [serialize_agent_for_frontend(agent) for agent in tick_data.agents]
+                emit("tick_update", {
+                    "tick": ticks_sent,
+                    "epoch": tick_data.epoch,
+                    "species": species_data,
+                    "agents": agent_data,
+                    "interpolate_duration": 1000 / TICK_RATE,
+                })
+                ticks_sent += 1
+                socketio.sleep(1.0 / (TICK_RATE * current_speed))
+
+                if not is_playing:
+                    break
+
+        text_buffer = incomplete
+        if not is_playing:
+            break
+
+    emit("simulation_complete", {"total_ticks": ticks_sent})
 
 
 @socketio.on("pause")

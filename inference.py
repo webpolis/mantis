@@ -366,6 +366,65 @@ class InferenceEngine:
 
         return logits
 
+    @torch.no_grad()
+    def generate_streaming(
+        self,
+        prompt: str,
+        max_length: int = 4096,
+        temperature: float = 0.8,
+        top_p: float = 0.9,
+        top_k: int = 50,
+    ):
+        """Generator yielding token strings one at a time.
+
+        Same generation logic as generate() (KV-cache, top-k/top-p sampling)
+        but yields instead of accumulating.
+        """
+        self.model.eval()
+
+        input_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
+        input_tensor = torch.tensor([input_ids], dtype=torch.long).to(self.device)
+
+        is_greedy = (temperature == 0.0)
+        if is_greedy:
+            temperature = 1.0
+
+        past_key_values = None
+        for _ in range(max_length):
+            if past_key_values is None:
+                model_input = input_tensor[:, -self.model.max_seq_len:]
+            else:
+                model_input = input_tensor[:, -1:]
+
+            output = self.model(model_input, past_key_values=past_key_values, use_cache=True)
+            logits = output['logits']
+            past_key_values = output['past_key_values']
+
+            if past_key_values[0][0].size(1) >= self.model.max_seq_len:
+                past_key_values = [
+                    (k[:, -self.model.max_seq_len + 1:], v[:, -self.model.max_seq_len + 1:])
+                    for k, v in past_key_values
+                ]
+
+            next_token_logits = logits[0, -1, :] / temperature
+
+            if is_greedy:
+                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            else:
+                next_token_logits = self._apply_sampling_filters(
+                    next_token_logits, top_k=top_k, top_p=top_p
+                )
+                probs = F.softmax(next_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+
+            input_tensor = torch.cat([input_tensor, next_token.unsqueeze(0)], dim=1)
+
+            token_id = next_token.item()
+            if token_id == self.tokenizer.eos_token_id:
+                break
+
+            yield self.tokenizer.decode([token_id], skip_special_tokens=False)
+
     def print_stats(self):
         """Print aggregated statistics."""
         if self.stats['num_generations'] == 0:

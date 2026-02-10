@@ -91,7 +91,9 @@ Mutation rates, speciation probabilities, and serialization detail adjust per ep
 
 ## Output Protocol
 
-The simulator outputs structured text consumed by `TextDataset` in `train.py`. Each generation produces layered blocks:
+The simulator outputs structured text consumed by `TextDataset` in `train.py`. Two formats are supported:
+
+### v1 format (pipe-delimited, default)
 
 ```
 =EPOCH:2|TICK_SCALE:10gen|W42
@@ -106,7 +108,28 @@ The simulator outputs structured text consumed by `TextDataset` in `train.py`. E
 ---
 ```
 
-For intelligent species, spotlight blocks add chain-of-thought:
+### v2 format (compact, `--compact` flag)
+
+Int-scaled values, space-separated, ~40% fewer tokens:
+
+```
+=EPOCH 2 10 W42
+@BIO L0 shallows 80 120 L1 reef 30 0
+@SP S0 L0 sessile_auto 8200 D sol 100
+  T size 21±4 photosynth 68±9
+  E 4200 1800 6400 r 3
+@SP S3 L1 predator 40 D S1 70 det 10
+  T speed 62±9 intel 21±6
+@INT S3 hunt S1 62 S1 p-35
+@EVT S3 M+ social 15±8
+---
+```
+
+v2 scaling rules: traits ×10, diet proportions ×100, vegetation ×100, success ×100, repro rate ×10. Diet abbreviations: `detritus`→`det`, `plant`→`plt`, `solar`→`sol`.
+
+### Spotlight blocks
+
+For intelligent species (v1 shown; v2 compresses headers but keeps narrative lines unchanged):
 
 ```
 @SPOT|W42G310|L1|S3
@@ -119,27 +142,42 @@ For intelligent species, spotlight blocks add chain-of-thought:
 ---
 ```
 
-Keyframes dump full state every ~20 generations; intermediate ticks use delta encoding (`Δspeed=+0.3`).
+Keyframes dump full state every ~20 generations; intermediate ticks use delta encoding (`Δspeed=+0.3` in v1, `Δspeed +3` in v2).
 
-When agent-based simulation is active, species blocks include `@AGENT` sub-blocks with individual organism positions and states:
+### Agent blocks
 
+When agent-based simulation is active, species blocks include `@AGENT` sub-blocks:
+
+v1:
 ```
-@SP|S3|L1|plan=omnivore|pop=420±42(200 agents)|diet={S1:0.5,plant:0.3}
-  T:speed=5.1±0.8,intel=4.2±0.6,social=5.8±0.7
-  E:in=8400,out=6200,store=12000|repro=r(rate=0.4)
   @AGENT|count=420|sample=top200+rand50|quantize=10
     A0:(120,340,E=45,age=8,forage)
     A1:(130,350,E=52,age=10,hunt->A3)
     A5:(90,280,E=38,age=3,flee)
 ```
 
+v2:
+```
+  @AGENT 420 top200+rand50 10
+   A0 120 340 45 8 forage
+   A1 130 350 52 10 hunt->A3
+   A5 90 280 38 3 flee
+```
+
 Delta ticks encode only changed agents (moved >5 units or energy changed >2), with `†` for deaths:
 
+v1:
 ```
   @AGENT|Δpos|quantize=10
     A0:(125,345,E=43)
-    A2:(140,360,E=48)
     A5:†
+```
+
+v2:
+```
+  @AGENT Δ 10
+   A0 125 345 43
+   A5 †
 ```
 
 ---
@@ -185,26 +223,26 @@ Pad tokens get weight 0.0.
 ### Recommended approach (population-only)
 
 ```bash
-# 1. Generate dataset (no agents)
+# 1. Generate dataset (compact v2 format)
 python scripts/gen_evo_dataset.py --worlds 10000 --max-generations 200 \
-    --output data/evo_train.txt --workers 8 --seed 42
+    --output data/evo_train.txt --workers 8 --seed 42 --compact
 
 # 2. Train (tiny model, single GPU)
 python train.py --stage 1 data/evo_train.txt \
-    --model-size tiny --seq-len 4096 --batch-size 8 \
-    --gradient-accumulation-steps 4 --learning-rate 5e-4 \
+    --model-size tiny --seq-len 2048 --batch-size 16 \
+    --gradient-accumulation-steps 2 --learning-rate 5e-4 \
     --warmup-steps 2000 --epochs 10 --mixed-precision --val-split 0.1
 ```
 
 ### Recommended approach (with agent simulation)
 
-Agent blocks dramatically increase per-tick token volume. A single agent keyframe tick with 3 species can produce 6,000-14,000 tokens — exceeding `seq_len=4096` entirely. Longer sequences, smaller batches, and adjusted keyframe intervals are required.
+Agent blocks dramatically increase per-tick token volume. A single ECOSYSTEM agent keyframe tick has a median of ~10K tokens (v2 compact). Longer sequences, smaller batches, and adjusted keyframe intervals are required.
 
 ```bash
-# 1. Generate dataset (agents enabled, longer keyframe interval)
+# 1. Generate dataset (agents enabled, compact v2 format)
 python scripts/gen_evo_dataset.py --worlds 10000 --max-generations 200 \
     --output data/evo_agents_train.txt --workers 8 --seed 42 \
-    --enable-agents --agent-epoch INTELLIGENCE --keyframe-interval 40
+    --enable-agents --agent-epoch ECOSYSTEM --keyframe-interval 40 --compact
 
 # 2. Train (tiny model, 24GB GPU)
 python train.py --stage 1 data/evo_agents_train.txt \
@@ -216,30 +254,30 @@ python train.py --stage 1 data/evo_agents_train.txt \
 
 ### Critical training parameters
 
-Parameters differ based on whether agent simulation is enabled:
+All values below assume **v2 compact format** (`--compact`). v1 format requires roughly 1.7x the seq-len for equivalent coverage.
 
 **Population-only (no agents):**
 
-| Parameter     | Value                          | Why                                                                  |
-| ------------- | ------------------------------ | -------------------------------------------------------------------- |
-| `--seq-len`   | 4096                           | Cultural memories reference events 50-150 gens back. 512 is useless. |
-| `--stride`    | 2048                           | 50% overlap ensures no causal chain falls on a boundary.             |
-| Warmup        | 2000 steps                     | MoE router needs stabilization time.                                 |
-| Peak LR       | 5e-4 (tiny/small), 1e-4 (base) | Standard for MoE.                                                    |
-| Min LR        | 1e-5                           | Never decay to zero — late data is the most complex.                 |
-| Gradient clip | 1.0                            | MoE can produce gradient spikes.                                     |
+| Parameter     | Value                          | Why                                                                              |
+| ------------- | ------------------------------ | -------------------------------------------------------------------------------- |
+| `--seq-len`   | 2048                           | p95 keyframe tick = 1,933 tokens. 20-tick window median = 3,574.                |
+| `--stride`    | 1024                           | 50% overlap ensures no causal chain falls on a boundary.                         |
+| Warmup        | 2000 steps                     | MoE router needs stabilization time.                                             |
+| Peak LR       | 5e-4 (tiny/small), 1e-4 (base) | Standard for MoE.                                                                |
+| Min LR        | 1e-5                           | Never decay to zero — late data is the most complex.                             |
+| Gradient clip | 1.0                            | MoE can produce gradient spikes.                                                 |
 
 **With agent simulation:**
 
-| Parameter     | Value                          | Why                                                                       |
-| ------------- | ------------------------------ | ------------------------------------------------------------------------- |
-| `--seq-len`   | 8192 (min), 16384 (ideal)      | Agent keyframe ticks produce 6K-14K tokens. 4096 truncates mid-block.     |
-| `--stride`    | 4096-6144                      | Agent coordinates have weak inter-tick causality; overlap less valuable.   |
-| Warmup        | 3000 steps                     | Agent tokens increase vocabulary diversity; router needs more time.        |
-| Peak LR       | 5e-4 (tiny/small), 1e-4 (base) | Same as population-only.                                                  |
-| Min LR        | 1e-5                           | Same as population-only.                                                  |
-| Gradient clip | 1.0                            | Same as population-only.                                                  |
-| Keyframe interval | 40                         | Halves agent keyframe frequency — reduces token spikes by 2x.             |
+| Parameter     | Value                          | Why                                                                              |
+| ------------- | ------------------------------ | -------------------------------------------------------------------------------- |
+| `--seq-len`   | 8192 (24GB), 16384 (48GB+)    | Median agent keyframe = 10,272 tokens. p95 = 18,762.                            |
+| `--stride`    | 4096 (24GB), 8192 (48GB+)     | 50% overlap. Agent coordinates have weak inter-tick causality.                   |
+| Warmup        | 3000 steps                     | Agent tokens increase vocabulary diversity; router needs more time.               |
+| Peak LR       | 5e-4 (tiny/small), 1e-4 (base) | Same as population-only.                                                         |
+| Min LR        | 1e-5                           | Same as population-only.                                                         |
+| Gradient clip | 1.0                            | Same as population-only.                                                         |
+| Keyframe interval | 40                         | Halves agent keyframe frequency — reduces token spikes by 2x.                    |
 
 **Batch size scaling for agent-enabled training (24GB GPU):**
 
@@ -254,30 +292,32 @@ Use `--gradient-checkpointing` unconditionally with agent-enabled data.
 
 ### Token volume comparison
 
-Approximate tokens per tick by epoch (agent-enabled):
+Empirically measured tokens per tick by epoch (v2 compact format, agent-enabled, kf=20, n=30 worlds × 200 ticks):
 
-| Epoch        | Delta tick   | Keyframe tick   | Notes                                    |
-| ------------ | ------------ | --------------- | ---------------------------------------- |
-| PRIMORDIAL   | 50-100       | 200-400         | No agents, same as population-only.      |
-| CAMBRIAN     | 50-100       | 200-400         | No agents, same as population-only.      |
-| ECOSYSTEM    | 800-2,500    | 8,000-14,000    | 3-5 species with agents (simple mode).   |
-| INTELLIGENCE | 1,000-3,000  | 10,000-14,000   | 1-3 species with agents + spotlight.     |
+| Epoch        | Delta (median) | Delta (p95) | Keyframe (median) | Keyframe (p95) | Notes                                    |
+| ------------ | -------------- | ----------- | ------------------ | -------------- | ---------------------------------------- |
+| PRIMORDIAL   | 184            | 541         | 590                | 1,348          | No agents, same as population-only.      |
+| CAMBRIAN     | 101            | 389         | 655                | 1,713          | No agents, same as population-only.      |
+| ECOSYSTEM    | 1,750          | 4,694       | 10,272             | 18,762         | 3-5 species with agents (simple mode).   |
 
-A 100-gen agent-enabled world produces ~80,000-260,000 tokens (10-20x more than population-only). This has direct implications for curriculum mixing — see below.
+Per-world totals (v2 compact, agent-enabled): median = 59,602 tokens, p95 = 448,915, max = 806,098.
+Population-only: median = 35,199, p95 = 111,358, max = 159,197.
+
+Agent-enabled worlds produce ~2-5x more tokens than population-only. This has direct implications for curriculum mixing — see below.
 
 ### World boundary handling
 
 Worlds are independent simulations. **Never pack tokens from different worlds into the same sequence.** Pad to `seq_len` at each world boundary (EOS).
 
-Padding waste varies by mode:
-- **Population-only**: <10% waste at `seq_len=4096` (worlds produce ~8K-15K tokens).
-- **Agent-enabled**: <1% waste at `seq_len=8192` (worlds produce ~80K-260K tokens). The bottleneck shifts from padding to compute-per-world.
+Padding waste varies by mode (v2 compact):
+- **Population-only**: <6% waste at `seq_len=2048` (worlds produce median 35K tokens, ~17 sequences per world).
+- **Agent-enabled**: <1% waste at `seq_len=8192` (worlds produce median 60K-450K tokens). The bottleneck shifts from padding to compute-per-world.
 
 ### Training curriculum
 
 Don't train sequentially (biology → ecosystems → intelligence) — causes catastrophic forgetting. Instead, mix gradually.
 
-**Important**: Mix by **token count**, not world count. Agent-enabled INTELLIGENCE worlds produce 10-20x more tokens per world than PRIMORDIAL worlds. Mixing by world count causes INTELLIGENCE tokens to dominate (~90% of training), overfitting the model to coordinate prediction at the expense of core ecological dynamics.
+**Important**: Mix by **token count**, not world count. Agent-enabled ECOSYSTEM worlds produce 2-5x more tokens per world than population-only worlds (v2 compact). Mixing by world count causes agent tokens to dominate training, overfitting the model to coordinate prediction at the expense of core ecological dynamics.
 
 | Progress | Bio tokens | Ecosystem tokens | Intelligence tokens |
 | -------- | ---------- | ---------------- | ------------------- |

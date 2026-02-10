@@ -21,6 +21,9 @@ function App() {
     selectedWorld,
     selectFile,
     selectWorld,
+    models,
+    selectedModel,
+    selectModel,
   } = useWebSocket();
 
   return (
@@ -49,6 +52,9 @@ function App() {
             selectedWorld={selectedWorld}
             onSelectFile={selectFile}
             onSelectWorld={selectWorld}
+            models={models}
+            selectedModel={selectedModel}
+            onSelectModel={selectModel}
           />
           <SimulationCanvas
             agents={agents}
