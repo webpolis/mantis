@@ -1,5 +1,13 @@
 import type { AgentSnapshot, SpeciesInfo } from "../types/simulation";
 
+export interface Camera {
+  zoom: number;
+  offsetX: number;
+  offsetY: number;
+}
+
+export const DEFAULT_CAMERA: Camera = { zoom: 1, offsetX: 0, offsetY: 0 };
+
 const BODY_PLAN_COLORS: Record<string, string> = {
   predator: "#ff4444",
   grazer: "#88cc88",
@@ -21,6 +29,31 @@ const STATE_BORDER_COLORS: Record<string, string> = {
 
 function agentRadius(count: number): number {
   return Math.max(2, Math.min(8, Math.sqrt(count || 1) * 2));
+}
+
+/** Apply camera transform, call fn, then restore. */
+export function withCamera(
+  ctx: CanvasRenderingContext2D,
+  cam: Camera,
+  fn: () => void
+) {
+  ctx.save();
+  ctx.translate(cam.offsetX, cam.offsetY);
+  ctx.scale(cam.zoom, cam.zoom);
+  fn();
+  ctx.restore();
+}
+
+/** Convert screen-space canvas coords to base (pre-camera) canvas coords. */
+export function screenToBase(
+  screenX: number,
+  screenY: number,
+  cam: Camera
+): [number, number] {
+  return [
+    (screenX - cam.offsetX) / cam.zoom,
+    (screenY - cam.offsetY) / cam.zoom,
+  ];
 }
 
 export function renderAgents(
@@ -148,10 +181,14 @@ export function renderHUD(
   tick: number,
   epoch: number,
   agentCount: number,
-  speciesCount: number
+  speciesCount: number,
+  zoom?: number
 ) {
+  const showZoom = zoom != null && zoom !== 1;
+  const height = showZoom ? 96 : 80;
+
   ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
-  ctx.fillRect(5, 5, 200, 80);
+  ctx.fillRect(5, 5, 200, height);
 
   ctx.fillStyle = "#fff";
   ctx.font = "12px monospace";
@@ -159,4 +196,8 @@ export function renderHUD(
   ctx.fillText(`Epoch: ${EPOCH_NAMES[epoch] || epoch}`, 12, 38);
   ctx.fillText(`Agents: ${agentCount}`, 12, 54);
   ctx.fillText(`Species: ${speciesCount}`, 12, 70);
+  if (showZoom) {
+    ctx.fillStyle = "#8cf";
+    ctx.fillText(`Zoom: ${zoom!.toFixed(1)}x`, 12, 86);
+  }
 }

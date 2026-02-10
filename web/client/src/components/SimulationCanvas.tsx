@@ -1,7 +1,16 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import type { AgentSnapshot, SpeciesInfo } from "../types/simulation";
 import { useInterpolation } from "../hooks/useInterpolation";
-import { renderAgents, renderGrid, renderHUD, findAgentAt } from "../utils/renderer";
+import {
+  renderAgents,
+  renderGrid,
+  renderHUD,
+  findAgentAt,
+  withCamera,
+  screenToBase,
+  DEFAULT_CAMERA,
+} from "../utils/renderer";
+import type { Camera } from "../utils/renderer";
 
 interface Props {
   agents: AgentSnapshot[];
@@ -14,6 +23,9 @@ interface Props {
 }
 
 const CANVAS_SIZE = 800;
+const MIN_ZOOM = 1;
+const MAX_ZOOM = 20;
+const ZOOM_SPEED = 0.001;
 
 export function SimulationCanvas({
   agents,
@@ -31,28 +43,103 @@ export function SimulationCanvas({
   const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 });
   const hoveredRef = useRef<AgentSnapshot | null>(null);
 
-  // Keep ref in sync for use in render loop
+  // Camera state as ref to avoid re-creating render callback on every zoom/pan
+  const camRef = useRef<Camera>({ ...DEFAULT_CAMERA });
+  const [camSnapshot, setCamSnapshot] = useState<Camera>({ ...DEFAULT_CAMERA });
+
+  // Pan dragging state
+  const dragRef = useRef<{ active: boolean; lastX: number; lastY: number }>({
+    active: false,
+    lastX: 0,
+    lastY: 0,
+  });
+
   hoveredRef.current = hovered;
 
-  // Update interpolation snapshot when new agents arrive
   useEffect(() => {
     if (agents.length > 0) {
       updateSnapshot(agents, interpolateDuration);
     }
   }, [agents, interpolateDuration, updateSnapshot]);
 
+  // --- Zoom (wheel) ---
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const cam = camRef.current;
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+      const mx = (e.clientX - rect.left) * scaleX;
+      const my = (e.clientY - rect.top) * scaleY;
+
+      const oldZoom = cam.zoom;
+      const delta = -e.deltaY * ZOOM_SPEED * oldZoom;
+      const newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, oldZoom + delta));
+
+      // Zoom toward cursor: keep the world point under cursor fixed
+      cam.offsetX = mx - (mx - cam.offsetX) * (newZoom / oldZoom);
+      cam.offsetY = my - (my - cam.offsetY) * (newZoom / oldZoom);
+      cam.zoom = newZoom;
+
+      // Clamp at zoom=1 to reset offset
+      if (newZoom === 1) {
+        cam.offsetX = 0;
+        cam.offsetY = 0;
+      }
+
+      setCamSnapshot({ ...cam });
+    };
+
+    canvas.addEventListener("wheel", onWheel, { passive: false });
+    return () => canvas.removeEventListener("wheel", onWheel);
+  }, []);
+
+  // --- Pan (drag) ---
+  const handleMouseDown = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      if (camRef.current.zoom <= 1) return;
+      dragRef.current = { active: true, lastX: e.clientX, lastY: e.clientY };
+    },
+    []
+  );
+
+  const handleMouseUp = useCallback(() => {
+    dragRef.current.active = false;
+  }, []);
+
   const handleMouseMove = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
       const canvas = canvasRef.current;
       if (!canvas) return;
       const rect = canvas.getBoundingClientRect();
+
+      // Handle panning
+      if (dragRef.current.active) {
+        const cam = camRef.current;
+        const scaleX = canvas.width / rect.width;
+        const scaleY = canvas.height / rect.height;
+        cam.offsetX += (e.clientX - dragRef.current.lastX) * scaleX;
+        cam.offsetY += (e.clientY - dragRef.current.lastY) * scaleY;
+        dragRef.current.lastX = e.clientX;
+        dragRef.current.lastY = e.clientY;
+        setCamSnapshot({ ...cam });
+      }
+
+      // Hit detection
       const scaleX = canvas.width / rect.width;
       const scaleY = canvas.height / rect.height;
       const cx = (e.clientX - rect.left) * scaleX;
       const cy = (e.clientY - rect.top) * scaleY;
 
+      // Convert screen coords to base (pre-camera) coords
+      const [bx, by] = screenToBase(cx, cy, camRef.current);
+
       const currentAgents = isPlaying ? getInterpolated() : agents;
-      const agent = findAgentAt(cx, cy, currentAgents, worldSize, CANVAS_SIZE);
+      const agent = findAgentAt(bx, by, currentAgents, worldSize, CANVAS_SIZE);
       setHovered(agent);
       setTooltipPos({ x: e.clientX - rect.left, y: e.clientY - rect.top });
     },
@@ -61,8 +148,15 @@ export function SimulationCanvas({
 
   const handleMouseLeave = useCallback(() => {
     setHovered(null);
+    dragRef.current.active = false;
   }, []);
 
+  const handleDoubleClick = useCallback(() => {
+    camRef.current = { ...DEFAULT_CAMERA };
+    setCamSnapshot({ ...DEFAULT_CAMERA });
+  }, []);
+
+  // --- Render loop ---
   const render = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -72,12 +166,15 @@ export function SimulationCanvas({
     ctx.fillStyle = "#16213e";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    renderGrid(ctx, worldSize);
-
+    const cam = camRef.current;
     const interpolated = getInterpolated();
-    renderAgents(ctx, interpolated, species, worldSize, hoveredRef.current?.aid);
 
-    renderHUD(ctx, tick, epoch, interpolated.length, species.length);
+    withCamera(ctx, cam, () => {
+      renderGrid(ctx, worldSize);
+      renderAgents(ctx, interpolated, species, worldSize, hoveredRef.current?.aid);
+    });
+
+    renderHUD(ctx, tick, epoch, interpolated.length, species.length, cam.zoom);
 
     if (isPlaying) {
       rafRef.current = requestAnimationFrame(render);
@@ -105,14 +202,21 @@ export function SimulationCanvas({
 
       ctx.fillStyle = "#16213e";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
-      renderGrid(ctx, worldSize);
-      renderAgents(ctx, agents, species, worldSize, hoveredRef.current?.aid);
-      renderHUD(ctx, tick, epoch, agents.length, species.length);
+
+      const cam = camRef.current;
+
+      withCamera(ctx, cam, () => {
+        renderGrid(ctx, worldSize);
+        renderAgents(ctx, agents, species, worldSize, hoveredRef.current?.aid);
+      });
+
+      renderHUD(ctx, tick, epoch, agents.length, species.length, cam.zoom);
     }
-  }, [agents, species, worldSize, tick, epoch, isPlaying]);
+  }, [agents, species, worldSize, tick, epoch, isPlaying, camSnapshot]);
 
   const speciesMap = new Map(species.map((s) => [s.sid, s]));
   const hoveredSpecies = hovered ? speciesMap.get(hovered.species_sid) : null;
+  const isZoomed = camSnapshot.zoom > 1;
 
   return (
     <div style={{ position: "relative", display: "inline-block" }}>
@@ -120,15 +224,23 @@ export function SimulationCanvas({
         ref={canvasRef}
         width={CANVAS_SIZE}
         height={CANVAS_SIZE}
+        onMouseDown={handleMouseDown}
+        onMouseUp={handleMouseUp}
         onMouseMove={handleMouseMove}
         onMouseLeave={handleMouseLeave}
+        onDoubleClick={handleDoubleClick}
         style={{
           border: "2px solid #333",
           borderRadius: "4px",
           display: "block",
+          cursor: isZoomed
+            ? dragRef.current.active
+              ? "grabbing"
+              : "grab"
+            : "default",
         }}
       />
-      {hovered && (
+      {hovered && !dragRef.current.active && (
         <div
           style={{
             position: "absolute",

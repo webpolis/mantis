@@ -113,17 +113,22 @@ def generate_dataset(args):
         compact=args.compact,
     )
 
+    def accumulate_stats(stats):
+        nonlocal max_tier_global, total_species, total_spotlights
+        epoch_counts[stats["epoch"]] = epoch_counts.get(stats["epoch"], 0) + 1
+        max_tier_global = max(max_tier_global, stats["max_tier"])
+        total_species += stats["total_species"]
+        total_spotlights += stats["spotlights"]
+
     with open(output, "w") as f:
         if args.workers <= 1:
-            # Sequential
+            # Sequential — flush after each world
             for i, (wid, seed) in enumerate(zip(range(args.worlds), world_seeds)):
                 text, stats = simulate_world(wid, seed, args.max_generations, args.keyframe_interval, **agent_kwargs)
                 f.write(text + "\n")  # blank line = EOS boundary between worlds
+                f.flush()
 
-                epoch_counts[stats["epoch"]] = epoch_counts.get(stats["epoch"], 0) + 1
-                max_tier_global = max(max_tier_global, stats["max_tier"])
-                total_species += stats["total_species"]
-                total_spotlights += stats["spotlights"]
+                accumulate_stats(stats)
 
                 if args.verbose and (i + 1) % max(1, args.worlds // 20) == 0:
                     pct = (i + 1) / args.worlds * 100
@@ -135,11 +140,16 @@ def generate_dataset(args):
                         f"tier={stats['max_tier']} ({rate:.1f} worlds/s)"
                     )
         else:
-            # Parallel — write each world to a temp file to avoid holding all in RAM
-            import tempfile
-            import os
-            tmp_dir = tempfile.mkdtemp(prefix="evo_gen_")
-            stats_by_wid = {}
+            # Parallel — stream to disk in world-order as results arrive
+            pending = {}  # wid -> text for out-of-order completions
+            next_wid = 0
+
+            def flush_pending():
+                nonlocal next_wid
+                while next_wid in pending:
+                    f.write(pending.pop(next_wid))
+                    next_wid += 1
+                f.flush()
 
             with ProcessPoolExecutor(max_workers=args.workers) as pool:
                 futures = {
@@ -152,16 +162,10 @@ def generate_dataset(args):
                 for future in as_completed(futures):
                     wid = futures[future]
                     text, stats = future.result()
-                    # Write to temp file instead of holding in memory
-                    tmp_path = os.path.join(tmp_dir, f"{wid:08d}.txt")
-                    with open(tmp_path, "w") as tmp_f:
-                        tmp_f.write(text + "\n")
-                    stats_by_wid[wid] = stats
+                    pending[wid] = text + "\n"
+                    flush_pending()
 
-                    epoch_counts[stats["epoch"]] = epoch_counts.get(stats["epoch"], 0) + 1
-                    max_tier_global = max(max_tier_global, stats["max_tier"])
-                    total_species += stats["total_species"]
-                    total_spotlights += stats["spotlights"]
+                    accumulate_stats(stats)
 
                     done_count += 1
                     if args.verbose and done_count % max(1, args.worlds // 20) == 0:
@@ -169,17 +173,9 @@ def generate_dataset(args):
                         elapsed = time.time() - t0
                         rate = done_count / elapsed
                         print(
-                            f"  [{pct:5.1f}%] {done_count}/{args.worlds} done "
-                            f"({rate:.1f} worlds/s)"
+                            f"  [{pct:5.1f}%] {done_count}/{args.worlds} done, "
+                            f"{next_wid} written ({rate:.1f} worlds/s)"
                         )
-
-            # Concatenate in world-order for deterministic output
-            for wid in range(args.worlds):
-                tmp_path = os.path.join(tmp_dir, f"{wid:08d}.txt")
-                with open(tmp_path, "r") as tmp_f:
-                    f.write(tmp_f.read())
-                os.unlink(tmp_path)
-            os.rmdir(tmp_dir)
 
     elapsed = time.time() - t0
     tier_names = ["Physical", "Behavioral", "Cognitive", "Cultural", "Abstract"]
