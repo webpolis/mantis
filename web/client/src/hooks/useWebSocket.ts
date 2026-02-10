@@ -67,10 +67,26 @@ export function useWebSocket() {
     socketRef.current = socket;
 
     socket.on("tick_update", (data: TickData) => {
-      const sp = data.species.length > 0 ? data.species : undefined;
       const prevSpecies = historyRef.current.length > 0
         ? historyRef.current[historyRef.current.length - 1].species
         : [];
+
+      // Merge species: carry forward plan/locations from previous when delta omits them
+      let mergedSpecies: SpeciesInfo[];
+      if (data.species.length > 0) {
+        const prevMap = new Map(prevSpecies.map((s) => [s.sid, s]));
+        mergedSpecies = data.species.map((s) => {
+          const prev = prevMap.get(s.sid);
+          return {
+            ...s,
+            plan: s.plan || prev?.plan || "",
+            locations: s.locations.length > 0 ? s.locations : prev?.locations ?? [],
+          };
+        });
+      } else {
+        mergedSpecies = prevSpecies;
+      }
+
       const tickEvents = data.events ?? [];
 
       // Append to event log
@@ -83,7 +99,7 @@ export function useWebSocket() {
       const frame: HistoryFrame = {
         tick: data.tick,
         epoch: data.epoch,
-        species: sp ?? prevSpecies,
+        species: mergedSpecies,
         agents: data.agents,
         biomes: biomesRef.current.map((b) => ({ ...b, patches: [...b.patches] })),
         events: tickEvents,
@@ -95,7 +111,7 @@ export function useWebSocket() {
       if (viewIndexRef.current === null) {
         setTick(data.tick);
         setEpoch(data.epoch);
-        if (sp) setSpecies(sp);
+        setSpecies(mergedSpecies);
         setAgents(data.agents);
         setEvents(tickEvents);
         setInterpolateDuration(data.interpolate_duration);
