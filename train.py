@@ -82,6 +82,9 @@ from mantis.models import BaseMoEModel
 from mantis.configs.model_config import get_micro_config, get_tiny_config, get_small_config, get_base_config
 from mantis.tokenizer import MANTISTokenizer
 from mantis.utils.checkpoints import compat_load
+from mantis.training.vram_estimator import (
+    estimate_training_vram, compute_optimal_batch_sizes, format_vram_summary,
+)
 
 try:
     from datasets import load_from_disk, load_dataset
@@ -359,6 +362,32 @@ def compute_perplexity(loss):
     return math.exp(min(loss, 100))
 
 
+def resolve_model_config(args, tokenizer, accelerator):
+    """
+    Resolve model config from checkpoint or model-size preset.
+
+    Returns (config, checkpoint_dict_or_None) so the caller can reuse
+    the loaded checkpoint later instead of deserializing it twice.
+    """
+    checkpoint = None
+    if args.resume:
+        checkpoint = compat_load(args.resume)
+        if 'config' not in checkpoint:
+            raise ValueError(f"Checkpoint missing 'config' key: {args.resume}")
+        config = checkpoint['config']
+        if accelerator.is_main_process:
+            print(f"✓ Loaded model config from checkpoint")
+        config.base_moe.vocab_size = len(tokenizer)
+    else:
+        config = {
+            'micro': get_micro_config,
+            'tiny': get_tiny_config,
+            'small': get_small_config,
+            'base': get_base_config
+        }[args.model_size]()
+        config.base_moe.vocab_size = len(tokenizer)
+    return config, checkpoint
+
 
 
 def load_or_create_tokenizer(tokenizer_path=None):
@@ -458,27 +487,69 @@ def train(args):
         if args.cpu_offload:
             print("✓ CPU offloading enabled")
 
-    # Adjust batch size based on GPU VRAM (for heterogeneous multi-GPU setups)
-    if accelerator.num_processes > 1 and torch.cuda.is_available():
-        device_id = accelerator.local_process_index
-        gpu_memory_gb = torch.cuda.get_device_properties(device_id).total_memory / (1024**3)
-
-        # Auto-adjust batch size based on VRAM
-        if gpu_memory_gb < 8 and args.batch_size > 1:
-            original_batch_size = args.batch_size
-            args.batch_size = 1
-            print(f"[Rank {accelerator.process_index}] GPU {device_id} ({gpu_memory_gb:.1f}GB): "
-                  f"Reduced batch_size {original_batch_size} → {args.batch_size}")
-        elif gpu_memory_gb >= 10 and args.batch_size < 2:  # Changed from 12 to 10
-            original_batch_size = args.batch_size
-            args.batch_size = 2
-            print(f"[Rank {accelerator.process_index}] GPU {device_id} ({gpu_memory_gb:.1f}GB): "
-                  f"Increased batch_size {original_batch_size} → {args.batch_size}")
-        else:
-            print(f"[Rank {accelerator.process_index}] GPU {device_id} ({gpu_memory_gb:.1f}GB): "
-                  f"Using batch_size={args.batch_size}")
-
     tokenizer = load_or_create_tokenizer(args.tokenizer_path)
+
+    # Resolve model config early; also keeps loaded checkpoint for reuse during resume
+    config, preloaded_checkpoint = resolve_model_config(args, tokenizer, accelerator)
+
+    # Determine DeepSpeed ZeRO stage for VRAM estimation
+    deepspeed_zero_stage = 0
+    if use_deepspeed and accelerator.state.deepspeed_plugin is not None:
+        ds_config = accelerator.state.deepspeed_plugin
+        deepspeed_zero_stage = getattr(ds_config, 'zero_stage', 2)
+
+    # VRAM-aware batch size adjustment
+    should_auto_batch = (
+        (accelerator.num_processes > 1 and torch.cuda.is_available())
+        or (getattr(args, 'auto_batch', False) and torch.cuda.is_available())
+    )
+
+    if should_auto_batch:
+        device_id = accelerator.local_process_index
+        props = torch.cuda.get_device_properties(device_id)
+        gpu_vram = props.total_memory
+        gpu_name = props.name
+
+        optimal_batch_sizes = compute_optimal_batch_sizes(
+            config.base_moe,
+            args.seq_len,
+            [gpu_vram],
+            safety_margin=0.85,
+            mixed_precision=args.mixed_precision,
+            gradient_checkpointing=args.gradient_checkpointing,
+            use_8bit_optimizer=args.use_8bit_optimizer,
+            deepspeed_zero_stage=deepspeed_zero_stage,
+            num_gpus=accelerator.num_processes,
+            max_batch_size=args.batch_size,
+        )
+        optimal_bs = optimal_batch_sizes[0]
+
+        # Print VRAM summary on main process
+        if accelerator.is_main_process:
+            est = estimate_training_vram(
+                config.base_moe,
+                args.seq_len,
+                batch_size=1,
+                mixed_precision=args.mixed_precision,
+                gradient_checkpointing=args.gradient_checkpointing,
+                use_8bit_optimizer=args.use_8bit_optimizer,
+                deepspeed_zero_stage=deepspeed_zero_stage,
+                num_gpus=accelerator.num_processes,
+            )
+            # Gather GPU info from all processes would require communication;
+            # for the summary, just show this GPU's info
+            print(f"\n{format_vram_summary(config.base_moe, args.seq_len, [(gpu_name, gpu_vram)], [optimal_bs], est)}")
+
+        original_batch_size = args.batch_size
+        args.batch_size = optimal_bs
+        if args.batch_size != original_batch_size:
+            print(f"[Rank {accelerator.process_index}] GPU {device_id} ({gpu_name}, "
+                  f"{gpu_vram / (1024**3):.1f} GB): "
+                  f"batch_size {original_batch_size} → {args.batch_size}")
+        else:
+            print(f"[Rank {accelerator.process_index}] GPU {device_id} ({gpu_name}, "
+                  f"{gpu_vram / (1024**3):.1f} GB): "
+                  f"batch_size={args.batch_size}")
 
     # Datasets
     if accelerator.is_main_process:
@@ -622,34 +693,9 @@ def train(args):
             pin_memory=True
         )
 
-    # Model
+    # Model (config already resolved above, before datasets)
     if accelerator.is_main_process:
         print("\nInitializing model...")
-
-    # Load config from checkpoint if resuming, otherwise create new config
-    if args.resume:
-        if not os.path.exists(args.resume):
-            raise FileNotFoundError(f"Checkpoint not found: {args.resume}")
-
-        checkpoint_for_config = compat_load(args.resume)
-        if 'config' not in checkpoint_for_config:
-            raise ValueError(f"Checkpoint missing 'config' key: {args.resume}")
-
-        config = checkpoint_for_config['config']
-        if accelerator.is_main_process:
-            print(f"✓ Loaded model config from checkpoint")
-
-        # Update vocab size in case tokenizer changed (though this would be unusual)
-        config.base_moe.vocab_size = len(tokenizer)
-    else:
-        config = {
-            'micro': get_micro_config,
-            'tiny': get_tiny_config,
-            'small': get_small_config,
-            'base': get_base_config
-        }[args.model_size]()
-
-        config.base_moe.vocab_size = len(tokenizer)
 
     model = BaseMoEModel(
         vocab_size=config.base_moe.vocab_size,
@@ -769,7 +815,8 @@ def train(args):
         if accelerator.is_main_process:
             print(f"\nResuming from checkpoint: {args.resume}")
 
-        checkpoint = compat_load(args.resume)
+        # Reuse checkpoint already loaded during config resolution
+        checkpoint = preloaded_checkpoint
 
         # Restore model state using unwrap_model to access actual model beneath Accelerate's wrapper
         unwrapped_model = accelerator.unwrap_model(model)
@@ -1175,6 +1222,10 @@ Examples:
                         help='Enable DeepSpeed ZeRO-3 for multi-GPU training (auto-detected, handles mixed VRAM)')
     parser.add_argument('--cpu-offload', action='store_true',
                         help='Offload DeepSpeed optimizer and parameters to CPU (requires --deepspeed, slower but lower GPU memory)')
+    parser.add_argument('--auto-batch', action='store_true',
+                        help='Automatically set batch size based on VRAM estimation '
+                             '(always active for multi-GPU; this flag enables it for single-GPU too). '
+                             'The --batch-size value becomes the ceiling.')
 
     args = parser.parse_args()
 
