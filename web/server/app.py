@@ -364,7 +364,7 @@ def _build_seed_prompt() -> str:
     """Return a minimal v1 protocol seed to prime model generation."""
     return (
         "=EPOCH:1|TICK_SCALE:1000gen|W0\n"
-        "@SP|S0|plan=herbivore|pop=120|L0,L1\n"
+        "@SP|S0|plan=grazer|pop=120|L0,L1\n"
     )
 
 

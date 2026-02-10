@@ -44,8 +44,15 @@ class Biome:
     veg_growth_rate: float = 0.1
     veg_capacity: float = 1.0
 
+    # Minimum vegetation floor: seed bank / spore dispersal allows recovery
+    VEG_SEED_BANK = 0.005
+
     def regenerate(self, rng: np.random.Generator, veg_growth_mult: float = 1.0) -> None:
         """Logistic vegetation regrowth + detritus decay + nutrient cycling."""
+        # Seed bank: even fully stripped biomes recover slowly via spores/seeds
+        if self.vegetation < self.VEG_SEED_BANK:
+            self.vegetation = self.VEG_SEED_BANK
+
         # Nutrient-limited logistic regrowth: dV/dt = r * V * (1 - V/K) * min(N, P, 1)
         nutrient_factor = min(self.nitrogen, self.phosphorus, 1.0)
         effective_rate = self.veg_growth_rate * veg_growth_mult
@@ -62,6 +69,11 @@ class Biome:
         self.detritus = max(0.0, self.detritus * 0.95 + rng.normal(0, 0.5))
         self.nitrogen = float(np.clip(self.nitrogen + detritus_decay * NUTRIENT_RELEASE_N, 0.0, 1.0))
         self.phosphorus = float(np.clip(self.phosphorus + detritus_decay * NUTRIENT_RELEASE_P, 0.0, 1.0))
+
+        # Geological buffer: slow baseline nutrient release prevents permanent
+        # nutrient lockup if all decomposers die
+        self.nitrogen = float(np.clip(self.nitrogen + 0.002, 0.0, 1.0))
+        self.phosphorus = float(np.clip(self.phosphorus + 0.001, 0.0, 1.0))
 
     def drift_env(self, rng: np.random.Generator, sigma: float = 0.02) -> None:
         """Small random perturbation of environmental axes."""

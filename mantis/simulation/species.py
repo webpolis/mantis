@@ -99,13 +99,18 @@ class DietVector:
                 self._d[k] /= total
 
     def mutate(self, rng: np.random.Generator, magnitude: float = 0.05) -> None:
-        """Small random perturbation, re-normalized."""
+        """Small random perturbation, re-normalized.
+
+        Always preserves at least one diet source to prevent degeneracy
+        where a species loses all feeding ability.
+        """
         if not self._d:
             return
         for k in list(self._d):
             self._d[k] = max(0.0, self._d[k] + rng.normal(0, magnitude))
-        # Drop near-zero entries
-        self._d = {k: v for k, v in self._d.items() if v > 1e-4}
+        # Drop near-zero entries but always keep the dominant source
+        dominant = max(self._d, key=self._d.get) if self._d else None
+        self._d = {k: v for k, v in self._d.items() if v > 1e-4 or k == dominant}
         if self._d:
             self.normalize()
 

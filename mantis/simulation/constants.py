@@ -158,9 +158,9 @@ BODY_PLAN_TRANSITIONS: list[tuple[str, str, dict]] = [
 PREREQUISITES: dict[str, list[tuple[str, int]]] = {
     # T1 <- T0
     "social":      [("sense", 4), ("repro", 3)],
-    "aggression":  [("speed", 4), ("venom", 2)],
+    "aggression":  [("speed", 3), ("size", 3)],
     "curiosity":   [("sense", 5), ("speed", 3)],
-    "patience":    [("camo", 4), ("sense", 3)],
+    "patience":    [("endurance", 4), ("sense", 3)],
     "nocturnal":   [("sense", 6)],
     # T2 <- T1
     "intel":       [("curiosity", 3), ("social", 3)],
@@ -348,8 +348,8 @@ DIET_MISMATCH_PENALTY = 0.4  # default efficiency for unlisted diet categories
 # Symbiogenesis
 # ---------------------------------------------------------------------------
 
-SYMBIOGENESIS_MIN_TICKS = 5   # sustained co-location ticks required
-SYMBIOGENESIS_PROB = 0.02     # per-tick probability once threshold met
+SYMBIOGENESIS_MIN_TICKS = 20  # sustained co-location ticks required (rare event)
+SYMBIOGENESIS_PROB = 0.003    # per-tick probability once threshold met (extremely rare)
 
 # ---------------------------------------------------------------------------
 # Variance-as-evolvability
@@ -374,25 +374,30 @@ class Epoch(IntEnum):
 EPOCH_CONFIG: dict[Epoch, dict] = {
     Epoch.PRIMORDIAL: {
         "tick_scale": 1000,
-        "mutation_rate_mult": 3.0,
+        # Per-gen rate = mutation_rate_mult / tick_scale
+        # 3000/1000 = 3.0 per gen (rapid primordial evolution)
+        "mutation_rate_mult": 3000.0,
         "speciation_prob": 0.08,
         "description": "Chemical/solar energy, simple producers + consumers",
     },
     Epoch.CAMBRIAN: {
         "tick_scale": 10,
-        "mutation_rate_mult": 1.5,
+        # 15/10 = 1.5 per gen (diversification burst)
+        "mutation_rate_mult": 15.0,
         "speciation_prob": 0.06,
         "description": "Body plan diversification, predation emerges",
     },
     Epoch.ECOSYSTEM: {
         "tick_scale": 1,
+        # 1/1 = 1.0 per gen (baseline)
         "mutation_rate_mult": 1.0,
         "speciation_prob": 0.04,
         "description": "Niche specialization, migration, stable food webs",
     },
     Epoch.INTELLIGENCE: {
         "tick_scale": 0.1,
-        "mutation_rate_mult": 0.5,
+        # 0.05/0.1 = 0.5 per gen (slower evolution for complex organisms)
+        "mutation_rate_mult": 0.05,
         "speciation_prob": 0.02,
         "description": "Individual-level events, culture, language",
     },

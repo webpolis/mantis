@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 
+from .constants import BRAIN_TAX, TRAIT_TO_TIER
 from .spatial import SpatialHash, VegetationPatch
 
 if TYPE_CHECKING:
@@ -90,10 +91,12 @@ class AgentManager:
         species_sid: int,
         biome_lid: int,
         world_size: int = WORLD_SIZE_DEFAULT,
+        base_metabolism: float = 1.0,
     ):
         self.species_sid = species_sid
         self.biome_lid = biome_lid
         self.world_size = world_size
+        self.base_metabolism = base_metabolism  # from body plan
         self.agents: list[Agent] = []
         self.spatial_hash = SpatialHash(world_size, cell_size=CELL_SIZE)
         self.next_aid = 0
@@ -191,14 +194,22 @@ class AgentManager:
         # 3. Resolve local interactions
         self._resolve_interactions(all_managers, vegetation_patches, prey_sids, rng)
 
-        # 4. Metabolism cost
+        # 4. Metabolism cost (matches population-level formula in engine.py)
         for a in self.agents:
             if not a.alive:
                 continue
-            metab = a.traits.get("metab", 1.0)
             size = a.traits.get("size", 1.0)
-            cost = metab * (size ** 0.75) * 0.1 + math.sqrt(a.vx * a.vx + a.vy * a.vy) * 0.02
-            a.energy -= cost
+            # Basal: body_plan base_metabolism * Kleiber scaling
+            basal = self.base_metabolism * (size ** 0.75) * 0.1
+            # Brain tax: cognitive traits cost energy (same as population-level)
+            brain = 0.0
+            for trait_name, val in a.traits.items():
+                tier = TRAIT_TO_TIER.get(trait_name, 0)
+                if tier > 0:
+                    brain += val * BRAIN_TAX.get(tier, 0.0)
+            # Movement: velocity-based
+            movement = math.sqrt(a.vx * a.vx + a.vy * a.vy) * 0.02
+            a.energy -= basal + brain + movement
             a.age += 1
 
         # 5. Prune dead

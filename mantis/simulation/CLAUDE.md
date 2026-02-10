@@ -43,7 +43,7 @@ for _ in range(100):
 
 Data flows in one direction: **constants → species/biome → agent/behavior/spatial → engine → serializer**
 
-- **`constants.py`** — All rules: trait taxonomy (5 tiers, 35 traits), body plans (9 types), prerequisites, fusion rules, epoch configs, energy constants. This is the single source of truth for simulation parameters.
+- **`constants.py`** — All rules: trait taxonomy (5 tiers, 35 traits), body plans (9 types), prerequisites, fusion rules, epoch configs (mutation_rate_mult is raw — engine divides by tick_scale), energy constants. This is the single source of truth for simulation parameters.
 - **`species.py`** — `Species` (population + traits as `TraitDistribution` mean/variance + `DietVector` + `BodyPlan`). Population-level state.
 - **`biome.py`** — `Biome` (location with vegetation/detritus/solar/environmental axes).
 - **`spatial.py`** — `SpatialHash` (100-unit grid cells, O(k) neighbor queries) + `VegetationPatch` (Gaussian density falloff, logistic regrowth).
@@ -56,15 +56,16 @@ Data flows in one direction: **constants → species/biome → agent/behavior/sp
 
 ## Simulation Pipeline (per tick)
 
-1. Energy accounting — food web (producer → herbivore → predator)
-2. Interactions — hunts, grazes, parasitism (population-level probability)
-3. Mutations — trait drift (directional or random, respecting body plan caps)
-4. Body plan transitions — diet-driven morphological changes
-5. Speciation — split when genetic divergence is high
-6. Extinction — population ≤ 0 or starvation
-7. Epoch transitions — triggered by complexity milestones (max tier reached)
-8. Agent stepping — if active: behavior selection → movement → local interactions → metabolism → death/birth
-9. Spotlights — INTELLIGENCE epoch cultural reasoning scenes for high-cognition species
+1. Energy accounting — food web (producer → herbivore → predator). Agent-managed species are **skipped** (agents handle their own energy via foraging/metabolism, reconciled back via `PopulationReconciler`).
+2. Interactions — hunts, grazes, parasitism (population-level probability). Agent-managed species are **skipped** for predation to prevent double-counting.
+3. Population update — surplus → reproduction, deficit → starvation. Minimum viable population floor (10) only applies when species has energy surplus (not being starved/hunted out).
+4. Mutations — trait drift per generation (rate normalized by `mutation_rate_mult / tick_scale`), respecting body plan caps.
+5. Body plan transitions — diet-driven morphological changes
+6. Speciation — split when genetic divergence is high (SD=0.2 trait divergence, gradual not saltational)
+7. Extinction — population ≤ 0 or starvation
+8. Epoch transitions — triggered by complexity milestones (max tier reached)
+9. Agent stepping — if active: behavior selection → movement → local interactions → metabolism → death/birth
+10. Spotlights — INTELLIGENCE epoch cultural reasoning scenes for high-cognition species
 
 ## Protocol Format
 
@@ -83,10 +84,14 @@ Output tokens processed by `mantis/tokenizer.py` with per-block loss weights:
 
 ## Key Design Decisions
 
-- **Energy-based, not fitness-based**: Population dynamics driven by actual energy flows through food web (Kleiber scaling, trophic efficiency). Species starve or thrive based on energy balance, not abstract fitness scores.
+- **Energy-based, not fitness-based**: Population dynamics driven by actual energy flows through food web (Kleiber scaling, trophic efficiency). Species starve or thrive based on energy balance, not abstract fitness scores. Plant/solar income scales with population (per-capita harvest × head count, capped by available resources).
 - **Body plans constrain evolution**: Each of 9 body plans blocks/caps certain traits. A `sessile_autotroph` can't evolve `speed`. Transitions happen when diet changes enough (e.g., grazer → omnivore when meat intake exceeds threshold).
-- **Dual-layer simulation**: Population-level dynamics (always on) + optional agent-level individuals (activated per-epoch). `PopulationReconciler` prevents the two layers from diverging.
+- **Dual-layer simulation**: Population-level dynamics (always on) + optional agent-level individuals (activated per-epoch). `PopulationReconciler` prevents the two layers from diverging. Agent-managed species are skipped in population-level energy computation and predation to prevent double-counting.
+- **Per-generation mutation normalization**: Raw `mutation_rate_mult` is divided by `tick_scale` so PRIMORDIAL (1000 gen/tick) and INTELLIGENCE (0.1 gen/tick) have comparable per-generation mutation rates.
+- **Vegetation resilience**: Seed bank floor (0.005) prevents permanent vegetation death. Geological nutrient buffer slowly replenishes N/P even without decomposers.
+- **Symbiogenesis restricted**: Only occurs in PRIMORDIAL/CAMBRIAN epochs (real endosymbiosis is an ancient event). Requires 20 ticks of co-location, 0.3% per-tick probability.
 - **Hysteresis in behavior**: Agents commit to actions for multiple ticks (flee: 10, hunt: 8, forage: 3) to prevent oscillation. Emergency energy override breaks commitment.
+- **Agent metabolism matches population-level**: Agent basal cost uses `body_plan.base_metabolism × size^0.75`, plus brain tax from cognitive traits (same formula as `_compute_cost` in engine.py).
 - **Keyframe + delta serialization**: Full state every 20 ticks, only changes between. Agent blocks use grid+notable hybrid: 100-unit spatial grid cells (count, avg energy, behavior distribution) + top-5 notable agents (10-unit quantized positions). Reduces keyframe tokens per species from ~1,750 to ~220-400.
 
 ## Gotchas
@@ -96,3 +101,5 @@ Output tokens processed by `mantis/tokenizer.py` with per-block loss weights:
 - **`constants.py` is the single source of truth**: All trait lists, body plan rules, epoch thresholds, and energy constants live here. Don't scatter magic numbers into other modules.
 - **Agent max limits**: 250 agents/species (`AGENT_MAX_PER_SPECIES`), enforced in `AgentManager`. `SpatialHash` cell size (100 units) matches max sense range.
 - **RNG discipline**: `World` takes a seed and creates `self.rng = np.random.default_rng(seed)`. All randomness must flow through `self.rng` for reproducibility. Never use `np.random` module-level.
+- **Diet preservation**: `DietVector.mutate()` always keeps the dominant source to prevent degeneracy where a species loses all feeding ability.
+- **Population floor is conditional**: Minimum viable population (10) only kicks in when `e_in >= e_out` (energy surplus). Species being starved or hunted into deficit decline naturally to extinction.

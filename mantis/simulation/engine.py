@@ -105,7 +105,7 @@ PRIMORDIAL_DIETS = {
     "filter_feeder": {"detritus": 0.6, "plant": 0.4},
     "decomposer": {"detritus": 1.0},
     "grazer": {"plant": 0.8, "detritus": 0.2},
-    "scavenger": {"detritus": 0.5, "plant": 0.3, "solar": 0.2},
+    "scavenger": {"detritus": 0.6, "plant": 0.4},
 }
 
 SPOTLIGHT_ROLES = ["Elder", "Warrior", "Scout", "Youth", "Mother"]
@@ -344,11 +344,21 @@ class World:
     # ------------------------------------------------------------------
 
     def _compute_energy(self, alive: list[Species]) -> None:
-        """Compute E_income and E_cost for each species."""
+        """Compute E_income and E_cost for each species.
+
+        Species with active agent managers are skipped — agents handle
+        their own energy via foraging/metabolism in _step_agents(),
+        then reconcile back to macro stats via PopulationReconciler.
+        This prevents double-counting energy flows.
+        """
         # Shuffle feeding order so no species consistently drains biomes first
         feeding_order = list(alive)
         self.rng.shuffle(feeding_order)
         for sp in feeding_order:
+            if sp.agent_manager is not None:
+                # Agent-managed species: energy handled by agent layer
+                self.energy_log[sp.sid] = (0.0, 0.0)
+                continue
             e_income = self._compute_income(sp)
             e_cost = self._compute_cost(sp)
             self.energy_log[sp.sid] = (e_income, e_cost)
@@ -359,6 +369,8 @@ class World:
         Predation income is excluded — it comes solely from successful
         hunts in _resolve_predation to avoid double-counting.
         Per-biome contributions are divided by biome count (population split).
+        Income scales with population (per-capita harvest with diminishing
+        returns from resource competition).
         Consumption depletes biome vegetation and detritus as a side effect.
         Digestive penalty applied based on body plan / diet affinity.
         """
@@ -383,13 +395,21 @@ class World:
                 photo = sp.traits["photosynth"].mean if "photosynth" in sp.traits else 0.0
                 for biome in biomes:
                     nutrient_factor = min(biome.nitrogen, biome.phosphorus, 1.0)
-                    income += proportion * biome.solar * solar_mult * photo * 100.0 * eff * nutrient_factor / n_biomes
+                    # Per-capita solar harvest, scales with population
+                    per_capita = proportion * biome.solar * solar_mult * photo * 0.1 * eff * nutrient_factor
+                    income += per_capita * pop_per_biome
             elif source == "plant":
                 eff = affinity.get("plant", DIET_MISMATCH_PENALTY)
                 for biome in biomes:
                     nutrient_factor = min(biome.nitrogen, biome.phosphorus, 1.0)
-                    income += proportion * biome.vegetation * size_mean * 80.0 * eff * nutrient_factor / n_biomes
-                    grazing = proportion * size_mean * pop_per_biome * 0.00005
+                    # Per-capita plant harvest limited by available vegetation
+                    per_capita = proportion * size_mean * 0.08 * eff * nutrient_factor
+                    available = biome.vegetation * 5000.0  # convert density to harvestable units
+                    total_demand = per_capita * pop_per_biome
+                    total_harvest = min(total_demand, available)
+                    income += total_harvest
+                    # Grazing depletes vegetation proportional to harvest
+                    grazing = total_harvest * 0.0001
                     biome.vegetation = max(0.0, biome.vegetation - grazing)
             elif source == "detritus":
                 eff = affinity.get("detritus", DIET_MISMATCH_PENALTY)
@@ -407,7 +427,7 @@ class World:
             else:
                 # Unknown source — apply mismatch penalty
                 eff = affinity.get(source, DIET_MISMATCH_PENALTY)
-                income += proportion * 30.0 * eff
+                income += proportion * 30.0 * eff * pop_per_biome
 
         return income
 
@@ -447,10 +467,12 @@ class World:
 
     def _resolve_interactions(self, alive: list[Species]) -> None:
         """Resolve predation, competition, and symbiosis between species."""
-        # Predation
+        # Predation (skip agent-managed species — they resolve hunts in agent layer)
         for sp in alive:
+            if sp.agent_manager is not None:
+                continue
             for source, proportion in sp.diet._d.items():
-                if source.startswith("S") and proportion > 0.1:
+                if source.startswith("S") and proportion > 0.05:
                     try:
                         prey_sid = int(source[1:])
                         prey = self._species_by_sid.get(prey_sid)
@@ -502,17 +524,23 @@ class World:
         success = float(np.clip(0.3 + advantage * 0.05 + self.rng.normal(0, 0.05), 0.05, 0.95))
 
         kills = max(1, int(prey.population * success * diet_prop * 0.1))
-        kills = min(kills, prey.population // 2)  # safety rail: can't kill more than half
+        kills = min(kills, prey.population - 1)  # leave at least 1 (extinction via starvation)
 
         prey_size = prey.traits["size"].mean if "size" in prey.traits else 1.0
         energy_gain = kills * prey_size * TROPHIC_EFFICIENCY * 100.0
 
+        old_pop = prey.population
         prey.population = max(1, prey.population - kills)
         predator.energy_store += energy_gain
 
-        # Detritus from kills
+        # Reduce prey energy_store proportionally to population lost
+        if old_pop > 0:
+            fraction_lost = kills / old_pop
+            prey.energy_store = max(0.0, prey.energy_store * (1.0 - fraction_lost))
+
+        # Detritus from kills (increased from 0.3 to 0.4 — less energy vanishes)
         for biome in self._species_biomes(prey):
-            biome.add_detritus(kills * prey_size * 0.3)
+            biome.add_detritus(kills * prey_size * 0.4)
 
         self.interactions.append(Interaction(
             verb="hunt",
@@ -612,9 +640,12 @@ class World:
                         for biome in self._species_biomes(sp):
                             biome.add_detritus(loss * size * 0.5)
 
-            # Population floor — only for viable species with energy reserves
-            if sp.alive and sp.population < 2 and sp.energy_store > 0:
-                sp.population = 2
+            # Minimum viable population — Allee effect: below this threshold,
+            # genetic drift and inbreeding make recovery unlikely.
+            # Only applies when species has energy surplus (not being starved out).
+            e_in, e_out = self.energy_log.get(sp.sid, (0.0, 0.0))
+            if sp.alive and sp.population < 10 and e_in >= e_out:
+                sp.population = 10
 
     # ------------------------------------------------------------------
     # Evolution
@@ -623,7 +654,11 @@ class World:
     def _evolve(self, alive: list[Species]) -> None:
         """Run evolutionary operations on all living species."""
         epoch_cfg = EPOCH_CONFIG[self.epoch]
-        mut_mult = epoch_cfg["mutation_rate_mult"]
+        # Normalize mutation rate per generation: divide by tick_scale so that
+        # PRIMORDIAL (1000 gen/tick) and INTELLIGENCE (0.1 gen/tick) have
+        # comparable per-generation mutation rates.
+        tick_scale = max(0.01, epoch_cfg["tick_scale"])
+        mut_mult = epoch_cfg["mutation_rate_mult"] / tick_scale
 
         for sp in alive:
             self.mutations.setdefault(sp.sid, [])
@@ -874,8 +909,9 @@ class World:
         # Copy and mutate traits
         child_traits = {}
         for t, td in parent.traits.items():
-            new_mean = float(np.clip(td.mean + self.rng.normal(0, 0.5), 0, 10))
-            new_var = float(max(0.01, td.variance * (1.0 + self.rng.normal(0, 0.2))))
+            # SD=0.2: gradual divergence, not saltation (hopeful monsters)
+            new_mean = float(np.clip(td.mean + self.rng.normal(0, 0.2), 0, 10))
+            new_var = float(max(0.01, td.variance * (1.0 + self.rng.normal(0, 0.15))))
             child_traits[t] = TraitDistribution(new_mean, new_var)
 
         # Maybe lose a higher-tier trait
@@ -1003,8 +1039,15 @@ class World:
     # ------------------------------------------------------------------
 
     def _check_symbiogenesis(self, alive: list[Species]) -> None:
-        """Check for symbiogenesis events from sustained symbiotic pairs."""
+        """Check for symbiogenesis events from sustained symbiotic pairs.
+
+        Restricted to PRIMORDIAL/CAMBRIAN epochs — real symbiogenesis
+        (e.g., mitochondrial endosymbiosis) is an ancient, extremely rare
+        event that does not occur in complex multicellular life.
+        """
         if len(alive) >= 20:
+            return
+        if self.epoch.value > Epoch.CAMBRIAN.value:
             return
 
         # Decay absent pairs (remove if both species not sharing a biome)
@@ -1254,6 +1297,7 @@ class World:
                 species_sid=sp.sid,
                 biome_lid=biome.lid,
                 world_size=1000,
+                base_metabolism=sp.body_plan.base_metabolism,
             )
             mgr.simple_mode = simple_mode
             mgr.spawn_agents(n_agents, sp, self.rng)

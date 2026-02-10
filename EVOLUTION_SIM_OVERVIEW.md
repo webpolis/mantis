@@ -70,7 +70,7 @@ Higher tiers require prerequisites from lower tiers (e.g., `intel` needs `curios
 Body plans shift when diet composition crosses thresholds (the "scavenger gateway"):
 
 ```
-herbivore {plant:1.0}
+grazer {plant:1.0}
   → scavenger {plant:0.7, detritus:0.3}
     → omnivore {plant:0.5, detritus:0.2, meat:0.3}
       → predator {meat:0.6, detritus:0.1, ...}
@@ -89,7 +89,7 @@ Simulations pass through 4 timescale epochs, triggered by complexity milestones:
 | ECOSYSTEM    | ~1 generation     | Stable food web (3+ levels) | Niche specialization, migration        |
 | INTELLIGENCE | Sub-generational  | Spotlight score > threshold | Individual-level events, culture       |
 
-Mutation rates, speciation probabilities, and serialization detail adjust per epoch.
+Mutation rates are normalized **per generation** (raw `mutation_rate_mult / tick_scale`), so PRIMORDIAL (1000 gen/tick) and INTELLIGENCE (0.1 gen/tick) evolve at comparable per-generation rates despite vastly different tick scales. Speciation probabilities and serialization detail also adjust per epoch.
 
 ---
 
