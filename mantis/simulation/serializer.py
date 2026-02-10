@@ -43,6 +43,23 @@ class Serializer:
             else:
                 lines.append(f"=EPOCH:{world.epoch.value}|TICK_SCALE:{tick_scale}gen|W{world.wid}")
 
+        # World-level events (catastrophes — before species blocks)
+        for evt in world.world_events:
+            if evt.startswith("catastrophe:"):
+                payload = evt.split(":", 1)[1]
+                if c:
+                    # "volcanic_winter|dur=8" -> "volcanic_winter dur 8"
+                    parts = payload.replace("|", " ").replace("=", " ")
+                    lines.append(f"@EVT WORLD catastrophe {parts}")
+                else:
+                    lines.append(f"@EVT|WORLD|catastrophe|{payload}")
+            elif evt.startswith("catastrophe_end:"):
+                ctype = evt.split(":", 1)[1]
+                if c:
+                    lines.append(f"@EVT WORLD catastrophe_end {ctype}")
+                else:
+                    lines.append(f"@EVT|WORLD|catastrophe_end|type={ctype}")
+
         # Biome state
         if is_keyframe:
             if c:
@@ -119,6 +136,39 @@ class Serializer:
                         self._species_since_keyframe.add(child_sid)
                     except ValueError:
                         pass
+                elif evt.startswith("disease:"):
+                    payload = evt.split(":", 1)[1]  # "plague|pop-=2000"
+                    if c:
+                        # "plague|pop-=2000" -> "plague p-2000"
+                        parts = payload.split("|")
+                        dtype = parts[0]
+                        pop_part = parts[1].replace("pop-=", "p-") if len(parts) > 1 else ""
+                        lines.append(f"@EVT S{sp.sid} disease {dtype} {pop_part}")
+                    else:
+                        lines.append(f"@EVT|S{sp.sid}|disease|{payload}")
+                elif evt.startswith("symbiogenesis:"):
+                    payload = evt.split(":", 1)[1]  # "S3+S5->S8|gained=photosynth,toxin_resist"
+                    if c:
+                        # Parse "S3+S5->S8|gained=photosynth,toxin_resist"
+                        main, gained_part = payload.split("|", 1) if "|" in payload else (payload, "")
+                        parents, child_id = main.split("->") if "->" in main else (main, "")
+                        gained = gained_part.replace("gained=", "").replace(",", " ") if gained_part else ""
+                        lines.append(f"@EVT S{sp.sid} symbiogenesis {parents} {child_id} {gained}".rstrip())
+                    else:
+                        lines.append(f"@EVT|S{sp.sid}|symbiogenesis|{payload}")
+                    # Track child for keyframe
+                    if "->" in payload:
+                        try:
+                            child_id_str = payload.split("->")[1].split("|")[0]
+                            child_sid = int(child_id_str[1:])
+                            self._species_since_keyframe.add(child_sid)
+                        except (ValueError, IndexError):
+                            pass
+                elif evt.startswith("evo_trap:"):
+                    if c:
+                        lines.append(f"@EVT S{sp.sid} evo_trap low_var")
+                    else:
+                        lines.append(f"@EVT|S{sp.sid}|evo_trap|low_variance")
 
         # Spotlight blocks
         for spot in world.spotlights:

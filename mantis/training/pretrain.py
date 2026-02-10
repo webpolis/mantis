@@ -184,8 +184,6 @@ class PreTrainer:
             lr_scale = min(1.0, self.global_step / self.warmup_steps)
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = param_group['initial_lr'] * lr_scale
-        else:
-            self.scheduler.step()
 
         # Mixed precision forward
         with torch.amp.autocast('cuda', enabled=self.scaler is not None):
@@ -216,6 +214,10 @@ class PreTrainer:
             total_loss.backward()
             nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
             self.optimizer.step()
+
+        # Step scheduler after optimizer (must be after warmup phase)
+        if self.global_step >= self.warmup_steps:
+            self.scheduler.step()
 
         return total_loss.item()
 

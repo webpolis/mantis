@@ -302,6 +302,64 @@ FAT_STORE_MAX_FACTOR = 5.0         # max energy_store = factor * per-tick cost
 REPRODUCTION_ENERGY_FRACTION = 0.3 # fraction of surplus allocated to reproduction
 
 # ---------------------------------------------------------------------------
+# Nutrient cycling
+# ---------------------------------------------------------------------------
+
+NUTRIENT_RELEASE_N = 0.08    # N released per unit detritus decay
+NUTRIENT_RELEASE_P = 0.03    # P released per unit detritus decay (slower)
+NUTRIENT_UPTAKE_RATE = 0.04  # N/P consumed per unit vegetation growth
+
+# ---------------------------------------------------------------------------
+# Disease
+# ---------------------------------------------------------------------------
+
+DISEASE_BASE_PROB = 0.015    # per-species per-tick base probability
+DISEASE_TYPES = ["plague", "blight", "parasitic_worm", "viral_outbreak", "fungal_rot"]
+
+# ---------------------------------------------------------------------------
+# Catastrophe
+# ---------------------------------------------------------------------------
+
+CATASTROPHE_PROB = 0.005     # per-tick (expect ~1 per 200 ticks)
+CATASTROPHE_TYPES: dict[str, dict] = {
+    "volcanic_winter": {"solar_mult": 0.1, "duration_range": (5, 10)},
+    "meteor_impact":   {"veg_set": 0.0, "detritus_spike": 500, "pop_loss": (0.5, 0.9), "duration_range": (1, 1)},
+    "ice_age":         {"veg_growth_mult": 0.3, "duration_range": (15, 30)},
+}
+
+# ---------------------------------------------------------------------------
+# Digestive efficiency
+# ---------------------------------------------------------------------------
+
+BODY_PLAN_DIET_AFFINITY: dict[str, dict[str, float]] = {
+    "sessile_autotroph": {"solar": 1.0},
+    "mobile_autotroph":  {"solar": 1.0, "plant": 0.7},
+    "filter_feeder":     {"detritus": 1.0, "plant": 0.8},
+    "grazer":            {"plant": 1.0, "detritus": 0.7},
+    "scavenger":         {"detritus": 1.0, "plant": 0.8, "meat": 0.5},
+    "omnivore":          {"plant": 0.9, "detritus": 0.8, "meat": 0.9},
+    "predator":          {"meat": 1.0, "detritus": 0.6},
+    "parasite":          {"meat": 1.0},
+    "decomposer":        {"detritus": 1.0},
+}
+DIET_MISMATCH_PENALTY = 0.4  # default efficiency for unlisted diet categories
+
+# ---------------------------------------------------------------------------
+# Symbiogenesis
+# ---------------------------------------------------------------------------
+
+SYMBIOGENESIS_MIN_TICKS = 5   # sustained co-location ticks required
+SYMBIOGENESIS_PROB = 0.02     # per-tick probability once threshold met
+
+# ---------------------------------------------------------------------------
+# Variance-as-evolvability
+# ---------------------------------------------------------------------------
+
+STRESS_MLEAP_MULT = 5.0      # Mleap probability multiplier under stress + high variance
+LOW_VARIANCE_THRESHOLD = 0.15 # below this, species is "over-specialized"
+HIGH_VARIANCE_THRESHOLD = 0.5 # above this, species can do evolutionary rescue
+
+# ---------------------------------------------------------------------------
 # Epoch definitions
 # ---------------------------------------------------------------------------
 

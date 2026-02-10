@@ -18,18 +18,28 @@ from .agent import AgentManager, AGENT_MAX_PER_SPECIES, AGENT_TOTAL_MAX
 from .agent_reconciliation import PopulationReconciler
 from .biome import Biome, BIOME_NAMES
 from .constants import (
+    BODY_PLAN_DIET_AFFINITY,
     BODY_PLANS,
     BRAIN_TAX,
+    CATASTROPHE_PROB,
+    CATASTROPHE_TYPES,
+    DIET_MISMATCH_PENALTY,
+    DISEASE_BASE_PROB,
+    DISEASE_TYPES,
     EPOCH_CONFIG,
     EXTINCTION_CAUSES,
     FAT_STORE_MAX_FACTOR,
     FUSION_RULES,
     GOALS,
+    HIGH_VARIANCE_THRESHOLD,
     KLEIBER_EXPONENT,
+    LOW_VARIANCE_THRESHOLD,
     PREREQUISITES,
     REPRODUCTION_ENERGY_FRACTION,
     STARVATION_RATE,
     STARVATION_THRESHOLD,
+    SYMBIOGENESIS_MIN_TICKS,
+    SYMBIOGENESIS_PROB,
     TRAIT_TIERS,
     TRAIT_TO_TIER,
     TROPHIC_EFFICIENCY,
@@ -179,9 +189,43 @@ class World:
         # Epoch transition flag for serializer
         self.epoch_just_changed = False
 
+        # Symbiosis history for symbiogenesis: (sid_a, sid_b) -> co-location ticks
+        self.symbiosis_history: dict[tuple[int, int], int] = {}
+
+        # Active catastrophe state
+        self.catastrophe: dict | None = None
+
+        # World-level events for current tick (serialized before species blocks)
+        self.world_events: list[str] = []
+
+        # Biome adjacency graph: lid -> {lid: permeability}
+        self.biome_adjacency: dict[int, dict[int, float]] = {}
+        self._build_biome_adjacency()
+
         # Per-tick caches
         self._biome_cache: dict[int, list[Biome]] = {}
         self._species_by_sid: dict[int, Species] = {sp.sid: sp for sp in self.species}
+
+    def _build_biome_adjacency(self) -> None:
+        """Build random biome adjacency graph (chain + extra edges)."""
+        for b in self.biomes:
+            self.biome_adjacency[b.lid] = {}
+        # Chain all biomes in order for guaranteed connectivity
+        for i in range(len(self.biomes) - 1):
+            a, b = self.biomes[i], self.biomes[i + 1]
+            perm = float(self.rng.uniform(0.3, 0.8))
+            self.biome_adjacency[a.lid][b.lid] = perm
+            self.biome_adjacency[b.lid][a.lid] = perm
+        # Add 0-2 random extra edges
+        n_extra = int(self.rng.integers(0, 3))
+        for _ in range(n_extra):
+            if len(self.biomes) < 2:
+                break
+            a, b = self.rng.choice(self.biomes, size=2, replace=False)
+            if b.lid not in self.biome_adjacency[a.lid]:
+                perm = float(self.rng.uniform(0.3, 0.8))
+                self.biome_adjacency[a.lid][b.lid] = perm
+                self.biome_adjacency[b.lid][a.lid] = perm
 
     def _create_primordial_species(self) -> Species:
         """Create a species with a primordial body plan."""
@@ -233,6 +277,7 @@ class World:
         self.mutations.clear()
         self.events.clear()
         self.energy_log.clear()
+        self.world_events.clear()
         self.epoch_just_changed = False
 
         # Per-tick caches (cleared each tick)
@@ -243,38 +288,51 @@ class World:
         if not alive:
             return
 
-        # 1. Biome regeneration + env drift
+        # 1. Catastrophe check (before biome regen — modifies biome params)
+        self._check_catastrophes()
+
+        # 2. Biome regeneration + env drift (nutrient-limited)
+        veg_growth_mult = 1.0
+        if self.catastrophe and "veg_growth_mult" in self.catastrophe:
+            veg_growth_mult = self.catastrophe["veg_growth_mult"]
         sigma = 0.04 if self.epoch == Epoch.PRIMORDIAL else 0.02
         for biome in self.biomes:
-            biome.regenerate(self.rng)
+            biome.regenerate(self.rng, veg_growth_mult=veg_growth_mult)
             biome.drift_env(self.rng, sigma)
 
-        # 2. Energy computation
+        # 3. Energy computation (with digestive penalty + nutrient factor)
         self._compute_energy(alive)
 
-        # 3. Interaction resolution
+        # 4. Interaction resolution (tracks symbiosis history)
         self._resolve_interactions(alive)
 
-        # 4. Population dynamics
+        # 5. Population dynamics (low-variance starvation penalty)
         self._update_populations(alive)
 
-        # 5. Evolution: mutations, trait acquisition, fusion, body plan transitions
+        # 6. Disease check
+        self._check_disease(alive)
+
+        # 7. Evolution: mutations, trait acquisition, fusion, body plan transitions
+        #    (stress-boosted Mleap via variance-as-evolvability)
         self._evolve(alive)
 
-        # 6. Speciation
+        # 8. Symbiogenesis check
+        self._check_symbiogenesis(alive)
+
+        # 9. Speciation (migration friction boost)
         self._try_speciation(alive)
 
-        # 7. Spotlights (INTELLIGENCE epoch only)
+        # 10. Spotlights (INTELLIGENCE epoch only)
         if self.epoch.value >= Epoch.INTELLIGENCE.value:
             self._generate_spotlights(alive)
 
-        # 8. Agent activation and stepping
+        # 11. Agent activation and stepping
         if self.enable_agents:
             self._activate_agents(alive)
             if self.agents_active:
                 self._step_agents(alive)
 
-        # 9. Epoch transition checks
+        # 12. Epoch transition checks
         self._check_epoch_transition()
 
         # Age all species
@@ -302,6 +360,7 @@ class World:
         hunts in _resolve_predation to avoid double-counting.
         Per-biome contributions are divided by biome count (population split).
         Consumption depletes biome vegetation and detritus as a side effect.
+        Digestive penalty applied based on body plan / diet affinity.
         """
         income = 0.0
         diet = sp.diet._d  # read-only access, avoid dict copy
@@ -310,24 +369,45 @@ class World:
         n_biomes = max(1, len(biomes))
         pop_per_biome = sp.population / n_biomes
 
+        # Digestive affinity lookup
+        affinity = BODY_PLAN_DIET_AFFINITY.get(sp.body_plan.name, {})
+
+        # Effective solar multiplier from catastrophe
+        solar_mult = 1.0
+        if self.catastrophe and "solar_mult" in self.catastrophe:
+            solar_mult = self.catastrophe["solar_mult"]
+
         for source, proportion in diet.items():
             if source == "solar":
+                eff = affinity.get("solar", DIET_MISMATCH_PENALTY)
                 photo = sp.traits["photosynth"].mean if "photosynth" in sp.traits else 0.0
                 for biome in biomes:
-                    income += proportion * biome.solar * photo * 100.0 / n_biomes
+                    nutrient_factor = min(biome.nitrogen, biome.phosphorus, 1.0)
+                    income += proportion * biome.solar * solar_mult * photo * 100.0 * eff * nutrient_factor / n_biomes
             elif source == "plant":
+                eff = affinity.get("plant", DIET_MISMATCH_PENALTY)
                 for biome in biomes:
-                    income += proportion * biome.vegetation * size_mean * 80.0 / n_biomes
-                    # Deplete vegetation from grazing (population-proportional)
+                    nutrient_factor = min(biome.nitrogen, biome.phosphorus, 1.0)
+                    income += proportion * biome.vegetation * size_mean * 80.0 * eff * nutrient_factor / n_biomes
                     grazing = proportion * size_mean * pop_per_biome * 0.00005
                     biome.vegetation = max(0.0, biome.vegetation - grazing)
             elif source == "detritus":
+                eff = affinity.get("detritus", DIET_MISMATCH_PENALTY)
+                is_decomposer = sp.body_plan.name == "decomposer"
                 for biome in biomes:
                     consumable = min(biome.detritus, pop_per_biome * 0.1)
-                    income += proportion * consumable * 50.0
-                    # Deplete detritus that was consumed
-                    biome.detritus = max(0.0, biome.detritus - consumable * proportion)
-            # Predation: energy comes from _resolve_predation only
+                    income += proportion * consumable * 50.0 * eff
+                    consumed = consumable * proportion
+                    biome.detritus = max(0.0, biome.detritus - consumed)
+                    # Decomposers release nutrients when consuming detritus
+                    if is_decomposer and consumed > 0:
+                        biome.release_nutrients(consumed)
+            elif source.startswith("S"):
+                pass  # Predation: energy comes from _resolve_predation only
+            else:
+                # Unknown source — apply mismatch penalty
+                eff = affinity.get(source, DIET_MISMATCH_PENALTY)
+                income += proportion * 30.0 * eff
 
         return income
 
@@ -387,7 +467,7 @@ class World:
                     if overlap > 0.3 and self.rng.random() < 0.3:
                         self._resolve_competition(sp_a, sp_b, overlap)
 
-        # Symbiosis (rare)
+        # Symbiosis (rare) — also track for symbiogenesis
         if len(alive) >= 2 and self.rng.random() < 0.03:
             pair = self.rng.choice(alive, size=2, replace=False)
             if self._share_biome(pair[0], pair[1]):
@@ -406,6 +486,9 @@ class World:
                     ))
                     pair[0].energy_store += 200
                     pair[1].energy_store += 200
+                    # Track symbiosis history for symbiogenesis
+                    key = (min(pair[0].sid, pair[1].sid), max(pair[0].sid, pair[1].sid))
+                    self.symbiosis_history[key] = self.symbiosis_history.get(key, 0) + 1
 
     def _resolve_predation(self, predator: Species, prey: Species, diet_prop: float) -> None:
         """Resolve a hunting interaction."""
@@ -512,6 +595,10 @@ class World:
                     remaining_deficit = deficit - sp.energy_store
                     sp.energy_store = 0.0
                     severity = min(1.0, remaining_deficit / (deficit + 1.0))
+                    # Low-variance species are more vulnerable to starvation
+                    mean_var = self._mean_variance(sp)
+                    if mean_var < LOW_VARIANCE_THRESHOLD:
+                        severity = min(1.0, severity * 1.5)
                     loss = max(1, int(sp.population * STARVATION_RATE * severity))
                     sp.population = max(0, sp.population - loss)
 
@@ -541,6 +628,12 @@ class World:
         for sp in alive:
             self.mutations.setdefault(sp.sid, [])
             self.events.setdefault(sp.sid, [])
+
+            # Evolutionary trap: stressed + low variance = over-specialized
+            e_income, e_cost = self.energy_log.get(sp.sid, (0.0, 0.0))
+            stressed = sp.energy_store == 0 or (sp.energy_store < e_cost and sp.energy_store > 0)
+            if stressed and self._mean_variance(sp) < LOW_VARIANCE_THRESHOLD:
+                self.events[sp.sid].append("evo_trap:low_variance")
 
             # Mutate existing traits
             self._mutate_traits(sp, mut_mult)
@@ -594,11 +687,21 @@ class World:
         container = sp.fused_traits if is_fused else sp.traits
         td = container[trait]
 
+        # Stress-boosted Mleap (variance-as-evolvability)
+        e_income, e_cost = self.energy_log.get(sp.sid, (0.0, 0.0))
+        stress = 1.0 if sp.energy_store == 0 else (0.3 if sp.energy_store < e_cost else 0.0)
+        mean_var = self._mean_variance(sp)
+
         roll = float(self.rng.random())
+        # Under stress + high variance: Mleap range expands from [0.75, 0.90) to [0.50, 0.90)
+        mleap_floor = 0.75
+        if stress > 0 and mean_var >= HIGH_VARIANCE_THRESHOLD:
+            mleap_floor = 0.50
+
         if roll < 0.50:
             mut_type = "Mpoint"
             delta = float(self.rng.choice([-0.5, -0.3, 0.3, 0.5]))
-        elif roll < 0.75:
+        elif roll < mleap_floor:
             mut_type = "Mdrift"
             delta = float(self.rng.normal(0, 0.3))
             # Also widen/narrow variance
@@ -749,7 +852,13 @@ class World:
         spec_prob = EPOCH_CONFIG[self.epoch]["speciation_prob"]
 
         for sp in alive:
-            if sp.population > 500 and sp.energy_store > 0 and self.rng.random() < spec_prob:
+            if sp.population <= 500 or sp.energy_store <= 0:
+                continue
+
+            # Migration friction: disconnected biomes boost speciation
+            adjusted_prob = spec_prob * self._isolation_factor(sp)
+
+            if self.rng.random() < adjusted_prob:
                 child = self._branch_species(sp)
                 # Subtract child population from parent (conservation of individuals)
                 sp.population -= child.population
@@ -792,6 +901,14 @@ class World:
 
         child_pop = max(10, parent.population // int(self.rng.integers(5, 15)))
 
+        # Child gets a random subset of parent's locations (migration friction)
+        parent_locs = sorted(parent.locations)
+        if len(parent_locs) > 1:
+            n_child_locs = int(self.rng.integers(1, len(parent_locs) + 1))
+            child_locs = set(self.rng.choice(parent_locs, size=n_child_locs, replace=False))
+        else:
+            child_locs = set(parent_locs)
+
         return Species(
             sid=sid,
             traits=child_traits,
@@ -800,8 +917,198 @@ class World:
             diet=child_diet,
             population=child_pop,
             energy_store=float(child_pop * 0.3),
-            locations=set(parent.locations),
+            locations=child_locs,
         )
+
+    # ------------------------------------------------------------------
+    # Catastrophes
+    # ------------------------------------------------------------------
+
+    def _check_catastrophes(self) -> None:
+        """Check for new catastrophe or apply ongoing one."""
+        if self.catastrophe is not None:
+            # Decrement duration
+            self.catastrophe["remaining"] -= 1
+            if self.catastrophe["remaining"] <= 0:
+                ctype = self.catastrophe["type"]
+                self.world_events.append(f"catastrophe_end:{ctype}")
+                self.catastrophe = None
+            return
+
+        if self.rng.random() >= CATASTROPHE_PROB:
+            return
+
+        ctype = str(self.rng.choice(list(CATASTROPHE_TYPES.keys())))
+        cfg = CATASTROPHE_TYPES[ctype]
+        lo, hi = cfg["duration_range"]
+        duration = int(self.rng.integers(lo, hi + 1))
+
+        self.catastrophe = {"type": ctype, "remaining": duration, **cfg}
+        self.world_events.append(f"catastrophe:{ctype}|dur={duration}")
+
+        # Immediate effects
+        if ctype == "meteor_impact":
+            # Pick a random biome for impact
+            target = self.rng.choice(self.biomes)
+            target.vegetation = cfg.get("veg_set", 0.0)
+            target.detritus += cfg.get("detritus_spike", 0)
+            pop_lo, pop_hi = cfg["pop_loss"]
+            for sp in self.species:
+                if sp.alive and f"L{target.lid}" in sp.locations:
+                    loss_frac = float(self.rng.uniform(pop_lo, pop_hi))
+                    pop_loss = int(sp.population * loss_frac)
+                    sp.population = max(1, sp.population - pop_loss)
+                    size = sp.traits["size"].mean if "size" in sp.traits else 1.0
+                    target.add_detritus(pop_loss * size * 0.5)
+
+    # ------------------------------------------------------------------
+    # Disease
+    # ------------------------------------------------------------------
+
+    def _check_disease(self, alive: list[Species]) -> None:
+        """Disease outbreak check for each species."""
+        for sp in alive:
+            mean_var = self._mean_variance(sp)
+            density_factor = sp.population / 5000.0
+            vulnerability = density_factor * max(0.1, 1.0 / (mean_var + 0.1))
+
+            if self.rng.random() >= vulnerability * DISEASE_BASE_PROB:
+                continue
+
+            # Outbreak — mortality depends on variance
+            if mean_var >= HIGH_VARIANCE_THRESHOLD:
+                mortality = float(self.rng.uniform(0.1, 0.2))
+            elif mean_var < LOW_VARIANCE_THRESHOLD:
+                mortality = float(self.rng.uniform(0.4, 0.8))
+            else:
+                mortality = float(self.rng.uniform(0.15, 0.4))
+
+            pop_loss = max(1, int(sp.population * mortality))
+            pop_loss = min(pop_loss, sp.population - 1)  # leave at least 1
+            sp.population -= pop_loss
+
+            # Detritus from dead
+            size = sp.traits["size"].mean if "size" in sp.traits else 1.0
+            biomes = self._species_biomes(sp)
+            for biome in biomes:
+                biome.add_detritus(pop_loss * size * 0.3 / max(1, len(biomes)))
+
+            disease_type = str(self.rng.choice(DISEASE_TYPES))
+            self.events.setdefault(sp.sid, []).append(
+                f"disease:{disease_type}|pop-={pop_loss}"
+            )
+
+    # ------------------------------------------------------------------
+    # Symbiogenesis
+    # ------------------------------------------------------------------
+
+    def _check_symbiogenesis(self, alive: list[Species]) -> None:
+        """Check for symbiogenesis events from sustained symbiotic pairs."""
+        if len(alive) >= 20:
+            return
+
+        # Decay absent pairs (remove if both species not sharing a biome)
+        for key in list(self.symbiosis_history.keys()):
+            sid_a, sid_b = key
+            sp_a = self._species_by_sid.get(sid_a)
+            sp_b = self._species_by_sid.get(sid_b)
+            if sp_a is None or sp_b is None or not sp_a.alive or not sp_b.alive:
+                del self.symbiosis_history[key]
+                continue
+            if not self._share_biome(sp_a, sp_b):
+                self.symbiosis_history[key] = max(0, self.symbiosis_history[key] - 1)
+                if self.symbiosis_history[key] <= 0:
+                    del self.symbiosis_history[key]
+
+        # Check for symbiogenesis
+        for key, ticks in list(self.symbiosis_history.items()):
+            if ticks < SYMBIOGENESIS_MIN_TICKS:
+                continue
+            if self.rng.random() >= SYMBIOGENESIS_PROB:
+                continue
+
+            sid_a, sid_b = key
+            sp_a = self._species_by_sid.get(sid_a)
+            sp_b = self._species_by_sid.get(sid_b)
+            if sp_a is None or sp_b is None or not sp_a.alive or not sp_b.alive:
+                continue
+
+            # Major partner = larger population; minor = smaller
+            if sp_a.population >= sp_b.population:
+                major, minor = sp_a, sp_b
+            else:
+                major, minor = sp_b, sp_a
+
+            # Pick traits from minor that major lacks
+            gained_traits = [t for t in minor.traits if t not in major.traits and major.body_plan.can_evolve(t)]
+            if not gained_traits:
+                continue
+            # Take up to 3 traits
+            n_gain = min(3, len(gained_traits))
+            gained = list(self.rng.choice(gained_traits, size=n_gain, replace=False))
+
+            # Create child species with major's base + gained traits
+            child_traits = {t: TraitDistribution(td.mean, td.variance) for t, td in major.traits.items()}
+            for t in gained:
+                td = minor.traits[t]
+                child_traits[t] = TraitDistribution(td.mean * 0.5, td.variance)
+
+            child_sid = self.next_sid
+            self.next_sid += 1
+            child_pop = max(10, min(major.population, minor.population) // 10)
+
+            child = Species(
+                sid=child_sid,
+                traits=child_traits,
+                body_plan=BodyPlan(major.body_plan.name),
+                diet=DietVector(major.diet.sources()),
+                population=child_pop,
+                energy_store=float(child_pop * 0.3),
+                locations=set(major.locations & minor.locations) or set(major.locations),
+            )
+
+            # Deduct from parents
+            major.population = max(1, major.population - child_pop // 2)
+            minor.population = max(1, minor.population - child_pop // 2)
+
+            self.species.append(child)
+            self._species_by_sid[child.sid] = child
+            self.goals[child.sid] = str(self.rng.choice(GOALS[:8]))
+
+            gained_str = ",".join(gained)
+            self.events.setdefault(major.sid, []).append(
+                f"symbiogenesis:S{major.sid}+S{minor.sid}->S{child_sid}|gained={gained_str}"
+            )
+
+            # Remove from history so it doesn't trigger again
+            del self.symbiosis_history[key]
+            break  # max one per tick
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _mean_variance(self, sp: Species) -> float:
+        """Mean trait variance across all traits."""
+        all_vars = [td.variance for td in sp.traits.values()]
+        if sp.fused_traits:
+            all_vars.extend(td.variance for td in sp.fused_traits.values())
+        return sum(all_vars) / max(1, len(all_vars))
+
+    def _isolation_factor(self, sp: Species) -> float:
+        """Compute isolation factor from disconnected biome pairs."""
+        lids = [int(loc[1:]) for loc in sp.locations if loc.startswith("L")]
+        if len(lids) < 2:
+            return 1.0
+        total_pairs = 0
+        disconnected = 0
+        for i in range(len(lids)):
+            for j in range(i + 1, len(lids)):
+                total_pairs += 1
+                adj = self.biome_adjacency.get(lids[i], {})
+                if lids[j] not in adj:
+                    disconnected += 1
+        return 1.0 + 0.5 * disconnected / max(1, total_pairs)
 
     # ------------------------------------------------------------------
     # Spotlights

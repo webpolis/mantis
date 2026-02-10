@@ -13,7 +13,7 @@ from typing import Optional
 
 import numpy as np
 
-from .constants import ENV_AXES
+from .constants import ENV_AXES, NUTRIENT_RELEASE_N, NUTRIENT_RELEASE_P, NUTRIENT_UPTAKE_RATE
 from .spatial import VegetationPatch
 
 
@@ -33,6 +33,8 @@ class Biome:
     vegetation: float = 0.5       # [0, 1] — regrows logistically
     detritus: float = 0.0         # accumulates from dead organisms
     solar: float = 1.0            # base solar energy availability
+    nitrogen: float = 0.5         # [0, 1] — released from detritus by decomposers
+    phosphorus: float = 0.3       # [0, 1] — released more slowly from detritus
     env: dict[str, float] = field(default_factory=dict)
 
     # Vegetation patches for agent-based simulation
@@ -42,14 +44,24 @@ class Biome:
     veg_growth_rate: float = 0.1
     veg_capacity: float = 1.0
 
-    def regenerate(self, rng: np.random.Generator) -> None:
-        """Logistic vegetation regrowth + detritus decay."""
-        # Logistic regrowth: dV/dt = r * V * (1 - V/K)
-        growth = self.veg_growth_rate * self.vegetation * (1.0 - self.vegetation / self.veg_capacity)
+    def regenerate(self, rng: np.random.Generator, veg_growth_mult: float = 1.0) -> None:
+        """Logistic vegetation regrowth + detritus decay + nutrient cycling."""
+        # Nutrient-limited logistic regrowth: dV/dt = r * V * (1 - V/K) * min(N, P, 1)
+        nutrient_factor = min(self.nitrogen, self.phosphorus, 1.0)
+        effective_rate = self.veg_growth_rate * veg_growth_mult
+        growth = effective_rate * self.vegetation * (1.0 - self.vegetation / self.veg_capacity) * nutrient_factor
+        growth = max(0.0, growth)  # no negative growth from nutrients
         self.vegetation = float(np.clip(self.vegetation + growth + rng.normal(0, 0.01), 0.0, self.veg_capacity))
 
-        # Detritus decays slowly
+        # Consume nutrients proportional to growth
+        self.nitrogen = float(np.clip(self.nitrogen - growth * NUTRIENT_UPTAKE_RATE, 0.0, 1.0))
+        self.phosphorus = float(np.clip(self.phosphorus - growth * NUTRIENT_UPTAKE_RATE, 0.0, 1.0))
+
+        # Detritus decays slowly — releases nutrients back
+        detritus_decay = self.detritus * 0.05
         self.detritus = max(0.0, self.detritus * 0.95 + rng.normal(0, 0.5))
+        self.nitrogen = float(np.clip(self.nitrogen + detritus_decay * NUTRIENT_RELEASE_N, 0.0, 1.0))
+        self.phosphorus = float(np.clip(self.phosphorus + detritus_decay * NUTRIENT_RELEASE_P, 0.0, 1.0))
 
     def drift_env(self, rng: np.random.Generator, sigma: float = 0.02) -> None:
         """Small random perturbation of environmental axes."""
@@ -71,6 +83,11 @@ class Biome:
         taken = min(amount, self.detritus)
         self.detritus -= taken
         return taken
+
+    def release_nutrients(self, detritus_consumed: float) -> None:
+        """Release nutrients from decomposer activity on detritus."""
+        self.nitrogen = float(np.clip(self.nitrogen + detritus_consumed * NUTRIENT_RELEASE_N, 0.0, 1.0))
+        self.phosphorus = float(np.clip(self.phosphorus + detritus_consumed * NUTRIENT_RELEASE_P, 0.0, 1.0))
 
     def init_vegetation_patches(self, rng: np.random.Generator, world_size: int, n_patches: int = 8) -> None:
         """Create spatial vegetation patches for agent-based simulation."""
@@ -97,11 +114,12 @@ class Biome:
 
     def serialize_header(self) -> str:
         """Serialize biome state for protocol output."""
-        return f"L{self.lid}:{self.name}(veg={self.vegetation:.1f},det={self.detritus:.0f})"
+        return f"L{self.lid}:{self.name}(veg={self.vegetation:.1f},det={self.detritus:.0f},N={self.nitrogen:.1f},P={self.phosphorus:.1f})"
 
     def serialize_header_compact(self) -> str:
-        """Serialize biome state in compact v2 format: L{lid} {name} {veg×100} {det}."""
-        return f"L{self.lid} {self.name} {int(round(self.vegetation * 100))} {int(round(self.detritus))}"
+        """Serialize biome state in compact v2 format: L{lid} {name} {veg×100} {det} N{n×10} P{p×10}."""
+        return (f"L{self.lid} {self.name} {int(round(self.vegetation * 100))} {int(round(self.detritus))} "
+                f"N{int(round(self.nitrogen * 10))} P{int(round(self.phosphorus * 10))}")
 
     @staticmethod
     def create_random(lid: int, rng: np.random.Generator, n_env_axes: int = 4,
@@ -125,11 +143,24 @@ class Biome:
         elif name in ("rainforest", "swamp", "meadow"):
             vegetation = float(rng.uniform(0.6, 1.0))
 
+        # Nutrient initialization based on biome fertility
+        if name in ("rainforest", "swamp", "meadow", "mangrove"):
+            nitrogen = float(rng.uniform(0.6, 0.9))
+            phosphorus = float(rng.uniform(0.4, 0.7))
+        elif name in ("desert", "tundra", "deep_ocean", "volcanic_vent"):
+            nitrogen = float(rng.uniform(0.1, 0.3))
+            phosphorus = float(rng.uniform(0.05, 0.2))
+        else:
+            nitrogen = float(rng.uniform(0.3, 0.7))
+            phosphorus = float(rng.uniform(0.2, 0.5))
+
         return Biome(
             lid=lid,
             name=name,
             vegetation=vegetation,
             detritus=float(rng.uniform(0, 50)),
             solar=solar,
+            nitrogen=nitrogen,
+            phosphorus=phosphorus,
             env=env,
         )

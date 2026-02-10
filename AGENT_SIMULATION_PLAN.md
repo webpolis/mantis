@@ -91,7 +91,7 @@ The MANTIS evolution simulator (`mantis/simulation/`) operates entirely at **pop
 
 ```
 mantis/simulation/
-├── constants.py        # Body plans, traits, brain tax, epochs
+├── constants.py        # Body plans, traits, brain tax, epochs, nutrients, disease, catastrophe, diet affinity
 ├── species.py          # TraitDistribution, DietVector, BodyPlan, Species
 ├── biome.py            # Biome with abstract resources
 ├── engine.py           # World simulation loop
@@ -102,7 +102,7 @@ mantis/simulation/
 
 | Aspect | Current State |
 |---|---|
-| **Biomes** | Abstract resources only (no x, y coordinates) |
+| **Biomes** | Abstract resources with nutrient cycling (N, P fields limit vegetation growth; no x, y coordinates) |
 | **Populations** | Range from 2 to 10,000+ per species |
 | **Typical world** | 2-5 biomes, 3-8 species, 100-200 generations |
 | **File size** | ~679MB for 10,000 worlds (67KB per world) |

@@ -12,12 +12,16 @@ Everything derives from energy flow. Species don't have abstract "fitness" — t
 
 ```
 E_income  = energy from feeding (photosynthesis, grazing, hunting, scavenging)
+            × digestive_affinity (body plan / diet match)
+            × nutrient_factor (min(N, P) for producers)
 E_cost    = basal_metabolism + movement + trait_maintenance + brain_tax
 E_balance = E_income - E_cost
 
 surplus  → fat storage or reproduction
 deficit  → burn stores, then population decline
 ```
+
+Energy income is modulated by two factors: **digestive affinity** (a grazer eating meat gets only 40% efficiency) and **nutrient availability** (producers limited by `min(nitrogen, phosphorus)` in their biome). Nutrients cycle back through decomposer activity on detritus.
 
 Intelligence is expensive (brain tax scales with cognitive tier). A species can't evolve `intel` without a calorie-dense food source, which naturally gates cognition to efficient omnivores/predators.
 
@@ -97,7 +101,8 @@ The simulator outputs structured text consumed by `TextDataset` in `train.py`. T
 
 ```
 =EPOCH:2|TICK_SCALE:10gen|W42
-@BIO|L0:shallows(veg=0.8,det=120)|L1:reef(veg=0.3)
+@EVT|WORLD|catastrophe|volcanic_winter|dur=8
+@BIO|L0:shallows(veg=0.8,det=120,N=0.6,P=0.4)|L1:reef(veg=0.3,det=5,N=0.3,P=0.2)
 @SP|S0|L0|plan=sessile_auto|pop=8200±900|diet={solar:1.0}
   T:size=2.1±0.4,photosynth=6.8±0.9
   E:in=4200,out=1800,store=6400|repro=r(rate=0.3)
@@ -105,6 +110,7 @@ The simulator outputs structured text consumed by `TextDataset` in `train.py`. T
   T:speed=6.2±0.9,intel=2.1±0.6
 @INT|S3 hunt S1|success=0.62|S1:pop-=35|S3:E+=420
 @EVT|S3|trait_emerge|social=1.5±0.8
+@EVT|S1|disease|plague|pop-=200
 ---
 ```
 
@@ -114,18 +120,20 @@ Int-scaled values, space-separated, ~40% fewer tokens:
 
 ```
 =EPOCH 2 10 W42
-@BIO L0 shallows 80 120 L1 reef 30 0
+@BIO L0 shallows 80 120 N6 P4 L1 reef 30 0 N3 P2
 @SP S0 L0 sessile_auto 8200 D sol 100
   T size 21±4 photosynth 68±9
   E 4200 1800 6400 r 3
 @SP S3 L1 predator 40 D S1 70 det 10
   T speed 62±9 intel 21±6
 @INT S3 hunt S1 62 S1 p-35
+@EVT WORLD catastrophe volcanic_winter dur 8
 @EVT S3 M+ social 15±8
+@EVT S1 disease plague p-200
 ---
 ```
 
-v2 scaling rules: traits ×10, diet proportions ×100, vegetation ×100, success ×100, repro rate ×10. Diet abbreviations: `detritus`→`det`, `plant`→`plt`, `solar`→`sol`.
+v2 scaling rules: traits ×10, diet proportions ×100, vegetation ×100, success ×100, repro rate ×10, nutrients (N/P) ×10. Diet abbreviations: `detritus`→`det`, `plant`→`plt`, `solar`→`sol`.
 
 ### Spotlight blocks
 
