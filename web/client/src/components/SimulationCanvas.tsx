@@ -80,9 +80,9 @@ export function SimulationCanvas({
     }
   }, [agents, interpolateDuration, updateSnapshot]);
 
-  // Rebuild biome texture when biome set changes
+  // Rebuild biome texture when biome identity or vegetation levels change
   useEffect(() => {
-    const key = biomes.map((b) => `${b.lid}:${b.name}`).join(",");
+    const key = biomes.map((b) => `${b.lid}:${b.name}:${b.vegetation.toFixed(2)}`).join(",");
     if (key !== biomeKeyRef.current) {
       biomeKeyRef.current = key;
       biomeTextureRef.current = buildBiomeTexture(biomes, CANVAS_SIZE);

@@ -100,11 +100,13 @@ export function buildBiomeTexture(
 
       const biome = biomeMap.get(bestLid);
       const tint = biome ? (BIOME_TINTS[biome.name] || [80, 80, 80, 0.1]) : [80, 80, 80, 0.1];
+      // Modulate alpha by vegetation — richer biomes show stronger color
+      const vegFactor = biome ? 0.5 + 0.5 * Math.min(1, biome.vegetation) : 0.5;
       const idx = (py * GRID_RES + px) * 4;
       data[idx] = tint[0];
       data[idx + 1] = tint[1];
       data[idx + 2] = tint[2];
-      data[idx + 3] = Math.round(tint[3] * 255);
+      data[idx + 3] = Math.round(tint[3] * vegFactor * 255);
     }
   }
 
