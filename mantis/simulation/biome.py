@@ -60,6 +60,18 @@ class Biome:
         """Add detritus from dead organisms."""
         self.detritus += max(0.0, amount)
 
+    def consume_vegetation(self, amount: float) -> float:
+        """Consume vegetation and return actual amount taken."""
+        taken = min(amount, self.vegetation)
+        self.vegetation -= taken
+        return taken
+
+    def consume_detritus(self, amount: float) -> float:
+        """Consume detritus and return actual amount taken."""
+        taken = min(amount, self.detritus)
+        self.detritus -= taken
+        return taken
+
     def init_vegetation_patches(self, rng: np.random.Generator, world_size: int, n_patches: int = 8) -> None:
         """Create spatial vegetation patches for agent-based simulation."""
         self.vegetation_patches = [

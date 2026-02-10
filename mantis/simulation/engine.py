@@ -180,6 +180,10 @@ class World:
         # Epoch transition flag for serializer
         self.epoch_just_changed = False
 
+        # Per-tick caches
+        self._biome_cache: dict[int, list[Biome]] = {}
+        self._species_by_sid: dict[int, Species] = {sp.sid: sp for sp in self.species}
+
     def _create_primordial_species(self) -> Species:
         """Create a species with a primordial body plan."""
         plan_name = str(self.rng.choice(PRIMORDIAL_PLANS))
@@ -232,6 +236,10 @@ class World:
         self.energy_log.clear()
         self.epoch_just_changed = False
 
+        # Per-tick caches (cleared each tick)
+        self._biome_cache: dict[int, list[Biome]] = {}
+        self._species_by_sid: dict[int, Species] = {sp.sid: sp for sp in self.species}
+
         alive = [sp for sp in self.species if sp.alive]
         if not alive:
             return
@@ -280,39 +288,47 @@ class World:
 
     def _compute_energy(self, alive: list[Species]) -> None:
         """Compute E_income and E_cost for each species."""
-        for sp in alive:
+        # Shuffle feeding order so no species consistently drains biomes first
+        feeding_order = list(alive)
+        self.rng.shuffle(feeding_order)
+        for sp in feeding_order:
             e_income = self._compute_income(sp)
             e_cost = self._compute_cost(sp)
             self.energy_log[sp.sid] = (e_income, e_cost)
 
     def _compute_income(self, sp: Species) -> float:
-        """Energy income from feeding based on diet vector and biome resources."""
+        """Energy income from non-predation feeding.
+
+        Predation income is excluded — it comes solely from successful
+        hunts in _resolve_predation to avoid double-counting.
+        Per-biome contributions are divided by biome count (population split).
+        Consumption depletes biome vegetation and detritus as a side effect.
+        """
         income = 0.0
-        diet = sp.diet.sources()
+        diet = sp.diet._d  # read-only access, avoid dict copy
         size_mean = sp.traits["size"].mean if "size" in sp.traits else 1.0
+        biomes = self._species_biomes(sp)
+        n_biomes = max(1, len(biomes))
+        pop_per_biome = sp.population / n_biomes
 
         for source, proportion in diet.items():
             if source == "solar":
-                # Solar income from biomes where present
                 photo = sp.traits["photosynth"].mean if "photosynth" in sp.traits else 0.0
-                for biome in self._species_biomes(sp):
-                    income += proportion * biome.solar * photo * 100.0
+                for biome in biomes:
+                    income += proportion * biome.solar * photo * 100.0 / n_biomes
             elif source == "plant":
-                for biome in self._species_biomes(sp):
-                    income += proportion * biome.vegetation * size_mean * 80.0
+                for biome in biomes:
+                    income += proportion * biome.vegetation * size_mean * 80.0 / n_biomes
+                    # Deplete vegetation from grazing (population-proportional)
+                    grazing = proportion * size_mean * pop_per_biome * 0.00005
+                    biome.vegetation = max(0.0, biome.vegetation - grazing)
             elif source == "detritus":
-                for biome in self._species_biomes(sp):
-                    income += proportion * min(biome.detritus, sp.population * 0.1) * 50.0
-            elif source.startswith("S"):
-                # Predation income — uses trophic efficiency
-                try:
-                    prey_sid = int(source[1:])
-                    prey = next((s for s in self.species if s.sid == prey_sid and s.alive), None)
-                    if prey:
-                        prey_biomass = prey.population * (prey.traits["size"].mean if "size" in prey.traits else 1.0)
-                        income += proportion * prey_biomass * TROPHIC_EFFICIENCY * 100.0
-                except (ValueError, StopIteration):
-                    pass
+                for biome in biomes:
+                    consumable = min(biome.detritus, pop_per_biome * 0.1)
+                    income += proportion * consumable * 50.0
+                    # Deplete detritus that was consumed
+                    biome.detritus = max(0.0, biome.detritus - consumable * proportion)
+            # Predation: energy comes from _resolve_predation only
 
         return income
 
@@ -338,8 +354,13 @@ class World:
         return basal + brain + movement
 
     def _species_biomes(self, sp: Species) -> list[Biome]:
-        """Get biomes where a species is present."""
-        return [b for b in self.biomes if f"L{b.lid}" in sp.locations]
+        """Get biomes where a species is present (cached per tick)."""
+        cached = self._biome_cache.get(sp.sid)
+        if cached is not None:
+            return cached
+        result = [b for b in self.biomes if f"L{b.lid}" in sp.locations]
+        self._biome_cache[sp.sid] = result
+        return result
 
     # ------------------------------------------------------------------
     # Interactions
@@ -349,15 +370,14 @@ class World:
         """Resolve predation, competition, and symbiosis between species."""
         # Predation
         for sp in alive:
-            diet = sp.diet.sources()
-            for source, proportion in diet.items():
+            for source, proportion in sp.diet._d.items():
                 if source.startswith("S") and proportion > 0.1:
                     try:
                         prey_sid = int(source[1:])
-                        prey = next((s for s in alive if s.sid == prey_sid), None)
-                        if prey and self._share_biome(sp, prey):
+                        prey = self._species_by_sid.get(prey_sid)
+                        if prey and prey.alive and self._share_biome(sp, prey):
                             self._resolve_predation(sp, prey, proportion)
-                    except (ValueError, StopIteration):
+                    except ValueError:
                         pass
 
         # Competition (species in same biome with overlapping diets)
@@ -506,8 +526,8 @@ class World:
                         for biome in self._species_biomes(sp):
                             biome.add_detritus(loss * size * 0.5)
 
-            # Population floor
-            if sp.alive and sp.population < 2:
+            # Population floor — only for viable species with energy reserves
+            if sp.alive and sp.population < 2 and sp.energy_store > 0:
                 sp.population = 2
 
     # ------------------------------------------------------------------
@@ -680,7 +700,7 @@ class World:
                 s for s in alive
                 if s.sid != sp.sid
                 and self._share_biome(sp, s)
-                and f"S{s.sid}" not in sp.diet.sources()
+                and f"S{s.sid}" not in sp.diet._d
                 and s.population > 50
             ]
             # Prefer smaller prey
@@ -698,21 +718,21 @@ class World:
                     sp.diet.add_source(f"S{prey.sid}", init_prop)
 
         # Grazers/scavengers might start eating detritus
-        if sp.body_plan.name == "grazer" and "detritus" not in sp.diet.sources():
+        if sp.body_plan.name == "grazer" and "detritus" not in sp.diet._d:
             if self.rng.random() < 0.1:
                 sp.diet.add_source("detritus", 0.05)
 
         # Filter feeders/decomposers might discover plant matter
-        if sp.body_plan.name in ("filter_feeder", "decomposer") and "plant" not in sp.diet.sources():
+        if sp.body_plan.name in ("filter_feeder", "decomposer") and "plant" not in sp.diet._d:
             if self.rng.random() < 0.05:
                 sp.diet.add_source("plant", 0.05)
 
         # Clean up dead prey from diet
-        for source in list(sp.diet.sources().keys()):
+        for source in list(sp.diet._d.keys()):
             if source.startswith("S"):
                 try:
                     prey_sid = int(source[1:])
-                    prey = next((s for s in self.species if s.sid == prey_sid), None)
+                    prey = self._species_by_sid.get(prey_sid)
                     if prey is None or not prey.alive:
                         sp.diet.remove_source(source)
                 except ValueError:
@@ -732,7 +752,11 @@ class World:
         for sp in alive:
             if sp.population > 500 and sp.energy_store > 0 and self.rng.random() < spec_prob:
                 child = self._branch_species(sp)
+                # Subtract child population from parent (conservation of individuals)
+                sp.population -= child.population
+                sp.energy_store = max(0.0, sp.energy_store - child.energy_store)
                 self.species.append(child)
+                self._species_by_sid[child.sid] = child
                 self.goals[child.sid] = str(self.rng.choice(GOALS[:8]))
                 self.events.setdefault(sp.sid, []).append(f"speciation:S{child.sid}")
                 break  # max one speciation per tick
@@ -853,6 +877,7 @@ class World:
                 if len(self.biomes) > 1:
                     target_biome = self.rng.choice([b for b in self.biomes if f"L{b.lid}" not in sp.locations] or self.biomes)
                     sp.locations.add(f"L{target_biome.lid}")
+                    self._biome_cache.pop(sp.sid, None)  # invalidate cache
                     effect_parts.append(f"loc+={{L{target_biome.lid}:60}}")
             effect_parts.append(f"H{actor.hid}:inf+={float(self.rng.uniform(-0.5, 1.0)):.1f}")
             effect_str = "|".join(effect_parts)

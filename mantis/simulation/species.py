@@ -132,7 +132,8 @@ class DietVector:
         return self._d.get(source, default)
 
     def sources(self) -> dict[str, float]:
-        return dict(self._d)
+        """Read-only access to internal sources dict. Callers must not modify."""
+        return self._d
 
     def get_category_totals(self) -> dict[str, float]:
         """Aggregate into high-level categories for body plan checks."""

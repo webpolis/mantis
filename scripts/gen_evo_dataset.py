@@ -11,7 +11,10 @@ Usage:
 """
 
 import argparse
+import os
+import shutil
 import sys
+import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -29,7 +32,6 @@ def _import_simulation():
         return _sim_cache
 
     import importlib.util
-    import os
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     sim_path = os.path.join(base, "mantis", "simulation")
 
@@ -56,8 +58,13 @@ def _import_simulation():
 
 def simulate_world(wid: int, seed: int, max_gens: int, keyframe_interval: int,
                    enable_agents: bool = False, agent_epoch: str = "INTELLIGENCE",
-                   agent_threshold: float = 15.0, compact: bool = False):
-    """Run one world simulation. Standalone function for process pool."""
+                   agent_threshold: float = 15.0, compact: bool = False,
+                   output_file: str | None = None):
+    """Run one world simulation. Standalone function for process pool.
+
+    When output_file is provided, streams text to that file instead of
+    accumulating in memory (avoids large IPC payloads in parallel mode).
+    """
     sim = _import_simulation()
     World = sim.World
     Serializer = sim.Serializer
@@ -66,17 +73,29 @@ def simulate_world(wid: int, seed: int, max_gens: int, keyframe_interval: int,
                   agent_epoch=agent_epoch, agent_threshold=agent_threshold)
     serializer = Serializer(keyframe_interval=keyframe_interval, compact=compact)
 
-    blocks = []
-    for _ in range(max_gens):
-        world.step()
-        block = serializer.serialize_tick(world)
-        blocks.append(block)
+    f = open(output_file, "w") if output_file else None
+    try:
+        blocks = [] if f is None else None
+        for _ in range(max_gens):
+            world.step()
+            block = serializer.serialize_tick(world)
+            if f is not None:
+                f.write(block)
+                f.write("\n")
+            else:
+                blocks.append(block)
 
-        # Stop early if all species are dead
-        if not any(sp.alive for sp in world.species):
-            break
+            # Stop early if all species are dead
+            if not any(sp.alive for sp in world.species):
+                break
 
-    text = "\n".join(blocks) + "\n"
+        if f is not None:
+            f.write("\n")  # blank line = EOS boundary
+        else:
+            text = "\n".join(blocks) + "\n"
+    finally:
+        if f is not None:
+            f.close()
 
     stats = {
         "wid": wid,
@@ -88,6 +107,8 @@ def simulate_world(wid: int, seed: int, max_gens: int, keyframe_interval: int,
         "spotlights": sum(1 for sp in world.species if sp.alive and sp.spotlight_score() > 15),
     }
 
+    if output_file:
+        return output_file, stats
     return text, stats
 
 
@@ -122,7 +143,7 @@ def generate_dataset(args):
 
     with open(output, "w") as f:
         if args.workers <= 1:
-            # Sequential — flush after each world
+            # Sequential — stream directly, no temp files needed
             for i, (wid, seed) in enumerate(zip(range(args.worlds), world_seeds)):
                 text, stats = simulate_world(wid, seed, args.max_generations, args.keyframe_interval, **agent_kwargs)
                 f.write(text + "\n")  # blank line = EOS boundary between worlds
@@ -140,42 +161,54 @@ def generate_dataset(args):
                         f"tier={stats['max_tier']} ({rate:.1f} worlds/s)"
                     )
         else:
-            # Parallel — stream to disk in world-order as results arrive
-            pending = {}  # wid -> text for out-of-order completions
-            next_wid = 0
+            # Parallel — workers write to temp files, main process concatenates
+            tmpdir = tempfile.mkdtemp(prefix="mantis_evo_")
+            try:
+                pending_files = {}  # wid -> tmp file path
+                next_wid = 0
 
-            def flush_pending():
-                nonlocal next_wid
-                while next_wid in pending:
-                    f.write(pending.pop(next_wid))
-                    next_wid += 1
-                f.flush()
+                def flush_pending():
+                    nonlocal next_wid
+                    while next_wid in pending_files:
+                        tmp_path = pending_files.pop(next_wid)
+                        with open(tmp_path, "r") as tmp_f:
+                            shutil.copyfileobj(tmp_f, f)
+                        os.unlink(tmp_path)
+                        next_wid += 1
+                    f.flush()
 
-            with ProcessPoolExecutor(max_workers=args.workers) as pool:
-                futures = {
-                    pool.submit(simulate_world, wid, seed, args.max_generations,
-                                args.keyframe_interval, **agent_kwargs): wid
-                    for wid, seed in zip(range(args.worlds), world_seeds)
-                }
+                with ProcessPoolExecutor(max_workers=args.workers) as pool:
+                    futures = {
+                        pool.submit(
+                            simulate_world, wid, seed, args.max_generations,
+                            args.keyframe_interval,
+                            output_file=os.path.join(tmpdir, f"w{wid}.txt"),
+                            **agent_kwargs,
+                        ): wid
+                        for wid, seed in zip(range(args.worlds), world_seeds)
+                    }
 
-                done_count = 0
-                for future in as_completed(futures):
-                    wid = futures[future]
-                    text, stats = future.result()
-                    pending[wid] = text + "\n"
-                    flush_pending()
+                    done_count = 0
+                    for future in as_completed(futures):
+                        wid = futures[future]
+                        tmp_path, stats = future.result()
+                        pending_files[wid] = tmp_path
+                        flush_pending()
 
-                    accumulate_stats(stats)
+                        accumulate_stats(stats)
 
-                    done_count += 1
-                    if args.verbose and done_count % max(1, args.worlds // 20) == 0:
-                        pct = done_count / args.worlds * 100
-                        elapsed = time.time() - t0
-                        rate = done_count / elapsed
-                        print(
-                            f"  [{pct:5.1f}%] {done_count}/{args.worlds} done, "
-                            f"{next_wid} written ({rate:.1f} worlds/s)"
-                        )
+                        done_count += 1
+                        if args.verbose and done_count % max(1, args.worlds // 20) == 0:
+                            pct = done_count / args.worlds * 100
+                            elapsed = time.time() - t0
+                            rate = done_count / elapsed
+                            print(
+                                f"  [{pct:5.1f}%] {done_count}/{args.worlds} done, "
+                                f"{next_wid} written ({rate:.1f} worlds/s)"
+                            )
+            finally:
+                # Clean up any remaining temp files
+                shutil.rmtree(tmpdir, ignore_errors=True)
 
     elapsed = time.time() - t0
     tier_names = ["Physical", "Behavioral", "Cognitive", "Cultural", "Abstract"]
