@@ -19,11 +19,16 @@ const STATE_BORDER_COLORS: Record<string, string> = {
   flock: "#44aaff",
 };
 
+function agentRadius(count: number): number {
+  return Math.max(2, Math.min(8, Math.sqrt(count || 1) * 2));
+}
+
 export function renderAgents(
   ctx: CanvasRenderingContext2D,
   agents: AgentSnapshot[],
   species: SpeciesInfo[],
-  worldSize: number
+  worldSize: number,
+  hoveredAid?: number | null
 ) {
   const scale = ctx.canvas.width / worldSize;
   const speciesMap = new Map(species.map((s) => [s.sid, s]));
@@ -38,8 +43,7 @@ export function renderAgents(
     const y = agent.y * scale;
 
     const color = BODY_PLAN_COLORS[bodyPlan] || "#aaaaaa";
-    const agentCount = agent.count || 1;
-    const radius = Math.max(2, Math.min(8, Math.sqrt(agentCount) * 2));
+    const radius = agentRadius(agent.count);
 
     // State indicator border
     const borderColor = STATE_BORDER_COLORS[agent.state];
@@ -48,6 +52,15 @@ export function renderAgents(
       ctx.lineWidth = 2;
       ctx.beginPath();
       ctx.arc(x, y, radius + 2, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // Hover highlight
+    if (agent.aid === hoveredAid) {
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(x, y, radius + 4, 0, Math.PI * 2);
       ctx.stroke();
     }
 
@@ -70,6 +83,34 @@ export function renderAgents(
       );
     }
   }
+}
+
+export function findAgentAt(
+  canvasX: number,
+  canvasY: number,
+  agents: AgentSnapshot[],
+  worldSize: number,
+  canvasSize: number
+): AgentSnapshot | null {
+  const scale = canvasSize / worldSize;
+  const hitSlop = 4;
+  let closest: AgentSnapshot | null = null;
+  let closestDist = Infinity;
+
+  for (const agent of agents) {
+    if (agent.dead) continue;
+    const ax = agent.x * scale;
+    const ay = agent.y * scale;
+    const radius = agentRadius(agent.count);
+    const dx = canvasX - ax;
+    const dy = canvasY - ay;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist <= radius + hitSlop && dist < closestDist) {
+      closest = agent;
+      closestDist = dist;
+    }
+  }
+  return closest;
 }
 
 export function renderGrid(
