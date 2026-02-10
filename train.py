@@ -943,10 +943,10 @@ def train(args):
                     accelerator.clip_grad_norm_(model.parameters(), args.grad_clip)
 
                 optimizer.step()
-                scheduler.step()
                 optimizer.zero_grad()
 
                 if accelerator.sync_gradients:
+                    scheduler.step()
                     optimizer_step += 1
 
             epoch_loss += lm_loss.item()
