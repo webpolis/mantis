@@ -124,42 +124,74 @@ def estimate_training_vram(
         optim_bytes //= shard
         grad_bytes //= shard
 
-    cuda_overhead = 200 * 1024 * 1024  # ~200 MB (CUDA context + allocator bookkeeping)
+    cuda_overhead = 300 * 1024 * 1024  # ~300 MB (CUDA context + allocator + fragmentation)
 
-    fixed = model_bytes + optim_bytes + grad_bytes + cuda_overhead
+    # DeepSpeed allocates large communication buffers (reduce_bucket, allgather)
+    # and FP16 parameter copies for mixed-precision forward/backward.
+    ds_buffer_bytes = 0
+    if deepspeed_zero_stage > 0:
+        # FP16 parameter copy for mixed-precision forward
+        ds_buffer_bytes += n_params * 2
+        # Gradient reduction bucket (default reduce_bucket_size=5e8 elements, FP16)
+        # Capped at model size to avoid over-counting for small models
+        reduce_bucket = min(int(5e8) * 2, n_params * 2)
+        ds_buffer_bytes += reduce_bucket
+
+    fixed = model_bytes + optim_bytes + grad_bytes + cuda_overhead + ds_buffer_bytes
 
     # --- Variable costs (per sample) ---
 
     # Bytes per activation element
     act_elem = 2 if mixed_precision else 4
 
+    # Per-layer forward activation elements
+    per_layer_acts = (
+        3 * seq_len * D      # Q, K, V
+        + H * seq_len * seq_len  # attention scores
+        + seq_len * D        # attention output
+        + K * seq_len * F    # MoE FFN intermediate
+        + K * seq_len * D    # MoE FFN output
+        + 4 * seq_len * D    # norms, residuals, masks
+    )
+
+    # Autograd-saved tensors beyond forward activations:
+    # nn.Linear saves its input for weight gradient (dW = input^T @ grad_output)
+    # GELU saves its input for backward derivative computation
+    autograd_extras = (
+        seq_len * D          # attn in_proj input
+        + seq_len * D        # attn out_proj input
+        + seq_len * D        # MoE gate input
+        + K * seq_len * D    # expert w1 inputs
+        + K * seq_len * F    # expert w2 inputs
+        + K * seq_len * F    # GELU input saves
+    )
+
+    # Total per-layer: forward acts × 2 (gradients + saved outputs) + extra autograd saves
+    per_layer_total = per_layer_acts * 2 + autograd_extras
+
     if gradient_checkpointing:
-        # Only save layer boundary activations + one full layer recompute
-        # Boundary saves: L layers × seq_len × D
+        # Boundary saves: input to each layer (L × seq_len × D)
         boundary = L * seq_len * D * act_elem
-        # One full layer recompute during backward:
-        #   attention Q/K/V + scores + output + MoE intermediates
-        one_layer = (
-            3 * seq_len * D  # Q, K, V
-            + H * seq_len * seq_len  # attention scores
-            + seq_len * D  # attention output
-            + K * seq_len * F  # MoE FFN intermediate
-            + K * seq_len * D  # MoE FFN output
-            + 4 * seq_len * D  # norms, residuals
-        ) * act_elem
-        activation_per_sample = boundary + one_layer
+        # During backward, one layer is recomputed with autograd enabled.
+        # Peak = full forward + autograd saves for that single layer.
+        one_layer_peak = per_layer_total * act_elem
+        activation_per_sample = boundary + one_layer_peak
     else:
-        # Full activation storage per layer + autograd tape (~2×)
-        per_layer_acts = (
-            3 * seq_len * D  # Q, K, V
-            + H * seq_len * seq_len  # attention scores
-            + seq_len * D  # attention output
-            + K * seq_len * F  # MoE FFN intermediate
-            + K * seq_len * D  # MoE FFN output
-            + 4 * seq_len * D  # norms, residuals, masks
-        )
-        # Autograd tape roughly doubles activation storage
-        activation_per_sample = L * per_layer_acts * 2 * act_elem
+        # Full activation storage: all L layers
+        activation_per_sample = L * per_layer_total * act_elem
+
+    # Overhead multiplier for costs not captured by the analytical formula:
+    # - PyTorch allocator block rounding and fragmentation (~10%)
+    # - Autograd graph node metadata (~5%)
+    # - Transient backward temporaries (matmul intermediates, grad tensors)
+    # DeepSpeed adds extra overhead: allgather/reduce-scatter communication
+    # buffers, temporary FP16 weight copies during forward/backward, and
+    # gradient bucketing temporaries.
+    if deepspeed_zero_stage > 0:
+        overhead = 1.35
+    else:
+        overhead = 1.15
+    activation_per_sample = int(activation_per_sample * overhead)
 
     # Input tensors: input_ids + labels (int64)
     input_per_sample = seq_len * 8 * 2
@@ -175,6 +207,7 @@ def estimate_training_vram(
         'model_weights': model_bytes,
         'optimizer_state': optim_bytes,
         'gradients': grad_bytes,
+        'deepspeed_buffers': ds_buffer_bytes,
         'activations': per_sample * batch_size,
         'cuda_overhead': cuda_overhead,
         'total': total,
@@ -284,6 +317,8 @@ def format_vram_summary(config, seq_len, gpu_infos, batch_sizes, est, safety_mar
     lines.append(f"  Model weights:    {format_bytes(est['model_weights'])}")
     lines.append(f"  Optimizer state:  {format_bytes(est['optimizer_state'])}")
     lines.append(f"  Gradients:        {format_bytes(est['gradients'])}")
+    if est.get('deepspeed_buffers', 0) > 0:
+        lines.append(f"  DeepSpeed bufs:   {format_bytes(est['deepspeed_buffers'])}")
     lines.append(f"  CUDA overhead:    {format_bytes(est['cuda_overhead'])}")
     lines.append(f"  Fixed total:      {format_bytes(est['fixed'])}")
     lines.append(f"  Per-sample:       {format_bytes(est['per_sample'])}")

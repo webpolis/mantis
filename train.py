@@ -36,6 +36,11 @@ import subprocess
 os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ["NCCL_IB_DISABLE"] = "1"
 
+# Enable expandable segments to reduce CUDA memory fragmentation.
+# Without this, PyTorch's caching allocator can fail to serve large contiguous
+# allocations even when total free memory is sufficient (reserved-but-fragmented).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 # Detect and fix RTX 3060 cuBLAS bug
 # RTX 3060 (and some other Ampere GPUs) have a cuBLASLt kernel bug with large matrices
 # that causes CUBLAS_STATUS_NOT_INITIALIZED at specific sequence lengths
@@ -389,6 +394,27 @@ def resolve_model_config(args, tokenizer, accelerator):
     return config, checkpoint
 
 
+def _detect_pretokenized_seq_len(dataset_path):
+    """
+    Detect the actual seq_len baked into a pretokenized dataset.
+
+    Checks preprocessing_config.json first (written by preprocess_data.py),
+    falls back to peeking at the first sample's input_ids length.
+    Returns None if detection fails.
+    """
+    import json
+    config_path = os.path.join(dataset_path, 'preprocessing_config.json')
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            return json.load(f).get('seq_len')
+
+    # Fallback: peek at first sample (fast — HF datasets are memory-mapped)
+    try:
+        ds = load_from_disk(dataset_path)
+        return len(ds[0]['input_ids'])
+    except Exception:
+        return None
+
 
 def load_or_create_tokenizer(tokenizer_path=None):
     """
@@ -492,6 +518,16 @@ def train(args):
     # Resolve model config early; also keeps loaded checkpoint for reuse during resume
     config, preloaded_checkpoint = resolve_model_config(args, tokenizer, accelerator)
 
+    # Detect actual seq_len from pretokenized dataset (may differ from --seq-len)
+    effective_seq_len = args.seq_len
+    if args.pretokenized and args.train_file:
+        detected_seq_len = _detect_pretokenized_seq_len(args.train_file)
+        if detected_seq_len is not None and detected_seq_len != args.seq_len:
+            if accelerator.is_main_process:
+                print(f"⚠️  Pretokenized data has seq_len={detected_seq_len}, "
+                      f"overriding --seq-len={args.seq_len} for VRAM estimation")
+            effective_seq_len = detected_seq_len
+
     # Determine DeepSpeed ZeRO stage for VRAM estimation
     deepspeed_zero_stage = 0
     if use_deepspeed and accelerator.state.deepspeed_plugin is not None:
@@ -512,7 +548,7 @@ def train(args):
 
         optimal_batch_sizes = compute_optimal_batch_sizes(
             config.base_moe,
-            args.seq_len,
+            effective_seq_len,
             [gpu_vram],
             safety_margin=0.85,
             mixed_precision=args.mixed_precision,
@@ -528,7 +564,7 @@ def train(args):
         if accelerator.is_main_process:
             est = estimate_training_vram(
                 config.base_moe,
-                args.seq_len,
+                effective_seq_len,
                 batch_size=1,
                 mixed_precision=args.mixed_precision,
                 gradient_checkpointing=args.gradient_checkpointing,
@@ -536,9 +572,7 @@ def train(args):
                 deepspeed_zero_stage=deepspeed_zero_stage,
                 num_gpus=accelerator.num_processes,
             )
-            # Gather GPU info from all processes would require communication;
-            # for the summary, just show this GPU's info
-            print(f"\n{format_vram_summary(config.base_moe, args.seq_len, [(gpu_name, gpu_vram)], [optimal_bs], est)}")
+            print(f"\n{format_vram_summary(config.base_moe, effective_seq_len, [(gpu_name, gpu_vram)], [optimal_bs], est)}")
 
         original_batch_size = args.batch_size
         args.batch_size = optimal_bs

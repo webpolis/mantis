@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import json
 from pathlib import Path
 from datasets import load_dataset
 from mantis.tokenizer import MANTISTokenizer
@@ -106,6 +107,11 @@ def preprocess_dataset(input_file, output_path, tokenizer, seq_len, stride, num_
     # Save to disk
     print(f"\nSaving tokenized dataset to {output_path}...")
     tokenized_dataset.save_to_disk(output_path)
+
+    # Save preprocessing config so train.py can read actual seq_len/stride
+    config_path = Path(output_path) / "preprocessing_config.json"
+    with open(config_path, 'w') as f:
+        json.dump({"seq_len": seq_len, "stride": stride}, f)
 
     # Show stats
     total_tokens = len(tokenized_dataset) * seq_len
