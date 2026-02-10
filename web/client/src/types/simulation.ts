@@ -76,6 +76,7 @@ export interface WorldList {
   file: string;
   world_count: number;
   worlds_with_agents: number[];
+  worlds_with_spotlights: number[];
 }
 
 export interface ModelFile {

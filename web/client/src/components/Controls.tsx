@@ -11,6 +11,7 @@ interface Props {
   selectedFile: string | null;
   worldCount: number;
   worldsWithAgents: number[];
+  worldsWithSpotlights: number[];
   selectedWorld: number;
   onSelectFile: (name: string) => void;
   onSelectWorld: (index: number) => void;
@@ -35,6 +36,7 @@ export function Controls({
   selectedFile,
   worldCount,
   worldsWithAgents,
+  worldsWithSpotlights,
   selectedWorld,
   onSelectFile,
   onSelectWorld,
@@ -43,26 +45,45 @@ export function Controls({
   onSelectModel,
 }: Props) {
   const [filterAgents, setFilterAgents] = useState(false);
+  const [filterSpotlights, setFilterSpotlights] = useState(false);
 
-  const handleFilterToggle = () => {
-    const next = !filterAgents;
-    setFilterAgents(next);
-    if (next && worldsWithAgents.length > 0 && !worldsWithAgents.includes(selectedWorld)) {
-      onSelectWorld(worldsWithAgents[0]);
+  // Compute the set of worlds matching all active filters
+  const filteredWorlds = (() => {
+    if (!filterAgents && !filterSpotlights) return null;
+    let set = new Set(Array.from({ length: worldCount }, (_, i) => i));
+    if (filterAgents) set = new Set([...set].filter((i) => worldsWithAgents.includes(i)));
+    if (filterSpotlights) set = new Set([...set].filter((i) => worldsWithSpotlights.includes(i)));
+    return [...set].sort((a, b) => a - b);
+  })();
+
+  const handleFilterToggle = (kind: "agents" | "spotlights") => {
+    const nextAgents = kind === "agents" ? !filterAgents : filterAgents;
+    const nextSpotlights = kind === "spotlights" ? !filterSpotlights : filterSpotlights;
+    if (kind === "agents") setFilterAgents(nextAgents);
+    else setFilterSpotlights(nextSpotlights);
+
+    // Compute new filtered set and snap if needed
+    if (nextAgents || nextSpotlights) {
+      let set = new Set(Array.from({ length: worldCount }, (_, i) => i));
+      if (nextAgents) set = new Set([...set].filter((i) => worldsWithAgents.includes(i)));
+      if (nextSpotlights) set = new Set([...set].filter((i) => worldsWithSpotlights.includes(i)));
+      const sorted = [...set].sort((a, b) => a - b);
+      if (sorted.length > 0 && !sorted.includes(selectedWorld)) {
+        onSelectWorld(sorted[0]);
+      }
     }
   };
 
   const handleWorldChange = (value: number) => {
-    if (filterAgents) {
+    if (filteredWorlds) {
       const clamped = Math.max(0, Math.min(value, worldCount - 1));
-      // Snap to nearest world with agents
-      if (worldsWithAgents.includes(clamped)) {
+      if (filteredWorlds.includes(clamped)) {
         onSelectWorld(clamped);
       } else {
         const direction = value >= selectedWorld ? 1 : -1;
         const next = direction === 1
-          ? worldsWithAgents.find((i) => i >= clamped)
-          : [...worldsWithAgents].reverse().find((i) => i <= clamped);
+          ? filteredWorlds.find((i) => i >= clamped)
+          : [...filteredWorlds].reverse().find((i) => i <= clamped);
         if (next !== undefined) onSelectWorld(next);
       }
     } else {
@@ -114,7 +135,7 @@ export function Controls({
                 style={{ ...selectStyle, width: "60px" }}
               />
               <span style={{ color: "#888", fontSize: "12px" }}>
-                / {filterAgents ? worldsWithAgents.length : worldCount}
+                / {filteredWorlds ? filteredWorlds.length : worldCount}
               </span>
               <label
                 style={{ display: "flex", alignItems: "center", gap: "4px", cursor: "pointer" }}
@@ -123,10 +144,22 @@ export function Controls({
                 <input
                   type="checkbox"
                   checked={filterAgents}
-                  onChange={handleFilterToggle}
+                  onChange={() => handleFilterToggle("agents")}
                   style={{ accentColor: "#e94560" }}
                 />
-                <span style={{ fontSize: "12px", color: "#aaa" }}>Has agents</span>
+                <span style={{ fontSize: "12px", color: "#aaa" }}>Agents</span>
+              </label>
+              <label
+                style={{ display: "flex", alignItems: "center", gap: "4px", cursor: "pointer" }}
+                title="Only show worlds that contain spotlight scenes"
+              >
+                <input
+                  type="checkbox"
+                  checked={filterSpotlights}
+                  onChange={() => handleFilterToggle("spotlights")}
+                  style={{ accentColor: "#e94560" }}
+                />
+                <span style={{ fontSize: "12px", color: "#aaa" }}>Spotlights</span>
               </label>
             </label>
           )}

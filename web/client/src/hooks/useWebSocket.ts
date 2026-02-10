@@ -46,6 +46,7 @@ export function useWebSocket() {
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [worldCount, setWorldCount] = useState(0);
   const [worldsWithAgents, setWorldsWithAgents] = useState<number[]>([]);
+  const [worldsWithSpotlights, setWorldsWithSpotlights] = useState<number[]>([]);
   const [selectedWorld, setSelectedWorld] = useState(0);
   const [models, setModels] = useState<ModelFile[]>([]);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
@@ -121,6 +122,7 @@ export function useWebSocket() {
     socket.on("world_list", (data: WorldList) => {
       setWorldCount(data.world_count);
       setWorldsWithAgents(data.worlds_with_agents ?? []);
+      setWorldsWithSpotlights(data.worlds_with_spotlights ?? []);
       setSelectedWorld(0);
     });
 
@@ -173,6 +175,7 @@ export function useWebSocket() {
     setSelectedFile(name);
     setWorldCount(0);
     setWorldsWithAgents([]);
+    setWorldsWithSpotlights([]);
     setSelectedWorld(0);
     socketRef.current?.emit("list_worlds", { file: name });
   }, []);
@@ -299,6 +302,7 @@ export function useWebSocket() {
     selectedFile,
     worldCount,
     worldsWithAgents,
+    worldsWithSpotlights,
     selectedWorld,
     selectFile,
     selectWorld,

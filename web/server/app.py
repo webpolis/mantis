@@ -325,10 +325,12 @@ def handle_list_worlds(data):
         text = f.read()
     worlds = split_worlds(text)
     worlds_with_agents = [i for i, w in enumerate(worlds) if "@AGENT" in w]
+    worlds_with_spotlights = [i for i, w in enumerate(worlds) if "@SPOT" in w]
     emit("world_list", {
         "file": filename,
         "world_count": len(worlds),
         "worlds_with_agents": worlds_with_agents,
+        "worlds_with_spotlights": worlds_with_spotlights,
     })
 
 

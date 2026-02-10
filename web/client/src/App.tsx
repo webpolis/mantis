@@ -21,6 +21,7 @@ function App() {
     selectedFile,
     worldCount,
     worldsWithAgents,
+    worldsWithSpotlights,
     selectedWorld,
     selectFile,
     selectWorld,
@@ -62,6 +63,7 @@ function App() {
             selectedFile={selectedFile}
             worldCount={worldCount}
             worldsWithAgents={worldsWithAgents}
+            worldsWithSpotlights={worldsWithSpotlights}
             selectedWorld={selectedWorld}
             onSelectFile={selectFile}
             onSelectWorld={selectWorld}
