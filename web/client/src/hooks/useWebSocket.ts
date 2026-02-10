@@ -71,18 +71,19 @@ export function useWebSocket() {
         ? historyRef.current[historyRef.current.length - 1].species
         : [];
 
-      // Merge species: carry forward plan/locations from previous when delta omits them
+      // Merge species: carry forward ALL previous species, overlay current tick's updates
       let mergedSpecies: SpeciesInfo[];
       if (data.species.length > 0) {
-        const prevMap = new Map(prevSpecies.map((s) => [s.sid, s]));
-        mergedSpecies = data.species.map((s) => {
-          const prev = prevMap.get(s.sid);
-          return {
+        const resultMap = new Map(prevSpecies.map((s) => [s.sid, { ...s }]));
+        for (const s of data.species) {
+          const prev = resultMap.get(s.sid);
+          resultMap.set(s.sid, {
             ...s,
             plan: s.plan || prev?.plan || "",
             locations: s.locations.length > 0 ? s.locations : prev?.locations ?? [],
-          };
-        });
+          });
+        }
+        mergedSpecies = Array.from(resultMap.values());
       } else {
         mergedSpecies = prevSpecies;
       }
