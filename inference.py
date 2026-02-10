@@ -157,7 +157,7 @@ class InferenceEngine:
             self.tokenizer = MANTISTokenizer.load(tokenizer_path)
             print(f"Tokenizer loaded from: {tokenizer_path}")
         else:
-            print("Warning: Tokenizer not found, using default GPT-2 tokenizer")
+            print("Warning: Tokenizer not found, using default tokenizer")
             self.tokenizer = MANTISTokenizer()
 
         # Print model info
@@ -210,7 +210,7 @@ class InferenceEngine:
 
         # Encode prompt
         try:
-            input_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
+            input_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
         except Exception as e:
             raise ValueError(f"Failed to tokenize prompt: {e}")
 
@@ -382,7 +382,7 @@ class InferenceEngine:
         """
         self.model.eval()
 
-        input_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
+        input_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
         input_tensor = torch.tensor([input_ids], dtype=torch.long).to(self.device)
 
         is_greedy = (temperature == 0.0)

@@ -11,7 +11,7 @@ from typing import Optional
 @dataclass
 class BaseMoEConfig:
     """Configuration for Base MoE Model."""
-    vocab_size: int = 50304
+    vocab_size: int = 512
     d_model: int = 2048
     n_layers: int = 24
     n_heads: int = 32
@@ -38,7 +38,7 @@ class MetaControllerConfig:
 @dataclass
 class CriticConfig:
     """Configuration for Critic Model."""
-    vocab_size: int = 50304
+    vocab_size: int = 512
     d_model: int = 1024
     n_layers: int = 12
     n_heads: int = 16
