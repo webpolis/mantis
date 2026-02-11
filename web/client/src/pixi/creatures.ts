@@ -4,7 +4,7 @@
  * 3 idle animation frames per plan (subtle bob/pulse/wobble).
  * Sprite object pool for rendering agents.
  */
-import { Container, Sprite, Texture, Graphics } from "pixi.js";
+import { Container, Sprite, Texture, Graphics, Text, TextStyle } from "pixi.js";
 import type { AgentSnapshot, SpeciesInfo } from "../types/simulation";
 
 const SPRITE_SIZE = 64;
@@ -43,6 +43,7 @@ interface PooledAgent {
   highlight: Graphics;
   energyBar: Graphics;
   stateRing: Graphics;
+  countLabel: Text;
   inUse: boolean;
 }
 
@@ -474,6 +475,14 @@ export function getCreatureIconDataURL(bodyPlan: string): string {
 
 const INITIAL_POOL_SIZE = 500;
 
+const COUNT_LABEL_STYLE = new TextStyle({
+  fontFamily: "Rajdhani, monospace",
+  fontSize: 11,
+  fontWeight: "700",
+  fill: "#ffffff",
+  stroke: { color: "#000000", width: 3 },
+});
+
 export class CreatureRenderer {
   private container: Container;
   private pool: PooledAgent[] = [];
@@ -502,12 +511,17 @@ export class CreatureRenderer {
       const stateRing = new Graphics();
       stateRing.visible = false;
 
+      const countLabel = new Text({ text: "", style: COUNT_LABEL_STYLE });
+      countLabel.anchor.set(0.5);
+      countLabel.visible = false;
+
       this.container.addChild(stateRing);
       this.container.addChild(sprite);
       this.container.addChild(highlight);
       this.container.addChild(energyBar);
+      this.container.addChild(countLabel);
 
-      this.pool.push({ sprite, highlight, energyBar, stateRing, inUse: false });
+      this.pool.push({ sprite, highlight, energyBar, stateRing, countLabel, inUse: false });
     }
   }
 
@@ -536,6 +550,7 @@ export class CreatureRenderer {
       p.highlight.visible = false;
       p.energyBar.visible = false;
       p.stateRing.visible = false;
+      p.countLabel.visible = false;
     }
     this.activeCount = 0;
 
@@ -594,6 +609,14 @@ export class CreatureRenderer {
         entry.energyBar.fill({ color: 0x333333, alpha: 0.5 });
         entry.energyBar.rect(barX, barY, (agent.energy / 100) * barW, barH);
         entry.energyBar.fill({ color: 0xffff00, alpha: 0.8 });
+      }
+
+      // Count badge for clusters
+      if (agent.count > 1) {
+        entry.countLabel.visible = true;
+        entry.countLabel.text = String(agent.count);
+        entry.countLabel.x = agent.x;
+        entry.countLabel.y = agent.y - SPRITE_SIZE * baseScale * 0.5 - 6;
       }
     }
   }

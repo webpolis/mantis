@@ -175,18 +175,20 @@ export class PixiApp {
     this.biomeRenderer.update(biomes);
   }
 
-  updateAgents(agents: AgentSnapshot[], species: SpeciesInfo[], hoveredUid?: string | null) {
+  updateAgents(agents: AgentSnapshot[], species: SpeciesInfo[], hoveredUid?: string | null, rawAgents?: AgentSnapshot[]) {
     if (!this.initialized || this.destroyed) return;
 
-    // Detect births/deaths for particles
+    // Detect births/deaths using raw (unclustered) agents to avoid
+    // false positives from synthetic cluster UIDs changing every frame
+    const trackingAgents = rawAgents ?? agents;
     const currentIds = new Set<string>();
-    for (const a of agents) {
+    for (const a of trackingAgents) {
       if (!a.dead) currentIds.add(a.uid);
     }
 
     for (const uid of currentIds) {
       if (!this.prevAgentIds.has(uid)) {
-        const a = agents.find((ag) => ag.uid === uid);
+        const a = trackingAgents.find((ag) => ag.uid === uid);
         if (a) this.particleSystem.emitBirth(a.x, a.y);
       }
     }

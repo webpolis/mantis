@@ -2,6 +2,7 @@ import { useEffect, useRef, useCallback, useState, useMemo } from "react";
 import type { AgentSnapshot, SpeciesInfo, BiomeData, VegetationPatchData, SimulationEvent } from "../types/simulation";
 import { useInterpolation } from "../hooks/useInterpolation";
 import { PixiApp } from "../pixi/PixiApp";
+import { clusterAgents } from "../pixi/clustering";
 import { biomeCenters } from "../pixi/biomes";
 
 interface Props {
@@ -104,18 +105,15 @@ export function SimulationCanvas({
     let raf = 0;
     const loop = () => {
       const currentAgents = isPlaying ? getInterpolated() : agents;
+      const zoom = pixi.camera?.state.zoom ?? 1;
+      const clustered = clusterAgents(currentAgents, zoom);
       const hovUid = hoveredRef.current?.type === "agent" ? hoveredRef.current.agent.uid : undefined;
-      pixi.updateAgents(currentAgents, species, hovUid);
-      if (isPlaying) raf = requestAnimationFrame(loop);
+      pixi.updateAgents(clustered, species, hovUid, currentAgents);
+      raf = requestAnimationFrame(loop);
     };
 
-    if (isPlaying) {
-      raf = requestAnimationFrame(loop);
-    } else {
-      // Static update
-      const hovUid = hoveredRef.current?.type === "agent" ? hoveredRef.current.agent.uid : undefined;
-      pixi.updateAgents(agents, species, hovUid);
-    }
+    // Always run the RAF loop so clusters update when zooming while paused
+    raf = requestAnimationFrame(loop);
 
     return () => { if (raf) cancelAnimationFrame(raf); };
   }, [agents, species, isPlaying, getInterpolated]);
@@ -163,7 +161,8 @@ export function SimulationCanvas({
 
     // Hit detection in world space
     const world = pixi.camera.screenToWorld(e.clientX, e.clientY);
-    const currentAgents = isPlaying ? getInterpolated() : agents;
+    const zoom = pixi.camera.state.zoom;
+    const currentAgents = clusterAgents(isPlaying ? getInterpolated() : agents, zoom);
     const speciesMap = new Map(species.map((s) => [s.sid, s]));
 
     // Agent hit
@@ -289,6 +288,37 @@ export function SimulationCanvas({
 
 function AgentTooltip({ entity }: { entity: Extract<HoveredEntity, { type: "agent" }> }) {
   const { agent, species: sp } = entity;
+  const isCluster = agent.uid.startsWith("cluster_");
+
+  if (isCluster) {
+    return (
+      <>
+        <div style={{ fontWeight: 700, color: "#fff", marginBottom: 2, fontSize: "14px" }}>
+          Cluster ({agent.count} agents)
+        </div>
+        <div>
+          <span style={{ color: "#666" }}>Species:</span>{" "}
+          S{agent.species_sid}
+          {sp && <span style={{ color: "#888" }}> ({sp.plan})</span>}
+        </div>
+        <div>
+          <span style={{ color: "#666" }}>Avg Energy:</span>{" "}
+          <span style={{ color: agent.energy < 20 ? "#ff4" : "#ccc" }}>
+            {Math.round(agent.energy)}
+          </span>
+        </div>
+        <div>
+          <span style={{ color: "#666" }}>Dominant State:</span>{" "}
+          <span style={{ color: "#8cf" }}>{agent.state}</span>
+        </div>
+        <div>
+          <span style={{ color: "#666" }}>Pos:</span>{" "}
+          ({Math.round(agent.x)}, {Math.round(agent.y)})
+        </div>
+      </>
+    );
+  }
+
   return (
     <>
       <div style={{ fontWeight: 700, color: "#fff", marginBottom: 2, fontSize: "14px" }}>
@@ -321,11 +351,6 @@ function AgentTooltip({ entity }: { entity: Extract<HoveredEntity, { type: "agen
         <span style={{ color: "#666" }}>Pos:</span>{" "}
         ({Math.round(agent.x)}, {Math.round(agent.y)})
       </div>
-      {agent.count > 1 && (
-        <div>
-          <span style={{ color: "#666" }}>Count:</span> {agent.count}
-        </div>
-      )}
     </>
   );
 }
