@@ -83,6 +83,10 @@ torch.backends.cudnn.allow_tf32 = False
 # Suppress cuBLAS recovery warnings (these are expected when workaround is applied)
 warnings.filterwarnings('ignore', message='.*gemm_and_bias error: CUBLAS_STATUS_NOT_INITIALIZED.*')
 
+# LambdaLR.__init__ calls step() to set initial LRs before any optimizer.step() has occurred.
+# This is expected and harmless — suppress the PyTorch 1.1+ warning.
+warnings.filterwarnings('ignore', message='.*lr_scheduler.step.*optimizer.step.*')
+
 from mantis.models import BaseMoEModel
 from mantis.configs.model_config import get_micro_config, get_tiny_config, get_small_config, get_base_config
 from mantis.tokenizer import MANTISTokenizer
@@ -780,20 +784,43 @@ def train(args):
     if use_deepspeed and accelerator.is_main_process:
         print("✓ Using DeepSpeed ZeRO optimizer")
 
-    # Scheduler (adjusted for gradient accumulation)
-    steps_per_epoch = args.steps_per_epoch or len(train_loader)
+    # Prepare model, optimizer, and dataloaders with Accelerate (before loading checkpoint).
+    # Scheduler is created AFTER prepare so that steps_per_epoch is computed from the
+    # distributed DataLoader, which accounts for DistributedSampler and per-rank batch sizes.
+    model, optimizer, train_loader = accelerator.prepare(
+        model, optimizer, train_loader
+    )
 
-    # Round steps_per_epoch up to nearest multiple of gradient_accumulation_steps
-    # to prevent partial accumulation leaking stale gradients across epoch boundaries
+    if val_loader:
+        val_loader = accelerator.prepare(val_loader)
+
+    # Compute steps_per_epoch from the PREPARED DataLoader.  With heterogeneous GPUs
+    # and different per-rank batch sizes, each rank's DataLoader yields a different
+    # number of batches.  Take the minimum across ranks so every rank runs the same
+    # number of steps and stays synchronised for NCCL collectives.
     accum = args.gradient_accumulation_steps
+    if args.steps_per_epoch:
+        steps_per_epoch = args.steps_per_epoch
+    else:
+        local_steps = len(train_loader)
+        if accelerator.num_processes > 1:
+            steps_tensor = torch.tensor([local_steps], dtype=torch.long, device=accelerator.device)
+            gathered = accelerator.gather(steps_tensor)
+            steps_per_epoch = int(gathered.min().item())
+        else:
+            steps_per_epoch = local_steps
+
+    # Round up to nearest multiple of gradient_accumulation_steps
     if accum > 1 and steps_per_epoch % accum != 0:
         old_steps = steps_per_epoch
         steps_per_epoch = ((steps_per_epoch + accum - 1) // accum) * accum
-        args.steps_per_epoch = steps_per_epoch
         if accelerator.is_main_process:
             print(f"⚠️  Rounded steps_per_epoch {old_steps} → {steps_per_epoch} "
                   f"(nearest multiple of gradient_accumulation_steps={accum}) "
                   f"to prevent stale gradient leakage across epoch boundaries")
+
+    # Always set so the training loop break condition fires on every rank
+    args.steps_per_epoch = steps_per_epoch
 
     effective_steps_per_epoch = steps_per_epoch // accum
     total_steps = effective_steps_per_epoch * args.epochs
@@ -822,14 +849,7 @@ def train(args):
             return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    # Prepare everything with Accelerate FIRST (before loading checkpoint)
-    model, optimizer, train_loader, scheduler = accelerator.prepare(
-        model, optimizer, train_loader, scheduler
-    )
-
-    if val_loader:
-        val_loader = accelerator.prepare(val_loader)
+    scheduler = accelerator.prepare(scheduler)
 
     if args.gradient_checkpointing:
         unwrapped_model = accelerator.unwrap_model(model)
@@ -975,23 +995,24 @@ def train(args):
                     if accelerator.is_main_process:
                         print(f"\nStep {optimizer_step} - Val Loss: {val_loss:.4f}, Val PPL: {val_ppl:.2f}")
 
-                    if val_loss < best_val_loss and accelerator.is_main_process:
+                    if val_loss < best_val_loss:
                         best_val_loss = val_loss
                         accelerator.wait_for_everyone()
-                        unwrapped_model = accelerator.unwrap_model(model)
-                        best_path = os.path.join(args.output_dir, 'best_model.pt')
-                        torch.save({
-                            'epoch': epoch + 1,
-                            'step': optimizer_step,
-                            'global_step': global_step,
-                            'model_state_dict': unwrapped_model.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'scheduler_state_dict': scheduler.state_dict(),
-                            'config': config,
-                            'val_loss': val_loss,
-                            'best_val_loss': best_val_loss
-                        }, best_path)
-                        print(f"✓ Best model saved")
+                        if accelerator.is_main_process:
+                            unwrapped_model = accelerator.unwrap_model(model)
+                            best_path = os.path.join(args.output_dir, 'best_model.pt')
+                            torch.save({
+                                'epoch': epoch + 1,
+                                'step': optimizer_step,
+                                'global_step': global_step,
+                                'model_state_dict': unwrapped_model.state_dict(),
+                                'optimizer_state_dict': optimizer.state_dict(),
+                                'scheduler_state_dict': scheduler.state_dict(),
+                                'config': config,
+                                'val_loss': val_loss,
+                                'best_val_loss': best_val_loss
+                            }, best_path)
+                            print(f"✓ Best model saved")
 
                 model.train()
 
@@ -1023,8 +1044,8 @@ def train(args):
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 epochs_without_improvement = 0
+                accelerator.wait_for_everyone()
                 if accelerator.is_main_process:
-                    accelerator.wait_for_everyone()
                     unwrapped_model = accelerator.unwrap_model(model)
                     best_path = os.path.join(args.output_dir, 'best_model.pt')
                     torch.save({
@@ -1048,9 +1069,9 @@ def train(args):
                     print(f"\nEarly stopping: No improvement for {args.patience} epochs")
                 break
 
-        if accelerator.is_main_process:
-            if args.save_every and (epoch + 1) % args.save_every == 0:
-                accelerator.wait_for_everyone()
+        if args.save_every and (epoch + 1) % args.save_every == 0:
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
                 unwrapped_model = accelerator.unwrap_model(model)
                 ckpt_path = os.path.join(args.output_dir, f'epoch_{epoch+1}.pt')
                 torch.save({
@@ -1067,8 +1088,8 @@ def train(args):
                 print(f"Checkpoint saved: {ckpt_path}")
 
     # Final checkpoint
+    accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        accelerator.wait_for_everyone()
         unwrapped_model = accelerator.unwrap_model(model)
         final_path = os.path.join(args.output_dir, 'final_model.pt')
         torch.save({
