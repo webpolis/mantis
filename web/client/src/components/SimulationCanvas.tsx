@@ -44,6 +44,9 @@ export function SimulationCanvas({
   const prevEpochRef = useRef(epoch);
   const biomeCentersMap = useMemo(() => biomeCenters(biomes, worldSize), [biomes, worldSize]);
 
+  // Cached clustered agents from the RAF loop — reused by mouse hit-testing
+  const clusteredRef = useRef<AgentSnapshot[]>([]);
+
   // Track dragging
   const dragRef = useRef<{ active: boolean; lastX: number; lastY: number }>({
     active: false, lastX: 0, lastY: 0,
@@ -107,6 +110,7 @@ export function SimulationCanvas({
       const currentAgents = isPlaying ? getInterpolated() : agents;
       const zoom = pixi.camera?.state.zoom ?? 1;
       const clustered = clusterAgents(currentAgents, zoom);
+      clusteredRef.current = clustered;
       const hovUid = hoveredRef.current?.type === "agent" ? hoveredRef.current.agent.uid : undefined;
       pixi.updateAgents(clustered, species, hovUid, currentAgents);
       raf = requestAnimationFrame(loop);
@@ -159,10 +163,9 @@ export function SimulationCanvas({
       dragRef.current.lastY = e.clientY;
     }
 
-    // Hit detection in world space
+    // Hit detection against the last rendered clustered snapshot
     const world = pixi.camera.screenToWorld(e.clientX, e.clientY);
-    const zoom = pixi.camera.state.zoom;
-    const currentAgents = clusterAgents(isPlaying ? getInterpolated() : agents, zoom);
+    const currentAgents = clusteredRef.current;
     const speciesMap = new Map(species.map((s) => [s.sid, s]));
 
     // Agent hit
@@ -223,7 +226,7 @@ export function SimulationCanvas({
     }
 
     setTooltipPos({ x: e.clientX, y: e.clientY });
-  }, [agents, species, biomes, biomeCentersMap, isPlaying, getInterpolated]);
+  }, [species, biomes, biomeCentersMap]);
 
   const handleMouseLeave = useCallback(() => {
     setHovered(null);

@@ -13,12 +13,13 @@ export function clusterAgents(agents: AgentSnapshot[], zoom: number): AgentSnaps
 
   // Group by (species_sid, cellX, cellY)
   const buckets = new Map<string, AgentSnapshot[]>();
+  const dead: AgentSnapshot[] = [];
 
   for (const a of agents) {
-    if (a.dead) continue;
+    if (a.dead) { dead.push(a); continue; }
     const cx = Math.floor(a.x / cellSize);
     const cy = Math.floor(a.y / cellSize);
-    const key = `${a.species_sid}_${cx}_${cy}`;
+    const key = `${a.species_sid}|${cx}|${cy}`;
     let bucket = buckets.get(key);
     if (!bucket) {
       bucket = [];
@@ -29,7 +30,7 @@ export function clusterAgents(agents: AgentSnapshot[], zoom: number): AgentSnaps
 
   const result: AgentSnapshot[] = [];
 
-  for (const bucket of buckets.values()) {
+  for (const [key, bucket] of buckets) {
     if (bucket.length === 1) {
       result.push(bucket[0]);
       continue;
@@ -61,7 +62,7 @@ export function clusterAgents(agents: AgentSnapshot[], zoom: number): AgentSnaps
 
     const first = bucket[0];
     result.push({
-      uid: `cluster_${first.species_sid}_${Math.round(sumX / totalCount)}_${Math.round(sumY / totalCount)}`,
+      uid: `cluster_${key}`,
       aid: first.aid,
       species_sid: first.species_sid,
       x: sumX / totalCount,
@@ -75,10 +76,8 @@ export function clusterAgents(agents: AgentSnapshot[], zoom: number): AgentSnaps
     });
   }
 
-  // Pass through dead agents unchanged
-  for (const a of agents) {
-    if (a.dead) result.push(a);
-  }
+  // Append dead agents collected in first pass
+  for (const a of dead) result.push(a);
 
   return result;
 }
