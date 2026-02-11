@@ -122,7 +122,7 @@ def serialize_agents_keyframe(
         qx = _quantize(a.x)
         qy = _quantize(a.y)
         e = int(round(a.energy))
-        notable_snapshot[a.aid] = (qx, qy, e)
+        notable_snapshot[a.aid] = (qx, qy, e, a.age, a.state, a.target_aid)
         notable_ids.add(a.aid)
 
         state_str = a.state
@@ -209,24 +209,27 @@ def serialize_agents_delta(
             qx = _quantize(a.x)
             qy = _quantize(a.y)
             e = int(round(a.energy))
-            new_notables[aid] = (qx, qy, e)
+            state_str = a.state
+            if a.state == "hunt" and a.target_aid is not None:
+                state_str = f"hunt->A{a.target_aid}"
+            new_notables[aid] = (qx, qy, e, a.age, a.state, a.target_aid)
 
             prev_n = prev_notables.get(aid)
             if prev_n is not None:
-                px, py, pe = prev_n
+                px, py, pe = prev_n[0], prev_n[1], prev_n[2]
                 moved = abs(qx - px) > 5 or abs(qy - py) > 5
                 energy_changed = abs(e - pe) > 2
                 if moved or energy_changed:
                     if compact:
-                        changed_lines.append(f"   N A{aid} {qx} {qy} {e}")
+                        changed_lines.append(f"   N A{aid} {qx} {qy} {e} {a.age} {state_str}")
                     else:
-                        changed_lines.append(f"    N:A{aid}:({qx},{qy},E={e})")
+                        changed_lines.append(f"    N:A{aid}:({qx},{qy},E={e},age={a.age},{state_str})")
             else:
                 # Was notable but no prev data — emit full
                 if compact:
-                    changed_lines.append(f"   N A{aid} {qx} {qy} {e}")
+                    changed_lines.append(f"   N A{aid} {qx} {qy} {e} {a.age} {state_str}")
                 else:
-                    changed_lines.append(f"    N:A{aid}:({qx},{qy},E={e})")
+                    changed_lines.append(f"    N:A{aid}:({qx},{qy},E={e},age={a.age},{state_str})")
 
     # Dead notables
     for dead_aid in manager.event_log.deaths:
