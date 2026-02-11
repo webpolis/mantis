@@ -1,21 +1,7 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import type { AgentSnapshot, SpeciesInfo, BiomeData, VegetationPatchData, SimulationEvent } from "../types/simulation";
 import { useInterpolation } from "../hooks/useInterpolation";
-import {
-  renderAgents,
-  renderGrid,
-  renderHUD,
-  findAgentAt,
-  findVegetationAt,
-  findBiomeAt,
-  withCamera,
-  screenToBase,
-  DEFAULT_CAMERA,
-  buildBiomeTexture,
-  renderBiomeBackground,
-  renderVegetation,
-} from "../utils/renderer";
-import type { Camera } from "../utils/renderer";
+import { PixiApp } from "../pixi/PixiApp";
 
 interface Props {
   agents: AgentSnapshot[];
@@ -34,10 +20,7 @@ type HoveredEntity =
   | { type: "vegetation"; patch: VegetationPatchData; biome: BiomeData }
   | { type: "biome"; biome: BiomeData };
 
-const CANVAS_SIZE = 800;
-const MIN_ZOOM = 1;
-const MAX_ZOOM = 20;
-const ZOOM_SPEED = 0.001;
+const HIT_SLOP = 8; // world-space pixels
 
 export function SimulationCanvas({
   agents,
@@ -50,145 +33,167 @@ export function SimulationCanvas({
   biomes,
   events,
 }: Props) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const rafRef = useRef<number>(0);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const pixiRef = useRef<PixiApp | null>(null);
   const { updateSnapshot, getInterpolated } = useInterpolation();
   const [hovered, setHovered] = useState<HoveredEntity | null>(null);
-
-  // Cached biome texture
-  const biomeTextureRef = useRef<HTMLCanvasElement | null>(null);
-  const biomeKeyRef = useRef<string>("");
   const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 });
   const hoveredRef = useRef<HoveredEntity | null>(null);
+  const prevEpochRef = useRef(epoch);
 
-  // Camera state as ref to avoid re-creating render callback on every zoom/pan
-  const camRef = useRef<Camera>({ ...DEFAULT_CAMERA });
-  const [camSnapshot, setCamSnapshot] = useState<Camera>({ ...DEFAULT_CAMERA });
-
-  // Pan dragging state
+  // Track dragging
   const dragRef = useRef<{ active: boolean; lastX: number; lastY: number }>({
-    active: false,
-    lastX: 0,
-    lastY: 0,
+    active: false, lastX: 0, lastY: 0,
   });
 
   hoveredRef.current = hovered;
 
+  // Init PixiJS on mount
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const pixi = new PixiApp();
+    pixiRef.current = pixi;
+
+    // Register wheel synchronously so cleanup never misses it
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      pixi.camera?.zoomAt(e.clientX, e.clientY, e.deltaY);
+    };
+    container.addEventListener("wheel", onWheel, { passive: false });
+
+    pixi.init(container, worldSize);
+
+    return () => {
+      container.removeEventListener("wheel", onWheel);
+      pixi.destroy();
+      pixiRef.current = null;
+    };
+  }, [worldSize]);
+
+  // Feed interpolation
   useEffect(() => {
     if (agents.length > 0) {
       updateSnapshot(agents, interpolateDuration);
     }
   }, [agents, interpolateDuration, updateSnapshot]);
 
-  // Rebuild biome texture when biome identity or vegetation levels change
+  // Update biomes
   useEffect(() => {
-    const key = biomes.map((b) => `${b.lid}:${b.name}:${b.vegetation.toFixed(2)}`).join(",");
-    if (key !== biomeKeyRef.current) {
-      biomeKeyRef.current = key;
-      biomeTextureRef.current = buildBiomeTexture(biomes, CANVAS_SIZE);
-    }
+    pixiRef.current?.updateBiomes(biomes);
   }, [biomes]);
 
-  // --- Zoom (wheel) ---
+  // Update events + epoch transitions
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+    pixiRef.current?.updateEvents(events);
+  }, [events]);
 
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      const cam = camRef.current;
-      const rect = canvas.getBoundingClientRect();
-      const scaleX = canvas.width / rect.width;
-      const scaleY = canvas.height / rect.height;
-      const mx = (e.clientX - rect.left) * scaleX;
-      const my = (e.clientY - rect.top) * scaleY;
+  useEffect(() => {
+    if (epoch !== prevEpochRef.current) {
+      prevEpochRef.current = epoch;
+      pixiRef.current?.particleSystem?.emitEpochTransition(worldSize / 2, worldSize / 2);
+    }
+  }, [epoch, worldSize]);
 
-      const oldZoom = cam.zoom;
-      const delta = -e.deltaY * ZOOM_SPEED * oldZoom;
-      const newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, oldZoom + delta));
+  // Update agents on every frame
+  useEffect(() => {
+    const pixi = pixiRef.current;
+    if (!pixi) return;
 
-      // Zoom toward cursor: keep the world point under cursor fixed
-      cam.offsetX = mx - (mx - cam.offsetX) * (newZoom / oldZoom);
-      cam.offsetY = my - (my - cam.offsetY) * (newZoom / oldZoom);
-      cam.zoom = newZoom;
-
-      // Clamp at zoom=1 to reset offset
-      if (newZoom === 1) {
-        cam.offsetX = 0;
-        cam.offsetY = 0;
-      }
-
-      setCamSnapshot({ ...cam });
+    let raf = 0;
+    const loop = () => {
+      const currentAgents = isPlaying ? getInterpolated() : agents;
+      const hovAid = hoveredRef.current?.type === "agent" ? hoveredRef.current.agent.aid : undefined;
+      pixi.updateAgents(currentAgents, species, hovAid);
+      if (isPlaying) raf = requestAnimationFrame(loop);
     };
 
-    canvas.addEventListener("wheel", onWheel, { passive: false });
-    return () => canvas.removeEventListener("wheel", onWheel);
-  }, []);
+    if (isPlaying) {
+      raf = requestAnimationFrame(loop);
+    } else {
+      // Static update
+      const hovAid = hoveredRef.current?.type === "agent" ? hoveredRef.current.agent.aid : undefined;
+      pixi.updateAgents(agents, species, hovAid);
+    }
 
-  // --- Pan (drag) ---
-  const handleMouseDown = useCallback(
-    (e: React.MouseEvent<HTMLCanvasElement>) => {
-      if (camRef.current.zoom <= 1) return;
-      dragRef.current = { active: true, lastX: e.clientX, lastY: e.clientY };
-    },
-    []
-  );
+    return () => { if (raf) cancelAnimationFrame(raf); };
+  }, [agents, species, isPlaying, getInterpolated]);
+
+  // Mouse handlers
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    const pixi = pixiRef.current;
+    if (!pixi || !pixi.camera.isZoomed) return;
+    dragRef.current = { active: true, lastX: e.clientX, lastY: e.clientY };
+  }, []);
 
   const handleMouseUp = useCallback(() => {
     dragRef.current.active = false;
   }, []);
 
-  const handleMouseMove = useCallback(
-    (e: React.MouseEvent<HTMLCanvasElement>) => {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      const rect = canvas.getBoundingClientRect();
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    const pixi = pixiRef.current;
+    if (!pixi) return;
 
-      // Handle panning
-      if (dragRef.current.active) {
-        const cam = camRef.current;
-        const scaleX = canvas.width / rect.width;
-        const scaleY = canvas.height / rect.height;
-        cam.offsetX += (e.clientX - dragRef.current.lastX) * scaleX;
-        cam.offsetY += (e.clientY - dragRef.current.lastY) * scaleY;
-        dragRef.current.lastX = e.clientX;
-        dragRef.current.lastY = e.clientY;
-        setCamSnapshot({ ...cam });
+    // Pan
+    if (dragRef.current.active) {
+      pixi.camera.panBy(
+        e.clientX - dragRef.current.lastX,
+        e.clientY - dragRef.current.lastY,
+      );
+      dragRef.current.lastX = e.clientX;
+      dragRef.current.lastY = e.clientY;
+    }
+
+    // Hit detection in world space
+    const world = pixi.camera.screenToWorld(e.clientX, e.clientY);
+    const currentAgents = isPlaying ? getInterpolated() : agents;
+    const speciesMap = new Map(species.map((s) => [s.sid, s]));
+
+    // Agent hit
+    let closestAgent: AgentSnapshot | null = null;
+    let closestDist = Infinity;
+    for (const a of currentAgents) {
+      if (a.dead) continue;
+      const dx = world.x - a.x;
+      const dy = world.y - a.y;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      const r = Math.max(4, Math.sqrt(a.count || 1) * 3) + HIT_SLOP / pixi.camera.state.zoom;
+      if (d < r && d < closestDist) {
+        closestAgent = a;
+        closestDist = d;
       }
+    }
 
-      // Hit detection
-      const scaleX = canvas.width / rect.width;
-      const scaleY = canvas.height / rect.height;
-      const cx = (e.clientX - rect.left) * scaleX;
-      const cy = (e.clientY - rect.top) * scaleY;
-
-      // Convert screen coords to base (pre-camera) coords
-      const [bx, by] = screenToBase(cx, cy, camRef.current);
-
-      const currentAgents = isPlaying ? getInterpolated() : agents;
-      const speciesMap = new Map(species.map((s) => [s.sid, s]));
-
-      // Priority: agent > vegetation > biome
-      const agent = findAgentAt(bx, by, currentAgents, worldSize, CANVAS_SIZE);
-      if (agent) {
-        setHovered({ type: "agent", agent, species: speciesMap.get(agent.species_sid) });
-      } else {
-        const veg = findVegetationAt(bx, by, biomes, worldSize, CANVAS_SIZE);
-        if (veg) {
-          setHovered({ type: "vegetation", patch: veg.patch, biome: veg.biome });
-        } else {
-          const biome = findBiomeAt(bx, by, biomes, CANVAS_SIZE);
-          if (biome) {
-            setHovered({ type: "biome", biome });
-          } else {
-            setHovered(null);
+    if (closestAgent) {
+      setHovered({ type: "agent", agent: closestAgent, species: speciesMap.get(closestAgent.species_sid) });
+    } else {
+      // Vegetation hit
+      let closestVeg: { patch: VegetationPatchData; biome: BiomeData } | null = null;
+      let vegDist = Infinity;
+      for (const biome of biomes) {
+        for (const patch of biome.patches) {
+          if (patch.density < 0.01) continue;
+          const dx = world.x - patch.x;
+          const dy = world.y - patch.y;
+          const d = Math.sqrt(dx * dx + dy * dy);
+          if (d <= patch.radius * 0.6 && d < vegDist) {
+            closestVeg = { patch, biome };
+            vegDist = d;
           }
         }
       }
-      setTooltipPos({ x: e.clientX - rect.left, y: e.clientY - rect.top });
-    },
-    [agents, species, biomes, worldSize, isPlaying, getInterpolated]
-  );
+
+      if (closestVeg) {
+        setHovered({ type: "vegetation", patch: closestVeg.patch, biome: closestVeg.biome });
+      } else {
+        // Biome hit (nearest Voronoi center — simplified)
+        setHovered(null);
+      }
+    }
+
+    setTooltipPos({ x: e.clientX, y: e.clientY });
+  }, [agents, species, biomes, isPlaying, getInterpolated]);
 
   const handleMouseLeave = useCallback(() => {
     setHovered(null);
@@ -196,120 +201,49 @@ export function SimulationCanvas({
   }, []);
 
   const handleDoubleClick = useCallback(() => {
-    camRef.current = { ...DEFAULT_CAMERA };
-    setCamSnapshot({ ...DEFAULT_CAMERA });
+    pixiRef.current?.camera.reset();
   }, []);
 
-  // --- Render loop ---
-  const render = useCallback(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    ctx.fillStyle = "#0d1117";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    const cam = camRef.current;
-    const interpolated = getInterpolated();
-
-    withCamera(ctx, cam, () => {
-      if (biomeTextureRef.current) {
-        renderBiomeBackground(ctx, biomeTextureRef.current);
-      }
-      renderGrid(ctx, worldSize);
-      renderVegetation(ctx, biomes, worldSize);
-      const hovAid = hoveredRef.current?.type === "agent" ? hoveredRef.current.agent.aid : undefined;
-      renderAgents(ctx, interpolated, species, worldSize, hovAid);
-    });
-
-    renderHUD(ctx, tick, epoch, interpolated.length, species.length, cam.zoom);
-
-    if (isPlaying) {
-      rafRef.current = requestAnimationFrame(render);
-    }
-  }, [getInterpolated, species, worldSize, tick, epoch, isPlaying, biomes]);
-
-  useEffect(() => {
-    if (isPlaying) {
-      rafRef.current = requestAnimationFrame(render);
-    }
-    return () => {
-      if (rafRef.current) {
-        cancelAnimationFrame(rafRef.current);
-      }
-    };
-  }, [isPlaying, render]);
-
-  // Render once even when not playing (static frame)
-  useEffect(() => {
-    if (!isPlaying) {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
-
-      ctx.fillStyle = "#0d1117";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-      const cam = camRef.current;
-
-      withCamera(ctx, cam, () => {
-        if (biomeTextureRef.current) {
-          renderBiomeBackground(ctx, biomeTextureRef.current);
-        }
-        renderGrid(ctx, worldSize);
-        renderVegetation(ctx, biomes, worldSize);
-        const hovAid = hoveredRef.current?.type === "agent" ? hoveredRef.current.agent.aid : undefined;
-        renderAgents(ctx, agents, species, worldSize, hovAid);
-      });
-
-      renderHUD(ctx, tick, epoch, agents.length, species.length, cam.zoom);
-    }
-  }, [agents, species, worldSize, tick, epoch, isPlaying, camSnapshot, biomes]);
-
-  const isZoomed = camSnapshot.zoom > 1;
+  const isZoomed = pixiRef.current?.camera.isZoomed ?? false;
 
   return (
-    <div style={{ position: "relative", display: "inline-block" }}>
-      <canvas
-        ref={canvasRef}
-        width={CANVAS_SIZE}
-        height={CANVAS_SIZE}
-        onMouseDown={handleMouseDown}
-        onMouseUp={handleMouseUp}
-        onMouseMove={handleMouseMove}
-        onMouseLeave={handleMouseLeave}
-        onDoubleClick={handleDoubleClick}
-        style={{
-          border: "2px solid #333",
-          borderRadius: "4px",
-          display: "block",
-          cursor: isZoomed
-            ? dragRef.current.active
-              ? "grabbing"
-              : "grab"
-            : "default",
-        }}
-      />
+    <div
+      ref={containerRef}
+      onMouseDown={handleMouseDown}
+      onMouseUp={handleMouseUp}
+      onMouseMove={handleMouseMove}
+      onMouseLeave={handleMouseLeave}
+      onDoubleClick={handleDoubleClick}
+      style={{
+        position: "absolute",
+        inset: 0,
+        cursor: isZoomed
+          ? dragRef.current.active ? "grabbing" : "grab"
+          : "default",
+      }}
+    >
+      {/* Catastrophe banner overlay */}
       <CatastropheBanner events={events} />
+
+      {/* Tooltip */}
       {hovered && !dragRef.current.active && (
         <div
           style={{
-            position: "absolute",
+            position: "fixed",
             left: tooltipPos.x + 14,
             top: tooltipPos.y - 10,
-            background: "rgba(0, 0, 0, 0.85)",
-            color: "#eee",
+            background: "rgba(10, 10, 20, 0.9)",
+            backdropFilter: "blur(8px)",
+            color: "#dde",
             padding: "8px 10px",
-            borderRadius: "4px",
+            borderRadius: "6px",
             fontSize: "12px",
-            fontFamily: "monospace",
+            fontFamily: "'Rajdhani', monospace",
             lineHeight: "1.5",
             pointerEvents: "none",
             whiteSpace: "nowrap",
-            border: "1px solid #555",
-            zIndex: 10,
+            border: "1px solid rgba(255, 255, 255, 0.1)",
+            zIndex: 20,
           }}
         >
           {hovered.type === "agent" && <AgentTooltip entity={hovered} />}
@@ -325,39 +259,39 @@ function AgentTooltip({ entity }: { entity: Extract<HoveredEntity, { type: "agen
   const { agent, species: sp } = entity;
   return (
     <>
-      <div style={{ fontWeight: "bold", color: "#fff", marginBottom: "2px" }}>
+      <div style={{ fontWeight: 700, color: "#fff", marginBottom: 2, fontSize: "13px" }}>
         Agent #{agent.aid}
       </div>
       <div>
-        <span style={{ color: "#999" }}>Species:</span>{" "}
+        <span style={{ color: "#666" }}>Species:</span>{" "}
         S{agent.species_sid}
-        {sp && <span style={{ color: "#aaa" }}> ({sp.plan})</span>}
+        {sp && <span style={{ color: "#888" }}> ({sp.plan})</span>}
       </div>
       <div>
-        <span style={{ color: "#999" }}>Energy:</span>{" "}
-        <span style={{ color: agent.energy < 20 ? "#ff4" : "#eee" }}>
+        <span style={{ color: "#666" }}>Energy:</span>{" "}
+        <span style={{ color: agent.energy < 20 ? "#ff4" : "#ccc" }}>
           {Math.round(agent.energy)}
         </span>
       </div>
       <div>
-        <span style={{ color: "#999" }}>Age:</span> {agent.age}
+        <span style={{ color: "#666" }}>Age:</span> {agent.age}
       </div>
       <div>
-        <span style={{ color: "#999" }}>State:</span>{" "}
+        <span style={{ color: "#666" }}>State:</span>{" "}
         <span style={{ color: "#8cf" }}>{agent.state}</span>
       </div>
       {agent.target_aid != null && (
         <div>
-          <span style={{ color: "#999" }}>Target:</span> #{agent.target_aid}
+          <span style={{ color: "#666" }}>Target:</span> #{agent.target_aid}
         </div>
       )}
       <div>
-        <span style={{ color: "#999" }}>Pos:</span>{" "}
+        <span style={{ color: "#666" }}>Pos:</span>{" "}
         ({Math.round(agent.x)}, {Math.round(agent.y)})
       </div>
       {agent.count > 1 && (
         <div>
-          <span style={{ color: "#999" }}>Count:</span> {agent.count}
+          <span style={{ color: "#666" }}>Count:</span> {agent.count}
         </div>
       )}
     </>
@@ -368,23 +302,19 @@ function VegetationTooltip({ entity }: { entity: Extract<HoveredEntity, { type: 
   const { patch, biome } = entity;
   return (
     <>
-      <div style={{ fontWeight: "bold", color: "#6c6", marginBottom: "2px" }}>
+      <div style={{ fontWeight: 700, color: "#6c6", marginBottom: 2 }}>
         Vegetation Patch
       </div>
       <div>
-        <span style={{ color: "#999" }}>Biome:</span>{" "}
+        <span style={{ color: "#666" }}>Biome:</span>{" "}
         {biome.name} (L{biome.lid})
       </div>
       <div>
-        <span style={{ color: "#999" }}>Density:</span>{" "}
+        <span style={{ color: "#666" }}>Density:</span>{" "}
         {(patch.density * 100).toFixed(0)}%
       </div>
       <div>
-        <span style={{ color: "#999" }}>Radius:</span> {Math.round(patch.radius)}
-      </div>
-      <div>
-        <span style={{ color: "#999" }}>Pos:</span>{" "}
-        ({Math.round(patch.x)}, {Math.round(patch.y)})
+        <span style={{ color: "#666" }}>Radius:</span> {Math.round(patch.radius)}
       </div>
     </>
   );
@@ -394,40 +324,24 @@ function BiomeTooltip({ entity }: { entity: Extract<HoveredEntity, { type: "biom
   const { biome } = entity;
   return (
     <>
-      <div style={{ fontWeight: "bold", color: "#8cf", marginBottom: "2px" }}>
+      <div style={{ fontWeight: 700, color: "#8cf", marginBottom: 2 }}>
         {biome.name}
       </div>
       <div>
-        <span style={{ color: "#999" }}>ID:</span> L{biome.lid}
-      </div>
-      <div>
-        <span style={{ color: "#999" }}>Vegetation:</span>{" "}
+        <span style={{ color: "#666" }}>Vegetation:</span>{" "}
         {(biome.vegetation * 100).toFixed(0)}%
-      </div>
-      <div>
-        <span style={{ color: "#999" }}>Detritus:</span>{" "}
-        {Math.round(biome.detritus)}
-      </div>
-      <div>
-        <span style={{ color: "#999" }}>Nitrogen:</span>{" "}
-        <span style={{ color: biome.nitrogen < 0.2 ? "#ff4" : "#eee" }}>
-          {((biome.nitrogen ?? 0.5) * 100).toFixed(0)}%
-        </span>
-      </div>
-      <div>
-        <span style={{ color: "#999" }}>Phosphorus:</span>{" "}
-        <span style={{ color: biome.phosphorus < 0.1 ? "#ff4" : "#eee" }}>
-          {((biome.phosphorus ?? 0.3) * 100).toFixed(0)}%
-        </span>
       </div>
     </>
   );
 }
 
 const CATASTROPHE_COLORS: Record<string, string> = {
-  volcanic_winter: "rgba(255, 100, 30, 0.25)",
+  volcanic_winter: "rgba(255, 100, 30, 0.2)",
   meteor_impact: "rgba(255, 40, 40, 0.25)",
-  ice_age: "rgba(60, 120, 255, 0.25)",
+  ice_age: "rgba(60, 120, 255, 0.2)",
+  tsunami: "rgba(40, 140, 255, 0.2)",
+  drought: "rgba(200, 150, 50, 0.15)",
+  plague: "rgba(150, 200, 50, 0.15)",
 };
 
 function CatastropheBanner({ events }: { events: SimulationEvent[] }) {
@@ -435,7 +349,7 @@ function CatastropheBanner({ events }: { events: SimulationEvent[] }) {
   if (!active) return null;
 
   const kind = active.detail.split("|")[0];
-  const bg = CATASTROPHE_COLORS[kind] ?? "rgba(255, 100, 30, 0.2)";
+  const bg = CATASTROPHE_COLORS[kind] ?? "rgba(255, 100, 30, 0.15)";
 
   return (
     <div
@@ -444,19 +358,21 @@ function CatastropheBanner({ events }: { events: SimulationEvent[] }) {
         top: 0,
         left: 0,
         right: 0,
-        padding: "6px 12px",
+        padding: "8px 20px",
         background: bg,
+        backdropFilter: "blur(4px)",
         color: "#fff",
-        fontFamily: "monospace",
-        fontSize: "13px",
-        fontWeight: "bold",
+        fontSize: "14px",
+        fontWeight: 700,
         textAlign: "center",
         pointerEvents: "none",
-        borderRadius: "4px 4px 0 0",
-        textShadow: "0 1px 3px rgba(0,0,0,0.6)",
+        textShadow: "0 1px 4px rgba(0,0,0,0.6)",
+        letterSpacing: "2px",
+        textTransform: "uppercase",
+        zIndex: 15,
       }}
     >
-      {kind.replace(/_/g, " ").toUpperCase()}
+      {kind.replace(/_/g, " ")}
     </div>
   );
 }

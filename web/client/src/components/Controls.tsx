@@ -26,6 +26,8 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)}M`;
 }
 
+const SPEEDS = [0.5, 1, 2, 5, 10];
+
 export function Controls({
   onPlay,
   onPause,
@@ -44,8 +46,10 @@ export function Controls({
   selectedModel,
   onSelectModel,
 }: Props) {
+  const [speed, setLocalSpeed] = useState(1);
   const [filterAgents, setFilterAgents] = useState(false);
   const [filterSpotlights, setFilterSpotlights] = useState(false);
+  const [showDataset, setShowDataset] = useState(false);
 
   const computeFiltered = (agents: boolean, spotlights: boolean): number[] | null => {
     if (!agents && !spotlights) return null;
@@ -85,97 +89,82 @@ export function Controls({
       onSelectWorld(value);
     }
   };
+
+  const handleSpeed = (s: number) => {
+    setLocalSpeed(s);
+    onSpeed(s);
+  };
+
   return (
-    <div
-      style={{
-        padding: "12px 16px",
-        background: "#0f3460",
-        borderRadius: "4px",
-        marginBottom: "8px",
-        display: "flex",
-        alignItems: "center",
-        gap: "16px",
-      }}
-    >
+    <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
       {!isPlaying ? (
         <>
-          <button onClick={() => onPlay("live")} style={btnStyle}>
+          <button onClick={() => onPlay("live")} style={btnPrimary}>
             Live Simulation
           </button>
 
-          <div style={dividerStyle} />
+          <div style={divider} />
 
-          <select
-            value={selectedFile ?? ""}
-            onChange={(e) => e.target.value && onSelectFile(e.target.value)}
-            style={selectStyle}
+          <button
+            onClick={() => setShowDataset(!showDataset)}
+            style={{ ...btnGhost, color: selectedFile ? "#dde" : "#777" }}
           >
-            <option value="">Dataset...</option>
-            {datasets.map((d) => (
-              <option key={d.name} value={d.name}>
-                {d.name} ({formatSize(d.size)})
-              </option>
-            ))}
-          </select>
+            {selectedFile || "Dataset..."}
+          </button>
+
+          {showDataset && (
+            <select
+              value={selectedFile ?? ""}
+              onChange={(e) => { e.target.value && onSelectFile(e.target.value); setShowDataset(false); }}
+              style={selectStyle}
+              autoFocus
+              onBlur={() => setShowDataset(false)}
+            >
+              <option value="">Select...</option>
+              {datasets.map((d) => (
+                <option key={d.name} value={d.name}>
+                  {d.name} ({formatSize(d.size)})
+                </option>
+              ))}
+            </select>
+          )}
 
           {worldCount > 0 && (
-            <label style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-              World:
+            <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "13px" }}>
+              <span style={{ color: "#888" }}>W:</span>
               <input
                 type="number"
                 min={0}
                 max={worldCount - 1}
                 value={selectedWorld}
                 onChange={(e) => handleWorldChange(Number(e.target.value))}
-                style={{ ...selectStyle, width: "60px" }}
+                style={{ ...selectStyle, width: "52px", textAlign: "center" }}
               />
-              <span style={{ color: "#888", fontSize: "12px" }}>
-                / {filteredWorlds ? filteredWorlds.length : worldCount}
+              <span style={{ color: "#555", fontSize: "11px" }}>
+                /{filteredWorlds ? filteredWorlds.length : worldCount}
               </span>
-              <label
-                style={{ display: "flex", alignItems: "center", gap: "4px", cursor: "pointer" }}
-                title="Only show worlds that contain agents"
-              >
-                <input
-                  type="checkbox"
-                  checked={filterAgents}
-                  onChange={() => handleFilterToggle("agents")}
-                  style={{ accentColor: "#e94560" }}
-                />
-                <span style={{ fontSize: "12px", color: "#aaa" }}>Agents</span>
+              <label style={{ display: "flex", alignItems: "center", gap: 3, cursor: "pointer" }}>
+                <input type="checkbox" checked={filterAgents} onChange={() => handleFilterToggle("agents")} style={{ accentColor: "#e94560" }} />
+                <span style={{ fontSize: "11px", color: "#888" }}>A</span>
               </label>
-              <label
-                style={{ display: "flex", alignItems: "center", gap: "4px", cursor: "pointer" }}
-                title="Only show worlds that contain spotlight scenes"
-              >
-                <input
-                  type="checkbox"
-                  checked={filterSpotlights}
-                  onChange={() => handleFilterToggle("spotlights")}
-                  style={{ accentColor: "#e94560" }}
-                />
-                <span style={{ fontSize: "12px", color: "#aaa" }}>Spotlights</span>
+              <label style={{ display: "flex", alignItems: "center", gap: 3, cursor: "pointer" }}>
+                <input type="checkbox" checked={filterSpotlights} onChange={() => handleFilterToggle("spotlights")} style={{ accentColor: "#e94560" }} />
+                <span style={{ fontSize: "11px", color: "#888" }}>S</span>
               </label>
-            </label>
+            </div>
           )}
 
           <button
             onClick={() => onPlay("file", selectedFile ?? undefined, selectedWorld)}
             disabled={!selectedFile}
-            style={{
-              ...btnStyle,
-              background: selectedFile ? "#444" : "#333",
-              opacity: selectedFile ? 1 : 0.5,
-              cursor: selectedFile ? "pointer" : "not-allowed",
-            }}
+            style={selectedFile ? btnSecondary : { ...btnSecondary, opacity: 0.35, cursor: "not-allowed" }}
           >
-            Play World
+            Play
           </button>
 
           {models.length > 0 && (
             <>
-              <div style={dividerStyle} />
-
+              <div style={divider} />
               <select
                 value={selectedModel ?? ""}
                 onChange={(e) => e.target.value && onSelectModel(e.target.value)}
@@ -188,73 +177,121 @@ export function Controls({
                   </option>
                 ))}
               </select>
-
               <button
                 onClick={() => onPlay("model")}
                 disabled={!selectedModel}
-                style={{
-                  ...btnStyle,
-                  background: selectedModel ? "#16a34a" : "#333",
-                  opacity: selectedModel ? 1 : 0.5,
-                  cursor: selectedModel ? "pointer" : "not-allowed",
-                }}
+                style={selectedModel ? btnAccent : { ...btnAccent, opacity: 0.35, cursor: "not-allowed" }}
               >
-                Model Inference
+                Infer
               </button>
             </>
           )}
         </>
       ) : (
-        <button onClick={onPause} style={btnStyle}>
+        <button onClick={onPause} style={btnPrimary}>
           Pause
         </button>
       )}
 
       {!isPlaying && (
-        <button onClick={onResume} style={{ ...btnStyle, background: "#555" }}>
+        <button onClick={onResume} style={btnGhost}>
           Resume
         </button>
       )}
 
-      <label style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-        Speed:
-        <select
-          onChange={(e) => onSpeed(Number(e.target.value))}
-          defaultValue="1"
-          style={selectStyle}
-        >
-          <option value="0.5">0.5x</option>
-          <option value="1">1x</option>
-          <option value="2">2x</option>
-          <option value="5">5x</option>
-          <option value="10">10x</option>
-        </select>
-      </label>
+      <div style={divider} />
+
+      {/* Speed pill group */}
+      <div style={{ display: "flex", borderRadius: "6px", overflow: "hidden", border: "1px solid rgba(255,255,255,0.1)" }}>
+        {SPEEDS.map((s) => (
+          <button
+            key={s}
+            onClick={() => handleSpeed(s)}
+            style={{
+              padding: "4px 10px",
+              background: speed === s ? "rgba(233, 69, 96, 0.6)" : "transparent",
+              color: speed === s ? "#fff" : "#888",
+              border: "none",
+              cursor: "pointer",
+              fontSize: "12px",
+              fontWeight: speed === s ? 700 : 400,
+              fontFamily: "inherit",
+              transition: "all 0.15s ease",
+            }}
+          >
+            {s}x
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
 
-const btnStyle: React.CSSProperties = {
-  padding: "8px 16px",
-  background: "#e94560",
+const btnPrimary: React.CSSProperties = {
+  padding: "6px 16px",
+  background: "linear-gradient(135deg, #e94560, #c73450)",
   color: "#fff",
   border: "none",
-  borderRadius: "4px",
+  borderRadius: "6px",
   cursor: "pointer",
-  fontWeight: "bold",
-  fontSize: "14px",
+  fontWeight: 700,
+  fontSize: "13px",
+  fontFamily: "inherit",
+  letterSpacing: "0.5px",
+  boxShadow: "0 0 12px rgba(233, 69, 96, 0.3)",
+  transition: "box-shadow 0.2s ease",
+};
+
+const btnSecondary: React.CSSProperties = {
+  padding: "6px 14px",
+  background: "rgba(255, 255, 255, 0.08)",
+  color: "#dde",
+  border: "1px solid rgba(255, 255, 255, 0.12)",
+  borderRadius: "6px",
+  cursor: "pointer",
+  fontWeight: 600,
+  fontSize: "13px",
+  fontFamily: "inherit",
+  transition: "all 0.15s ease",
+};
+
+const btnAccent: React.CSSProperties = {
+  padding: "6px 14px",
+  background: "linear-gradient(135deg, #16a34a, #128a3e)",
+  color: "#fff",
+  border: "none",
+  borderRadius: "6px",
+  cursor: "pointer",
+  fontWeight: 700,
+  fontSize: "13px",
+  fontFamily: "inherit",
+  boxShadow: "0 0 12px rgba(22, 163, 74, 0.3)",
+};
+
+const btnGhost: React.CSSProperties = {
+  padding: "6px 12px",
+  background: "transparent",
+  color: "#999",
+  border: "1px solid rgba(255, 255, 255, 0.08)",
+  borderRadius: "6px",
+  cursor: "pointer",
+  fontWeight: 500,
+  fontSize: "13px",
+  fontFamily: "inherit",
 };
 
 const selectStyle: React.CSSProperties = {
   padding: "4px 8px",
-  background: "#1a1a2e",
-  color: "#eee",
-  border: "1px solid #555",
+  background: "rgba(10, 10, 20, 0.8)",
+  color: "#dde",
+  border: "1px solid rgba(255, 255, 255, 0.12)",
   borderRadius: "4px",
+  fontSize: "12px",
+  fontFamily: "inherit",
 };
 
-const dividerStyle: React.CSSProperties = {
+const divider: React.CSSProperties = {
   width: "1px",
-  height: "28px",
-  background: "#555",
+  height: "24px",
+  background: "rgba(255, 255, 255, 0.1)",
 };

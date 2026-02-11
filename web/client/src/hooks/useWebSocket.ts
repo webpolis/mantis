@@ -59,6 +59,8 @@ export function useWebSocket() {
   const [viewIndex, setViewIndex] = useState<number | null>(null);
   const viewIndexRef = useRef<number | null>(null);
   const biomesRef = useRef<BiomeData[]>([]);
+  const popHistoryRef = useRef<Map<number, number[]>>(new Map());
+  const [populationHistory, setPopulationHistory] = useState<Map<number, number[]>>(new Map());
 
   useEffect(() => {
     const socket = io(window.location.origin, {
@@ -130,6 +132,16 @@ export function useWebSocket() {
       };
       historyRef.current.push(frame);
       setHistoryLength(historyRef.current.length);
+
+      // Update population ring buffer (last 30 values per species)
+      const popMap = popHistoryRef.current;
+      for (const sp of mergedSpecies) {
+        let arr = popMap.get(sp.sid);
+        if (!arr) { arr = []; popMap.set(sp.sid, arr); }
+        arr.push(sp.population);
+        if (arr.length > 30) arr.shift();
+      }
+      setPopulationHistory(new Map(popMap));
 
       // Only update displayed state when following live
       if (viewIndexRef.current === null) {
@@ -261,6 +273,8 @@ export function useWebSocket() {
     setIsPlaying(true);
     setBiomes([]);
     biomesRef.current = [];
+    popHistoryRef.current = new Map();
+    setPopulationHistory(new Map());
     if (mode === "model") {
       socket.emit("start_model", {
         model: selectedModel,
@@ -372,5 +386,6 @@ export function useWebSocket() {
     seekTo,
     followLatest,
     epochs,
+    populationHistory,
   };
 }

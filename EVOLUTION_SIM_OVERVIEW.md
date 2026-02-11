@@ -264,7 +264,7 @@ Generate 3 partitioned datasets by complexity tier, then train with `train_evo.p
 # 1. Generate partitioned datasets (compact v2 format)
 python scripts/gen_evo_dataset.py --worlds 5000 --max-epoch CAMBRIAN  --output data/evo_bio.txt --compact --workers 8
 python scripts/gen_evo_dataset.py --worlds 5000 --max-epoch ECOSYSTEM --output data/evo_eco.txt --compact --workers 8 --enable-agents
-python scripts/gen_evo_dataset.py --worlds 5000                       --output data/evo_intel.txt --compact --workers 8 --enable-agents
+python scripts/gen_evo_dataset.py --worlds 5000  --output data/evo_intel.txt --compact --workers 8 --enable-agents
 
 # 2. Train with curriculum (tiny model, single GPU, 12GB VRAM)
 python train_evo.py \

@@ -157,13 +157,13 @@ BODY_PLAN_TRANSITIONS: list[tuple[str, str, dict]] = [
 
 PREREQUISITES: dict[str, list[tuple[str, int]]] = {
     # T1 <- T0
-    "social":      [("sense", 4), ("repro", 3)],
+    "social":      [("sense", 3), ("repro", 2)],
     "aggression":  [("speed", 3), ("size", 3)],
-    "curiosity":   [("sense", 5), ("speed", 3)],
+    "curiosity":   [("sense", 3), ("speed", 3)],
     "patience":    [("endurance", 4), ("sense", 3)],
     "nocturnal":   [("sense", 6)],
     # T2 <- T1
-    "intel":       [("curiosity", 3), ("social", 3)],
+    "intel":       [("curiosity", 2), ("social", 2)],
     "memory":      [("sense", 5), ("curiosity", 4)],
     "learning":    [("intel", 3), ("curiosity", 4)],
     "planning":    [("intel", 4), ("memory", 3)],
@@ -393,8 +393,8 @@ EPOCH_CONFIG: dict[Epoch, dict] = {
     },
     Epoch.ECOSYSTEM: {
         "tick_scale": 1,
-        # 1/1 = 1.0 per gen (baseline)
-        "mutation_rate_mult": 1.0,
+        # 2/1 = 2.0 per gen (arms-race pressure)
+        "mutation_rate_mult": 2.0,
         "speciation_prob": 0.04,
         "description": "Niche specialization, migration, stable food webs",
     },

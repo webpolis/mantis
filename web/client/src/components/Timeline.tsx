@@ -14,16 +14,19 @@ interface Props {
   onFollowLatest: () => void;
 }
 
-const EPOCH_COLORS = [
-  "#e94560",
-  "#16a34a",
-  "#3b82f6",
-  "#f59e0b",
-  "#8b5cf6",
-  "#06b6d4",
-  "#ec4899",
-  "#84cc16",
-];
+const EPOCH_NAMES: Record<number, string> = {
+  1: "Primordial",
+  2: "Cambrian",
+  3: "Ecosystem",
+  4: "Intelligence",
+};
+
+const EPOCH_COLORS: Record<number, string> = {
+  1: "#ff6633",
+  2: "#3399ff",
+  3: "#33cc66",
+  4: "#ffcc33",
+};
 
 export function Timeline({
   historyLength,
@@ -45,11 +48,8 @@ export function Timeline({
       onSeek(Math.max(0, displayIndex - 1));
     } else if (e.key === "ArrowRight") {
       e.preventDefault();
-      if (displayIndex >= max) {
-        onFollowLatest();
-      } else {
-        onSeek(Math.min(max, displayIndex + 1));
-      }
+      if (displayIndex >= max) onFollowLatest();
+      else onSeek(Math.min(max, displayIndex + 1));
     } else if (e.key === "End") {
       e.preventDefault();
       onFollowLatest();
@@ -59,68 +59,85 @@ export function Timeline({
     }
   };
 
+  // Build gradient for epoch-colored slider track
+  const trackGradient = epochs.length > 1 && max > 0
+    ? epochs.map((seg) => {
+        const color = EPOCH_COLORS[seg.epoch] || "#555";
+        const start = (seg.startIndex / max) * 100;
+        const end = (seg.endIndex / max) * 100;
+        return `${color} ${start}%, ${color} ${end}%`;
+      }).join(", ")
+    : undefined;
+
   return (
-    <div
-      style={{
-        padding: "8px 16px",
-        background: "#0f3460",
-        borderRadius: "4px",
-        marginBottom: "8px",
-        border: isFollowing ? "1px solid transparent" : "1px solid #f59e0b",
-      }}
-    >
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: "12px",
-          marginBottom: "4px",
-        }}
-      >
-        <span style={{ fontFamily: "monospace", fontSize: "13px", color: "#ccc", minWidth: "120px" }}>
-          Frame {displayIndex + 1} / {historyLength}
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 4 }}>
+        <span style={{ fontFamily: "monospace", fontSize: "12px", color: "#888" }}>
+          {displayIndex + 1} / {historyLength}
         </span>
-        <span style={{ fontFamily: "monospace", fontSize: "13px", color: EPOCH_COLORS[(currentEpoch - 1) % EPOCH_COLORS.length] }}>
-          Epoch {currentEpoch}
-        </span>
+
+        {isFollowing && (
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{
+              width: 6, height: 6,
+              borderRadius: "50%",
+              background: "#4ade80",
+              boxShadow: "0 0 6px #4ade80",
+              display: "inline-block",
+              animation: "pulse 2s ease infinite",
+            }} />
+            <span style={{ fontSize: "11px", color: "#4ade80", fontWeight: 600, letterSpacing: "0.5px" }}>
+              LIVE
+            </span>
+          </div>
+        )}
+
         {!isFollowing && (
           <>
-            <span
-              style={{
-                fontSize: "11px",
-                fontWeight: "bold",
-                color: "#f59e0b",
-                textTransform: "uppercase",
-                letterSpacing: "0.5px",
-              }}
-            >
+            <span style={{
+              fontSize: "10px",
+              fontWeight: 700,
+              color: "#f59e0b",
+              textTransform: "uppercase",
+              letterSpacing: "0.5px",
+            }}>
               Reviewing
             </span>
-            <button onClick={onFollowLatest} style={followBtnStyle}>
+            <button onClick={onFollowLatest} style={followBtn}>
               Follow Live
             </button>
           </>
+        )}
+
+        {/* Epoch labels */}
+        {epochs.length > 0 && (
+          <div style={{ marginLeft: "auto", display: "flex", gap: 8, fontSize: "10px" }}>
+            {epochs.map((seg) => (
+              <span
+                key={`${seg.epoch}-${seg.startIndex}`}
+                style={{
+                  color: EPOCH_COLORS[seg.epoch] || "#666",
+                  fontWeight: seg.epoch === currentEpoch ? 700 : 400,
+                  opacity: seg.epoch === currentEpoch ? 1 : 0.5,
+                }}
+              >
+                {EPOCH_NAMES[seg.epoch] || `E${seg.epoch}`}
+              </span>
+            ))}
+          </div>
         )}
       </div>
 
       {/* Epoch color bar */}
       {epochs.length > 1 && max > 0 && (
-        <div
-          style={{
-            display: "flex",
-            height: "4px",
-            borderRadius: "2px",
-            overflow: "hidden",
-            marginBottom: "4px",
-          }}
-        >
+        <div style={{ display: "flex", height: 3, borderRadius: 2, overflow: "hidden", marginBottom: 4 }}>
           {epochs.map((seg) => (
             <div
               key={`${seg.epoch}-${seg.startIndex}`}
               style={{
                 flex: seg.endIndex - seg.startIndex + 1,
-                background: EPOCH_COLORS[(seg.epoch - 1) % EPOCH_COLORS.length],
-                opacity: 0.6,
+                background: EPOCH_COLORS[seg.epoch] || "#555",
+                opacity: 0.5,
               }}
             />
           ))}
@@ -136,22 +153,30 @@ export function Timeline({
         onKeyDown={handleKeyDown}
         style={{
           width: "100%",
-          accentColor: "#e94560",
+          accentColor: EPOCH_COLORS[currentEpoch] || "#e94560",
           cursor: "pointer",
+          height: "4px",
         }}
       />
+
+      <style>{`
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.4; }
+        }
+      `}</style>
     </div>
   );
 }
 
-const followBtnStyle: React.CSSProperties = {
-  padding: "3px 10px",
+const followBtn: React.CSSProperties = {
+  padding: "2px 10px",
   background: "#f59e0b",
   color: "#000",
   border: "none",
-  borderRadius: "3px",
+  borderRadius: "4px",
   cursor: "pointer",
-  fontWeight: "bold",
-  fontSize: "12px",
-  marginLeft: "auto",
+  fontWeight: 700,
+  fontSize: "11px",
+  fontFamily: "inherit",
 };

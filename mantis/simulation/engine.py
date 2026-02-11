@@ -744,7 +744,7 @@ class World:
                 td.widen(0.05)
             else:
                 td.narrow(0.05)
-        elif roll < 0.90:
+        elif roll < 0.95:
             mut_type = "Mleap"
             delta = float(self.rng.choice([-2.0, -1.5, 1.5, 2.0]))
         else:
@@ -791,11 +791,11 @@ class World:
         if not candidates:
             return
 
-        prob = {0: 0.12, 1: 0.06, 2: 0.04, 3: 0.025, 4: 0.012}
+        prob = {0: 0.12, 1: 0.10, 2: 0.08, 3: 0.04, 4: 0.02}
         trait = str(self.rng.choice(candidates))
         tier = TRAIT_TO_TIER[trait]
         if self.rng.random() < prob.get(tier, 0.01) * mut_mult:
-            init_mean = float(self.rng.uniform(0.5, 2.5))
+            init_mean = float(self.rng.uniform(1.5, 4.0))
             init_var = float(self.rng.uniform(0.2, 1.0))
             cap = sp.body_plan.get_cap(trait)
             if cap is not None:
@@ -1390,9 +1390,9 @@ class World:
                 self.epoch_just_changed = True
 
         elif self.epoch == Epoch.ECOSYSTEM:
-            # Transition to INTELLIGENCE: any species has spotlight_score > 15
+            # Transition to INTELLIGENCE: any species has spotlight_score > 3
             for sp in alive:
-                if sp.spotlight_score() > 15.0:
+                if sp.spotlight_score() > 3.0:
                     self.epoch = Epoch.INTELLIGENCE
                     self.epoch_just_changed = True
                     return
