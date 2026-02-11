@@ -59,7 +59,7 @@ def _import_simulation():
 def simulate_world(wid: int, seed: int, max_gens: int, keyframe_interval: int,
                    enable_agents: bool = False, agent_epoch: str = "INTELLIGENCE",
                    agent_threshold: float = 15.0, compact: bool = False,
-                   output_file: str | None = None):
+                   output_file: str | None = None, max_epoch: str | None = None):
     """Run one world simulation. Standalone function for process pool.
 
     When output_file is provided, streams text to that file instead of
@@ -76,8 +76,16 @@ def simulate_world(wid: int, seed: int, max_gens: int, keyframe_interval: int,
     f = open(output_file, "w") if output_file else None
     try:
         blocks = [] if f is None else None
+        if max_epoch is not None:
+            Epoch = sim.Epoch
+            epoch_cap = Epoch[max_epoch].value
+
         for _ in range(max_gens):
             world.step()
+
+            if max_epoch is not None and world.epoch.value > epoch_cap:
+                break
+
             block = serializer.serialize_tick(world)
             if f is not None:
                 f.write(block)
@@ -132,6 +140,7 @@ def generate_dataset(args):
         agent_epoch=args.agent_epoch,
         agent_threshold=args.agent_threshold,
         compact=args.compact,
+        max_epoch=args.max_epoch,
     )
 
     def accumulate_stats(stats):
@@ -253,6 +262,9 @@ def main():
                         help="Spotlight score threshold for INTELLIGENCE agent activation (default: 15.0)")
     parser.add_argument("--compact", action="store_true",
                         help="Use compact v2 format (int-scaled, space-separated, ~50%% fewer tokens)")
+    parser.add_argument("--max-epoch", type=str, default=None,
+                        choices=["PRIMORDIAL", "CAMBRIAN", "ECOSYSTEM", "INTELLIGENCE"],
+                        help="Cap worlds at this epoch (for partitioned dataset generation)")
     args = parser.parse_args()
 
     generate_dataset(args)

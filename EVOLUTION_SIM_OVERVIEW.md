@@ -256,35 +256,68 @@ Pad tokens get weight 0.0.
 
 ## Training an Evolution Model
 
-### Recommended approach (population-only)
+### Recommended approach: Curriculum training with `train_evo.py`
+
+Generate 3 partitioned datasets by complexity tier, then train with `train_evo.py` which mixes them with shifting proportions via a curriculum schedule.
 
 ```bash
-# 1. Generate dataset (compact v2 format)
+# 1. Generate partitioned datasets (compact v2 format)
+python scripts/gen_evo_dataset.py --worlds 5000 --max-epoch CAMBRIAN  --output data/evo_bio.txt --compact --workers 8
+python scripts/gen_evo_dataset.py --worlds 5000 --max-epoch ECOSYSTEM --output data/evo_eco.txt --compact --workers 8 --enable-agents
+python scripts/gen_evo_dataset.py --worlds 5000                       --output data/evo_intel.txt --compact --workers 8 --enable-agents
+
+# 2. Train with curriculum (tiny model, single GPU, 12GB VRAM)
+python train_evo.py \
+    --bio data/evo_bio.txt --eco data/evo_eco.txt --intel data/evo_intel.txt \
+    --model-size tiny --seq-len 2048 --batch-size 8 \
+    --steps-per-epoch 1000 --epochs 20 \
+    --learning-rate 5e-4 --warmup-steps 2000 \
+    --mixed-precision --val-split 0.1
+
+# 3. Generate from trained model
+python inference_evo.py checkpoints/evo_train/best_model.pt \
+    --new-world --seed 42 --max-ticks 100
+```
+
+`--max-epoch CAMBRIAN` caps worlds at the CAMBRIAN epoch (they can enter CAMBRIAN but stop before ECOSYSTEM). This creates a "bio" partition with simpler ecological dynamics. The `--max-epoch` flag uses `>` comparison, so the named epoch is included.
+
+`train_evo.py` key features:
+- **`EvoWorldDataset`**: World-boundary-aware chunking (splits on `\n\n`, never crosses worlds)
+- **`CurriculumDataset`**: IterableDataset mixing partitions with token-budget proportions that shift across training
+- **Weighted cross-entropy**: Per-token loss weights from `tokenizer.compute_loss_weights()` (protocol markers set weight)
+- **`--steps-per-epoch`** is required (IterableDataset has no `__len__`)
+- Schedule presets: `default` (gradual shift), `linear`, `bio-only`
+
+### Alternative: Single-file training with `train.py`
+
+For quick iteration without curriculum mixing, `train.py` works with a single evolution dataset:
+
+```bash
+# Generate single dataset
 python scripts/gen_evo_dataset.py --worlds 10000 --max-generations 200 \
     --output data/evo_train.txt --workers 8 --seed 42 --compact
 
-# 2. Train (tiny model, single GPU, 12GB VRAM)
+# Train (no per-token weighting, no curriculum)
 python train.py --stage 1 data/evo_train.txt \
     --model-size tiny --seq-len 2048 --stride 1024 --batch-size 8 \
     --gradient-accumulation-steps 4 --learning-rate 5e-4 \
     --warmup-steps 2000 --epochs 10 --mixed-precision --val-split 0.1
 ```
 
-### Recommended approach (with agent simulation)
+Note: `train.py` uses plain cross-entropy (no per-token weighting) and `TextDataset` (which does not respect world boundaries). For production evolution training, prefer `train_evo.py`.
 
-Agent blocks use grid+notable hybrid format to keep token volume manageable. A single ECOSYSTEM agent keyframe tick has a median of ~721 tokens (p95 = 6,139) with the 512-token trie tokenizer. Standard sequence lengths work with adjusted keyframe intervals.
+### Agent-enabled training
+
+Agent blocks use grid+notable hybrid format. A single ECOSYSTEM agent keyframe tick has a median of ~721 tokens (p95 = 6,139) with the 512-token trie tokenizer. Use `--enable-agents` on the eco and intel partitions (agents only activate at `--agent-epoch`, default ECOSYSTEM — the bio partition never reaches that epoch).
 
 ```bash
-# 1. Generate dataset (agents enabled, compact v2 format)
-python scripts/gen_evo_dataset.py --worlds 10000 --max-generations 200 \
-    --output data/evo_agents_train.txt --workers 8 --seed 42 \
-    --enable-agents --agent-epoch ECOSYSTEM --keyframe-interval 40 --compact
-
-# 2. Train (tiny model, 24GB GPU)
-python train.py --stage 1 data/evo_agents_train.txt \
-    --model-size tiny --seq-len 4096 --batch-size 8 \
+# Agent-enabled with longer sequences (24GB GPU)
+python train_evo.py \
+    --bio data/evo_bio.txt --eco data/evo_eco.txt --intel data/evo_intel.txt \
+    --model-size tiny --seq-len 4096 --batch-size 4 \
+    --steps-per-epoch 1000 --epochs 20 \
     --gradient-accumulation-steps 4 --learning-rate 5e-4 \
-    --warmup-steps 3000 --epochs 10 --mixed-precision \
+    --warmup-steps 3000 --mixed-precision \
     --gradient-checkpointing --val-split 0.1
 ```
 
@@ -363,6 +396,8 @@ Don't train sequentially (biology → ecosystems → intelligence) — causes ca
 
 **Important**: Mix by **token count**, not world count. Agent-enabled ECOSYSTEM worlds produce 2-5x more tokens per world than population-only worlds (v2 compact). Mixing by world count causes agent tokens to dominate training, overfitting the model to coordinate prediction at the expense of core ecological dynamics.
 
+`train_evo.py` implements this via `CurriculumDataset`, which tracks global training progress and shifts proportions automatically. The default schedule:
+
 | Progress | Bio tokens | Ecosystem tokens | Intelligence tokens |
 | -------- | ---------- | ---------------- | ------------------- |
 | 0-20%    | 100%       | 0%               | 0%                  |
@@ -370,7 +405,7 @@ Don't train sequentially (biology → ecosystems → intelligence) — causes ca
 | 40-60%   | 25%        | 35%              | 40%                 |
 | 60-100%  | 20%        | 30%              | 50%                 |
 
-Generate three separate files partitioned by max epoch reached and mix with a curriculum sampler that samples **by token budget per batch**, not by file line count.
+Progress is computed globally across all epochs (`global_tokens / total_budget`), not per-epoch. Use `--schedule linear` for uniform mixing or `--schedule bio-only` for single-partition training.
 
 ### Evaluation metrics
 
@@ -409,3 +444,38 @@ Perplexity alone is insufficient. Track:
 ### What the trained model can do
 
 Given a partial simulation trace, the model autoregressively continues it — predicting population changes, trait mutations, energy flows, species interactions, body plan transitions, individual agent behaviors and positions, and (for intelligent species) spotlight scenes with chain-of-thought reasoning. A game engine can sample from this model to run an evolving universe in real time.
+
+### Inference with `inference_evo.py`
+
+Tick-by-tick generation with `---` separator detection. Designed as an importable module for web apps.
+
+```bash
+# CLI: generate a new world
+python inference_evo.py checkpoints/evo_train/best_model.pt \
+    --new-world --seed 42 --max-ticks 100
+
+# CLI: continue from partial trace
+python inference_evo.py checkpoints/evo_train/best_model.pt \
+    --continue trace.txt --max-ticks 50
+
+# CLI: save to file
+python inference_evo.py checkpoints/evo_train/best_model.pt \
+    --new-world --seed 0 --output generated_world.txt
+```
+
+```python
+# Python API (for web app / WebSocket streaming)
+from inference_evo import EvoInferenceEngine
+
+engine = EvoInferenceEngine("checkpoints/evo_train/best_model.pt")
+
+# Stream ticks to client
+for tick in engine.generate_world(seed=42, temperature=0.7):
+    send_to_client(tick)
+
+# Continue from existing state
+for tick in engine.continue_trace(existing_trace, max_ticks=10):
+    send_to_client(tick)
+```
+
+`EvoInferenceEngine` maintains a rolling context window, left-truncating at `---` boundaries when the context exceeds the model's max sequence length.

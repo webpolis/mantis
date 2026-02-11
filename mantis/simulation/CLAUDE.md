@@ -20,7 +20,14 @@ python scripts/gen_evo_dataset.py --worlds 10000 --max-generations 200 \
 
 # Agents at earlier epoch (simpler behaviors)
 python scripts/gen_evo_dataset.py --worlds 1000 --enable-agents --agent-epoch ECOSYSTEM
+
+# Partitioned generation for curriculum training (cap by epoch)
+python scripts/gen_evo_dataset.py --worlds 5000 --max-epoch CAMBRIAN  --output data/evo_bio.txt --compact --workers 8
+python scripts/gen_evo_dataset.py --worlds 5000 --max-epoch ECOSYSTEM --output data/evo_eco.txt --compact --workers 8 --enable-agents
+python scripts/gen_evo_dataset.py --worlds 5000                       --output data/evo_intel.txt --compact --workers 8 --enable-agents
 ```
+
+`--max-epoch` caps worlds at the named epoch (uses `>` comparison: `--max-epoch ECOSYSTEM` allows entry into ECOSYSTEM but stops before INTELLIGENCE).
 
 `gen_evo_dataset.py` uses `importlib` to import this module directly, bypassing `mantis/__init__.py` to avoid pulling in CUDA dependencies. This module has **no CUDA deps** — only numpy and stdlib.
 

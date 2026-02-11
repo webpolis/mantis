@@ -68,6 +68,43 @@ python train.py --stage 3 \
     --rl-episodes 50000
 ```
 
+## Evolution Curriculum Training
+
+Dedicated training pipeline for the evolution simulation with per-token loss weighting and curriculum mixing across complexity tiers.
+
+```bash
+# 1. Generate partitioned datasets (cap by epoch)
+python scripts/gen_evo_dataset.py --worlds 5000 --max-epoch CAMBRIAN  --output data/evo_bio.txt --compact --workers 8
+python scripts/gen_evo_dataset.py --worlds 5000 --max-epoch ECOSYSTEM --output data/evo_eco.txt --compact --workers 8 --enable-agents
+python scripts/gen_evo_dataset.py --worlds 5000                       --output data/evo_intel.txt --compact --workers 8 --enable-agents
+
+# 2. Train with curriculum (all 3 partitions)
+python train_evo.py \
+    --bio data/evo_bio.txt --eco data/evo_eco.txt --intel data/evo_intel.txt \
+    --model-size tiny --seq-len 2048 --batch-size 8 \
+    --steps-per-epoch 1000 --epochs 20 \
+    --learning-rate 5e-4 --warmup-steps 2000 \
+    --mixed-precision --val-split 0.1
+
+# Single partition (bio only)
+python train_evo.py --bio data/evo_bio.txt --schedule bio-only \
+    --model-size micro --seq-len 256 --batch-size 4 \
+    --steps-per-epoch 100 --epochs 5 --val-split 0.1
+
+# Resume from checkpoint
+python train_evo.py --bio data/evo_bio.txt \
+    --resume checkpoints/evo_train/best_model.pt \
+    --tokenizer-path checkpoints/evo_train/tokenizer \
+    --steps-per-epoch 1000 --epochs 40 --val-split 0.1
+```
+
+**Key differences from `train.py`**:
+- Uses `EvoWorldDataset` (world-boundary-aware chunking, never crosses `\n\n` boundaries)
+- Per-token loss weights via `tokenizer.compute_loss_weights()` (protocol markers set weight for subsequent tokens)
+- `CurriculumDataset` (IterableDataset) mixes partitions with shifting proportions across training
+- `--steps-per-epoch` is required (IterableDataset has no length)
+- Three schedule presets: `default` (gradual shift), `linear`, `bio-only`
+
 ## Inference Commands
 
 ```bash
@@ -89,6 +126,33 @@ python inference.py checkpoints/stage1/best_model.pt \
     --quantize int8
 ```
 
+### Evolution Inference
+
+Tick-by-tick generation of evolution simulation traces. Importable as a module for web apps.
+
+```bash
+# Generate a new world
+python inference_evo.py checkpoints/evo_train/best_model.pt \
+    --new-world --seed 42 --max-ticks 100
+
+# Continue from partial trace
+python inference_evo.py checkpoints/evo_train/best_model.pt \
+    --continue trace.txt --max-ticks 50
+
+# Generate from custom prompt
+python inference_evo.py checkpoints/evo_train/best_model.pt \
+    --prompt "=EPOCH 1 1000 W0"
+```
+
+```python
+# Python API (for web app integration)
+from inference_evo import EvoInferenceEngine
+
+engine = EvoInferenceEngine("checkpoints/evo_train/best_model.pt")
+for tick in engine.generate_world(seed=42, temperature=0.7):
+    send_to_client(tick)
+```
+
 ### RTX 3060 cuBLAS Bug Workaround
 
 If you encounter `CUBLAS_STATUS_NOT_INITIALIZED` errors during inference:
@@ -99,7 +163,7 @@ export TORCH_BLAS_PREFER_CUBLASLT=0
 python inference.py checkpoints/stage1/best_model.pt --prompt "Hello"
 ```
 
-This bug affects RTX 30xx/40xx series and A-series Ampere GPUs at sequence length ≥5 with large vocabulary matrices (128K tokens). The workaround is automatically applied in `train.py` and `inference.py`.
+This bug affects RTX 30xx/40xx series and A-series Ampere GPUs at sequence length ≥5 with large vocabulary matrices (128K tokens). The workaround is automatically applied in `train.py`, `train_evo.py`, `inference.py`, and `inference_evo.py`.
 
 ## Testing
 
@@ -158,8 +222,12 @@ evaluation/              # Evaluation harness
 ├── benchmarks.py        # MMLU, TruthfulQA, HumanEval, GSM8K
 └── metrics.py           # Accuracy, F1, hallucination rate
 
+train_evo.py             # Evolution curriculum training (weighted loss, partition mixing)
+inference_evo.py         # Evolution tick-by-tick inference (importable for web apps)
+
 scripts/                 # Utility scripts
 ├── preprocess_data.py   # Pre-tokenize datasets (5-10x faster)
+├── gen_evo_dataset.py   # Generate evolution simulation traces (supports --max-epoch partitioning)
 ├── split_dataset.py     # Split train/val for reproducibility
 └── run_eval.py          # Run benchmark evaluations
 ```
