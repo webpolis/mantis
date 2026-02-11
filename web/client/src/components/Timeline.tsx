@@ -72,7 +72,7 @@ export function Timeline({
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 4 }}>
-        <span style={{ fontFamily: "monospace", fontSize: "12px", color: "#888" }}>
+        <span style={{ fontFamily: "monospace", fontSize: "14px", color: "#999" }}>
           {displayIndex + 1} / {historyLength}
         </span>
 
@@ -86,7 +86,7 @@ export function Timeline({
               display: "inline-block",
               animation: "pulse 2s ease infinite",
             }} />
-            <span style={{ fontSize: "11px", color: "#4ade80", fontWeight: 600, letterSpacing: "0.5px" }}>
+            <span style={{ fontSize: "13px", color: "#4ade80", fontWeight: 600, letterSpacing: "0.5px" }}>
               LIVE
             </span>
           </div>
@@ -95,7 +95,7 @@ export function Timeline({
         {!isFollowing && (
           <>
             <span style={{
-              fontSize: "10px",
+              fontSize: "12px",
               fontWeight: 700,
               color: "#f59e0b",
               textTransform: "uppercase",
@@ -111,7 +111,7 @@ export function Timeline({
 
         {/* Epoch labels */}
         {epochs.length > 0 && (
-          <div style={{ marginLeft: "auto", display: "flex", gap: 8, fontSize: "10px" }}>
+          <div style={{ marginLeft: "auto", display: "flex", gap: 8, fontSize: "12px" }}>
             {epochs.map((seg) => (
               <span
                 key={`${seg.epoch}-${seg.startIndex}`}
@@ -170,13 +170,13 @@ export function Timeline({
 }
 
 const followBtn: React.CSSProperties = {
-  padding: "2px 10px",
+  padding: "3px 12px",
   background: "#f59e0b",
   color: "#000",
   border: "none",
   borderRadius: "4px",
   cursor: "pointer",
   fontWeight: 700,
-  fontSize: "11px",
+  fontSize: "13px",
   fontFamily: "inherit",
 };

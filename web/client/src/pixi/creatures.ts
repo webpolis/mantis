@@ -525,7 +525,7 @@ export class CreatureRenderer {
     return entry;
   }
 
-  update(agents: AgentSnapshot[], species: SpeciesInfo[], hoveredAid?: number | null) {
+  update(agents: AgentSnapshot[], species: SpeciesInfo[], hoveredUid?: string | null) {
     this.speciesMap = new Map(species.map((s) => [s.sid, s]));
 
     // Release all
@@ -553,7 +553,7 @@ export class CreatureRenderer {
       const frameIndex = (entry.sprite as any).__animFrame || 0;
       entry.sprite.texture = textures.frames[frameIndex % ANIM_FRAMES];
       (entry.sprite as any).__bodyPlan = bodyPlan;
-      (entry.sprite as any).__aid = agent.aid;
+      (entry.sprite as any).__aid = agent.uid;
 
       // Scale based on count
       const baseScale = (0.4 + Math.sqrt(agent.count || 1) * 0.15);
@@ -573,7 +573,7 @@ export class CreatureRenderer {
       }
 
       // Hover highlight
-      if (agent.aid === hoveredAid) {
+      if (agent.uid === hoveredUid) {
         entry.highlight.visible = true;
         entry.highlight.clear();
         const hlR = SPRITE_SIZE * baseScale * 0.6;

@@ -90,6 +90,27 @@ export function useWebSocket() {
         mergedSpecies = prevSpecies;
       }
 
+      // Merge agents: carry forward previous, overlay current (handles delta ticks)
+      let mergedAgents: AgentSnapshot[];
+      if (data.agents.length > 0) {
+        const prevAgents = historyRef.current.length > 0
+          ? historyRef.current[historyRef.current.length - 1].agents
+          : [];
+        const agentMap = new Map(prevAgents.map((a) => [a.uid, a]));
+        for (const a of data.agents) {
+          if (a.dead) {
+            agentMap.delete(a.uid);
+          } else {
+            agentMap.set(a.uid, a);
+          }
+        }
+        mergedAgents = Array.from(agentMap.values());
+      } else {
+        mergedAgents = historyRef.current.length > 0
+          ? historyRef.current[historyRef.current.length - 1].agents
+          : [];
+      }
+
       const tickEvents = data.events ?? [];
 
       // Append to event log
@@ -126,7 +147,7 @@ export function useWebSocket() {
         tick: data.tick,
         epoch: data.epoch,
         species: mergedSpecies,
-        agents: data.agents,
+        agents: mergedAgents,
         biomes: biomesRef.current.map((b) => ({ ...b, patches: [...b.patches] })),
         events: tickEvents,
       };
@@ -148,7 +169,7 @@ export function useWebSocket() {
         setTick(data.tick);
         setEpoch(data.epoch);
         setSpecies(mergedSpecies);
-        setAgents(data.agents);
+        setAgents(mergedAgents);
         setEvents(tickEvents);
         setInterpolateDuration(data.interpolate_duration);
       }
@@ -268,6 +289,10 @@ export function useWebSocket() {
     eventLogRef.current = [];
     setEventLog([]);
     setEvents([]);
+    setAgents([]);
+    setSpecies([]);
+    setTick(0);
+    setEpoch(1);
     viewIndexRef.current = null;
     setViewIndex(null);
     setIsPlaying(true);
@@ -321,6 +346,34 @@ export function useWebSocket() {
     setAgents(frame.agents);
     setBiomes(frame.biomes);
     setEvents(frame.events);
+  }, []);
+
+  const seekToTick = useCallback((tickNum: number) => {
+    // Find the history frame matching this tick, pause, and seek
+    socketRef.current?.emit("pause");
+    setIsPlaying(false);
+    const history = historyRef.current;
+    let idx = -1;
+    for (let i = 0; i < history.length; i++) {
+      if (history[i].tick === tickNum) { idx = i; break; }
+    }
+    if (idx === -1 && history.length > 0) {
+      // Closest frame with tick <= tickNum
+      for (let i = history.length - 1; i >= 0; i--) {
+        if (history[i].tick <= tickNum) { idx = i; break; }
+      }
+    }
+    if (idx >= 0) {
+      const frame = history[idx];
+      viewIndexRef.current = idx;
+      setViewIndex(idx);
+      setTick(frame.tick);
+      setEpoch(frame.epoch);
+      setSpecies(frame.species);
+      setAgents(frame.agents);
+      setBiomes(frame.biomes);
+      setEvents(frame.events);
+    }
   }, []);
 
   const followLatest = useCallback(() => {
@@ -384,6 +437,7 @@ export function useWebSocket() {
     viewIndex,
     isFollowing,
     seekTo,
+    seekToTick,
     followLatest,
     epochs,
     populationHistory,

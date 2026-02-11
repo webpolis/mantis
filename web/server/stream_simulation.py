@@ -630,9 +630,11 @@ def split_worlds(text: str) -> list[str]:
 
 def serialize_agent_for_frontend(agent: ParsedAgent, species_sid: int | None = None) -> dict:
     """Convert ParsedAgent to JSON-serializable dict for Socket.IO."""
+    sid = species_sid if species_sid is not None else agent.species_sid
     return {
+        "uid": f"{sid}_{agent.aid}",
         "aid": agent.aid,
-        "species_sid": species_sid if species_sid is not None else agent.species_sid,
+        "species_sid": sid,
         "x": agent.x,
         "y": agent.y,
         "energy": agent.energy,

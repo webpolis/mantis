@@ -18,8 +18,8 @@ function getIcon(plan: string): string {
 
 export function SpeciesPanel({ species, populationHistory }: Props) {
   return (
-    <div style={{ minWidth: 230 }}>
-      <h3 style={{ marginBottom: 8, fontSize: "14px", fontWeight: 700, color: "#e94560", letterSpacing: "1px", textTransform: "uppercase" }}>
+    <div style={{ minWidth: 240 }}>
+      <h3 style={{ marginBottom: 8, fontSize: "15px", fontWeight: 700, color: "#e94560", letterSpacing: "1px", textTransform: "uppercase" }}>
         Species ({species.length})
       </h3>
       {species.map((sp) => {
@@ -33,8 +33,8 @@ export function SpeciesPanel({ species, populationHistory }: Props) {
             key={sp.sid}
             style={{
               marginBottom: 6,
-              padding: "6px 8px",
-              background: "rgba(255, 255, 255, 0.03)",
+              padding: "7px 10px",
+              background: "rgba(255, 255, 255, 0.06)",
               borderRadius: "6px",
               borderLeft: `3px solid ${color}`,
               display: "flex",
@@ -52,11 +52,11 @@ export function SpeciesPanel({ species, populationHistory }: Props) {
             />
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <span style={{ fontSize: "13px", fontWeight: 600 }}>S{sp.sid}</span>
-                <span style={{ fontSize: "11px", color: "#888" }}>{sp.plan}</span>
+                <span style={{ fontSize: "14px", fontWeight: 600 }}>S{sp.sid}</span>
+                <span style={{ fontSize: "13px", color: "#999" }}>{sp.plan}</span>
                 {delta !== 0 && (
                   <span style={{
-                    fontSize: "10px",
+                    fontSize: "12px",
                     fontWeight: 700,
                     color: delta > 0 ? "#4ade80" : "#f87171",
                     marginLeft: "auto",
@@ -66,7 +66,7 @@ export function SpeciesPanel({ species, populationHistory }: Props) {
                 )}
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 2 }}>
-                <span style={{ fontSize: "12px", color: "#aaa" }}>
+                <span style={{ fontSize: "13px", color: "#bbb" }}>
                   {sp.population.toLocaleString()}
                 </span>
                 {history.length > 2 && (
@@ -78,7 +78,7 @@ export function SpeciesPanel({ species, populationHistory }: Props) {
         );
       })}
       {species.length === 0 && (
-        <div style={{ color: "#555", fontSize: "12px" }}>
+        <div style={{ color: "#666", fontSize: "13px" }}>
           No species data yet. Start a simulation.
         </div>
       )}

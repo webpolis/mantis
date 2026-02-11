@@ -130,8 +130,8 @@ export function Controls({
           )}
 
           {worldCount > 0 && (
-            <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "13px" }}>
-              <span style={{ color: "#888" }}>W:</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "14px" }}>
+              <span style={{ color: "#999" }}>W:</span>
               <input
                 type="number"
                 min={0}
@@ -140,16 +140,16 @@ export function Controls({
                 onChange={(e) => handleWorldChange(Number(e.target.value))}
                 style={{ ...selectStyle, width: "52px", textAlign: "center" }}
               />
-              <span style={{ color: "#555", fontSize: "11px" }}>
+              <span style={{ color: "#666", fontSize: "13px" }}>
                 /{filteredWorlds ? filteredWorlds.length : worldCount}
               </span>
               <label style={{ display: "flex", alignItems: "center", gap: 3, cursor: "pointer" }}>
                 <input type="checkbox" checked={filterAgents} onChange={() => handleFilterToggle("agents")} style={{ accentColor: "#e94560" }} />
-                <span style={{ fontSize: "11px", color: "#888" }}>A</span>
+                <span style={{ fontSize: "13px", color: "#999" }}>A</span>
               </label>
               <label style={{ display: "flex", alignItems: "center", gap: 3, cursor: "pointer" }}>
                 <input type="checkbox" checked={filterSpotlights} onChange={() => handleFilterToggle("spotlights")} style={{ accentColor: "#e94560" }} />
-                <span style={{ fontSize: "11px", color: "#888" }}>S</span>
+                <span style={{ fontSize: "13px", color: "#999" }}>S</span>
               </label>
             </div>
           )}
@@ -208,12 +208,12 @@ export function Controls({
             key={s}
             onClick={() => handleSpeed(s)}
             style={{
-              padding: "4px 10px",
+              padding: "5px 12px",
               background: speed === s ? "rgba(233, 69, 96, 0.6)" : "transparent",
-              color: speed === s ? "#fff" : "#888",
+              color: speed === s ? "#fff" : "#999",
               border: "none",
               cursor: "pointer",
-              fontSize: "12px",
+              fontSize: "14px",
               fontWeight: speed === s ? 700 : 400,
               fontFamily: "inherit",
               transition: "all 0.15s ease",
@@ -228,14 +228,14 @@ export function Controls({
 }
 
 const btnPrimary: React.CSSProperties = {
-  padding: "6px 16px",
+  padding: "7px 18px",
   background: "linear-gradient(135deg, #e94560, #c73450)",
   color: "#fff",
   border: "none",
   borderRadius: "6px",
   cursor: "pointer",
   fontWeight: 700,
-  fontSize: "13px",
+  fontSize: "14px",
   fontFamily: "inherit",
   letterSpacing: "0.5px",
   boxShadow: "0 0 12px rgba(233, 69, 96, 0.3)",
@@ -243,50 +243,50 @@ const btnPrimary: React.CSSProperties = {
 };
 
 const btnSecondary: React.CSSProperties = {
-  padding: "6px 14px",
+  padding: "7px 16px",
   background: "rgba(255, 255, 255, 0.08)",
   color: "#dde",
-  border: "1px solid rgba(255, 255, 255, 0.12)",
+  border: "1px solid rgba(255, 255, 255, 0.14)",
   borderRadius: "6px",
   cursor: "pointer",
   fontWeight: 600,
-  fontSize: "13px",
+  fontSize: "14px",
   fontFamily: "inherit",
   transition: "all 0.15s ease",
 };
 
 const btnAccent: React.CSSProperties = {
-  padding: "6px 14px",
+  padding: "7px 16px",
   background: "linear-gradient(135deg, #16a34a, #128a3e)",
   color: "#fff",
   border: "none",
   borderRadius: "6px",
   cursor: "pointer",
   fontWeight: 700,
-  fontSize: "13px",
+  fontSize: "14px",
   fontFamily: "inherit",
   boxShadow: "0 0 12px rgba(22, 163, 74, 0.3)",
 };
 
 const btnGhost: React.CSSProperties = {
-  padding: "6px 12px",
+  padding: "7px 14px",
   background: "transparent",
-  color: "#999",
-  border: "1px solid rgba(255, 255, 255, 0.08)",
+  color: "#aaa",
+  border: "1px solid rgba(255, 255, 255, 0.1)",
   borderRadius: "6px",
   cursor: "pointer",
   fontWeight: 500,
-  fontSize: "13px",
+  fontSize: "14px",
   fontFamily: "inherit",
 };
 
 const selectStyle: React.CSSProperties = {
-  padding: "4px 8px",
-  background: "rgba(10, 10, 20, 0.8)",
+  padding: "5px 10px",
+  background: "rgba(10, 10, 20, 0.85)",
   color: "#dde",
-  border: "1px solid rgba(255, 255, 255, 0.12)",
+  border: "1px solid rgba(255, 255, 255, 0.14)",
   borderRadius: "4px",
-  fontSize: "12px",
+  fontSize: "14px",
   fontFamily: "inherit",
 };
 

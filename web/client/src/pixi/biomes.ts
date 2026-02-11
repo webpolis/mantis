@@ -47,7 +47,7 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-function biomeCenters(biomes: BiomeData[], size: number): Map<number, [number, number]> {
+export function biomeCenters(biomes: BiomeData[], size: number): Map<number, [number, number]> {
   const centers = new Map<number, [number, number]>();
   for (const b of biomes) {
     const rng = mulberry32(b.lid * 7919 + 31);

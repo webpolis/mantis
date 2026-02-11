@@ -1,4 +1,5 @@
 export interface AgentSnapshot {
+  uid: string;
   aid: number;
   species_sid: number;
   x: number;

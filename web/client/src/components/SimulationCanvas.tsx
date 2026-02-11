@@ -1,7 +1,8 @@
-import { useEffect, useRef, useCallback, useState } from "react";
+import { useEffect, useRef, useCallback, useState, useMemo } from "react";
 import type { AgentSnapshot, SpeciesInfo, BiomeData, VegetationPatchData, SimulationEvent } from "../types/simulation";
 import { useInterpolation } from "../hooks/useInterpolation";
 import { PixiApp } from "../pixi/PixiApp";
+import { biomeCenters } from "../pixi/biomes";
 
 interface Props {
   agents: AgentSnapshot[];
@@ -40,6 +41,7 @@ export function SimulationCanvas({
   const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 });
   const hoveredRef = useRef<HoveredEntity | null>(null);
   const prevEpochRef = useRef(epoch);
+  const biomeCentersMap = useMemo(() => biomeCenters(biomes, worldSize), [biomes, worldSize]);
 
   // Track dragging
   const dragRef = useRef<{ active: boolean; lastX: number; lastY: number }>({
@@ -74,9 +76,7 @@ export function SimulationCanvas({
 
   // Feed interpolation
   useEffect(() => {
-    if (agents.length > 0) {
-      updateSnapshot(agents, interpolateDuration);
-    }
+    updateSnapshot(agents, interpolateDuration);
   }, [agents, interpolateDuration, updateSnapshot]);
 
   // Update biomes
@@ -104,8 +104,8 @@ export function SimulationCanvas({
     let raf = 0;
     const loop = () => {
       const currentAgents = isPlaying ? getInterpolated() : agents;
-      const hovAid = hoveredRef.current?.type === "agent" ? hoveredRef.current.agent.aid : undefined;
-      pixi.updateAgents(currentAgents, species, hovAid);
+      const hovUid = hoveredRef.current?.type === "agent" ? hoveredRef.current.agent.uid : undefined;
+      pixi.updateAgents(currentAgents, species, hovUid);
       if (isPlaying) raf = requestAnimationFrame(loop);
     };
 
@@ -113,8 +113,8 @@ export function SimulationCanvas({
       raf = requestAnimationFrame(loop);
     } else {
       // Static update
-      const hovAid = hoveredRef.current?.type === "agent" ? hoveredRef.current.agent.aid : undefined;
-      pixi.updateAgents(agents, species, hovAid);
+      const hovUid = hoveredRef.current?.type === "agent" ? hoveredRef.current.agent.uid : undefined;
+      pixi.updateAgents(agents, species, hovUid);
     }
 
     return () => { if (raf) cancelAnimationFrame(raf); };
@@ -186,14 +186,29 @@ export function SimulationCanvas({
 
       if (closestVeg) {
         setHovered({ type: "vegetation", patch: closestVeg.patch, biome: closestVeg.biome });
+      } else if (biomes.length > 0 && biomeCentersMap.size > 0) {
+        // Biome hit via nearest Voronoi center
+        let bestBiome: BiomeData | null = null;
+        let bestDist = Infinity;
+        for (const b of biomes) {
+          const center = biomeCentersMap.get(b.lid);
+          if (!center) continue;
+          const dx = world.x - center[0];
+          const dy = world.y - center[1];
+          const d = dx * dx + dy * dy;
+          if (d < bestDist) {
+            bestDist = d;
+            bestBiome = b;
+          }
+        }
+        setHovered(bestBiome ? { type: "biome", biome: bestBiome } : null);
       } else {
-        // Biome hit (nearest Voronoi center — simplified)
         setHovered(null);
       }
     }
 
     setTooltipPos({ x: e.clientX, y: e.clientY });
-  }, [agents, species, biomes, isPlaying, getInterpolated]);
+  }, [agents, species, biomes, biomeCentersMap, isPlaying, getInterpolated]);
 
   const handleMouseLeave = useCallback(() => {
     setHovered(null);
@@ -232,12 +247,12 @@ export function SimulationCanvas({
             position: "fixed",
             left: tooltipPos.x + 14,
             top: tooltipPos.y - 10,
-            background: "rgba(10, 10, 20, 0.9)",
-            backdropFilter: "blur(8px)",
+            background: "rgba(8, 8, 16, 0.92)",
+            backdropFilter: "blur(10px)",
             color: "#dde",
-            padding: "8px 10px",
+            padding: "9px 12px",
             borderRadius: "6px",
-            fontSize: "12px",
+            fontSize: "13px",
             fontFamily: "'Rajdhani', monospace",
             lineHeight: "1.5",
             pointerEvents: "none",
@@ -259,7 +274,7 @@ function AgentTooltip({ entity }: { entity: Extract<HoveredEntity, { type: "agen
   const { agent, species: sp } = entity;
   return (
     <>
-      <div style={{ fontWeight: 700, color: "#fff", marginBottom: 2, fontSize: "13px" }}>
+      <div style={{ fontWeight: 700, color: "#fff", marginBottom: 2, fontSize: "14px" }}>
         Agent #{agent.aid}
       </div>
       <div>
@@ -302,7 +317,7 @@ function VegetationTooltip({ entity }: { entity: Extract<HoveredEntity, { type: 
   const { patch, biome } = entity;
   return (
     <>
-      <div style={{ fontWeight: 700, color: "#6c6", marginBottom: 2 }}>
+      <div style={{ fontWeight: 700, color: "#6c6", marginBottom: 2, fontSize: "14px" }}>
         Vegetation Patch
       </div>
       <div>
@@ -324,12 +339,24 @@ function BiomeTooltip({ entity }: { entity: Extract<HoveredEntity, { type: "biom
   const { biome } = entity;
   return (
     <>
-      <div style={{ fontWeight: 700, color: "#8cf", marginBottom: 2 }}>
-        {biome.name}
+      <div style={{ fontWeight: 700, color: "#8cf", marginBottom: 2, fontSize: "14px" }}>
+        {biome.name} <span style={{ color: "#666", fontWeight: 400 }}>L{biome.lid}</span>
       </div>
       <div>
         <span style={{ color: "#666" }}>Vegetation:</span>{" "}
         {(biome.vegetation * 100).toFixed(0)}%
+      </div>
+      <div>
+        <span style={{ color: "#666" }}>Detritus:</span>{" "}
+        {Math.round(biome.detritus)}
+      </div>
+      <div>
+        <span style={{ color: "#666" }}>Nitrogen:</span>{" "}
+        {(biome.nitrogen * 100).toFixed(0)}%
+      </div>
+      <div>
+        <span style={{ color: "#666" }}>Phosphorus:</span>{" "}
+        {(biome.phosphorus * 100).toFixed(0)}%
       </div>
     </>
   );
@@ -362,7 +389,7 @@ function CatastropheBanner({ events }: { events: SimulationEvent[] }) {
         background: bg,
         backdropFilter: "blur(4px)",
         color: "#fff",
-        fontSize: "14px",
+        fontSize: "16px",
         fontWeight: 700,
         textAlign: "center",
         pointerEvents: "none",

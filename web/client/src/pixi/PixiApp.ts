@@ -50,7 +50,7 @@ export class PixiApp {
   private resizeObserver?: ResizeObserver;
 
   // Track previous agent set for birth/death detection
-  private prevAgentIds = new Set<number>();
+  private prevAgentIds = new Set<string>();
 
   private initialized = false;
   private destroyed = false;
@@ -174,30 +174,30 @@ export class PixiApp {
     this.biomeRenderer.update(biomes);
   }
 
-  updateAgents(agents: AgentSnapshot[], species: SpeciesInfo[], hoveredAid?: number | null) {
+  updateAgents(agents: AgentSnapshot[], species: SpeciesInfo[], hoveredUid?: string | null) {
     if (!this.initialized || this.destroyed) return;
 
     // Detect births/deaths for particles
-    const currentIds = new Set<number>();
+    const currentIds = new Set<string>();
     for (const a of agents) {
-      if (!a.dead) currentIds.add(a.aid);
+      if (!a.dead) currentIds.add(a.uid);
     }
 
-    for (const aid of currentIds) {
-      if (!this.prevAgentIds.has(aid)) {
-        const a = agents.find((ag) => ag.aid === aid);
+    for (const uid of currentIds) {
+      if (!this.prevAgentIds.has(uid)) {
+        const a = agents.find((ag) => ag.uid === uid);
         if (a) this.particleSystem.emitBirth(a.x, a.y);
       }
     }
-    for (const aid of this.prevAgentIds) {
-      if (!currentIds.has(aid)) {
+    for (const uid of this.prevAgentIds) {
+      if (!currentIds.has(uid)) {
         // Agent died — find last known position from previous frame
         // We don't have previous position here, so skip death particles for missing agents
       }
     }
     this.prevAgentIds = currentIds;
 
-    this.creatureRenderer.update(agents, species, hoveredAid);
+    this.creatureRenderer.update(agents, species, hoveredUid);
     this.updateMinimap();
   }
 

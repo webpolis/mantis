@@ -7,10 +7,10 @@ import { EventLog } from "./components/EventLog";
 import { EpochIndicator } from "./components/EpochIndicator";
 
 const glassPanel: React.CSSProperties = {
-  background: "rgba(10, 10, 20, 0.7)",
-  backdropFilter: "blur(12px)",
-  WebkitBackdropFilter: "blur(12px)",
-  border: "1px solid rgba(255, 255, 255, 0.08)",
+  background: "rgba(8, 8, 16, 0.88)",
+  backdropFilter: "blur(14px)",
+  WebkitBackdropFilter: "blur(14px)",
+  border: "1px solid rgba(255, 255, 255, 0.13)",
   borderRadius: "8px",
 };
 
@@ -44,6 +44,7 @@ function App() {
     viewIndex,
     isFollowing,
     seekTo,
+    seekToTick,
     followLatest,
     epochs,
     populationHistory,
@@ -70,7 +71,7 @@ function App() {
       </div>
 
       {/* HUD: top-center — controls */}
-      <div style={{ position: "absolute", top: 16, left: "50%", transform: "translateX(-50%)", zIndex: 10, ...glassPanel, padding: "8px 16px" }}>
+      <div style={{ position: "absolute", top: 16, left: "50%", transform: "translateX(-50%)", zIndex: 10, ...glassPanel, padding: "10px 18px" }}>
         <Controls
           onPlay={play}
           onPause={pause}
@@ -93,16 +94,16 @@ function App() {
 
       {/* Right side — species panel + event log */}
       <div style={{ position: "absolute", top: 16, right: 16, zIndex: 10, display: "flex", flexDirection: "column", gap: 8, maxHeight: "calc(100vh - 100px)" }}>
-        <div style={{ ...glassPanel, padding: "10px 12px", maxHeight: "55vh", overflowY: "auto" }}>
+        <div style={{ ...glassPanel, padding: "12px 14px", maxHeight: "55vh", overflowY: "auto" }}>
           <SpeciesPanel species={species} populationHistory={populationHistory} />
         </div>
-        <div style={{ ...glassPanel, padding: "10px 12px", maxHeight: "35vh", overflowY: "auto" }}>
-          <EventLog eventLog={eventLog} />
+        <div style={{ ...glassPanel, padding: "12px 14px", maxHeight: "35vh", overflowY: "auto" }}>
+          <EventLog eventLog={eventLog} onSeekToTick={seekToTick} />
         </div>
       </div>
 
       {/* Bottom — timeline */}
-      <div style={{ position: "absolute", bottom: 16, left: 180, right: 16, zIndex: 10, ...glassPanel, padding: "8px 16px" }}>
+      <div style={{ position: "absolute", bottom: 16, left: 180, right: 16, zIndex: 10, ...glassPanel, padding: "10px 18px" }}>
         <Timeline
           historyLength={historyLength}
           viewIndex={viewIndex}

@@ -2,14 +2,14 @@ import { useRef, useCallback } from "react";
 import type { AgentSnapshot } from "../types/simulation";
 
 export class AgentInterpolator {
-  private prevSnapshot: Map<number, AgentSnapshot> = new Map();
-  private nextSnapshot: Map<number, AgentSnapshot> = new Map();
+  private prevSnapshot: Map<string, AgentSnapshot> = new Map();
+  private nextSnapshot: Map<string, AgentSnapshot> = new Map();
   private interpolateDuration = 66.7;
   private snapshotTime = 0;
 
   updateSnapshot(agents: AgentSnapshot[], timestamp: number, duration: number) {
     this.prevSnapshot = this.nextSnapshot;
-    this.nextSnapshot = new Map(agents.map((a) => [a.aid, a]));
+    this.nextSnapshot = new Map(agents.map((a) => [a.uid, a]));
     this.snapshotTime = timestamp;
     this.interpolateDuration = duration;
   }
@@ -20,8 +20,8 @@ export class AgentInterpolator {
 
     const result: AgentSnapshot[] = [];
 
-    for (const [aid, next] of this.nextSnapshot) {
-      const prev = this.prevSnapshot.get(aid);
+    for (const [uid, next] of this.nextSnapshot) {
+      const prev = this.prevSnapshot.get(uid);
 
       if (!prev) {
         result.push(next);
@@ -29,7 +29,8 @@ export class AgentInterpolator {
       }
 
       result.push({
-        aid,
+        uid,
+        aid: next.aid,
         species_sid: next.species_sid,
         x: prev.x + (next.x - prev.x) * t,
         y: prev.y + (next.y - prev.y) * t,

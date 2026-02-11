@@ -237,6 +237,22 @@ def handle_start_live(data=None):
         agent_data = []
         for sp in world.species:
             if not sp.alive:
+                # Emit death markers for any remaining agents so frontend merge cleans them up
+                if sp.agent_manager is not None:
+                    for a in sp.agent_manager.agents:
+                        agent_data.append({
+                            "uid": f"{sp.sid}_{a.aid}",
+                            "aid": a.aid,
+                            "species_sid": sp.sid,
+                            "x": a.x,
+                            "y": a.y,
+                            "energy": 0,
+                            "age": a.age,
+                            "state": a.state,
+                            "target_aid": None,
+                            "dead": True,
+                            "count": 1,
+                        })
                 continue
             species_data.append({
                 "sid": sp.sid,
@@ -247,6 +263,7 @@ def handle_start_live(data=None):
             if sp.agent_manager is not None:
                 for a in sp.agent_manager.agents:
                     agent_data.append({
+                        "uid": f"{sp.sid}_{a.aid}",
                         "aid": a.aid,
                         "species_sid": sp.sid,
                         "x": a.x,
@@ -256,6 +273,7 @@ def handle_start_live(data=None):
                         "state": a.state,
                         "target_aid": a.target_aid,
                         "dead": not a.alive,
+                        "count": 1,
                     })
 
         # Collect events from world
