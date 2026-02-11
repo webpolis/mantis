@@ -21,10 +21,12 @@ function App() {
     species,
     agents,
     isPlaying,
+    isPaused,
     interpolateDuration,
     play,
     pause,
     resume,
+    stop,
     setSpeed,
     datasets,
     selectedFile,
@@ -76,8 +78,10 @@ function App() {
           onPlay={play}
           onPause={pause}
           onResume={resume}
+          onStop={stop}
           onSpeed={setSpeed}
           isPlaying={isPlaying}
+          isPaused={isPaused}
           datasets={datasets}
           selectedFile={selectedFile}
           worldCount={worldCount}

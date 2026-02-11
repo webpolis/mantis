@@ -5,8 +5,10 @@ interface Props {
   onPlay: (mode: "file" | "live" | "model", file?: string, worldIndex?: number) => void;
   onPause: () => void;
   onResume: () => void;
+  onStop: () => void;
   onSpeed: (speed: number) => void;
   isPlaying: boolean;
+  isPaused: boolean;
   datasets: DatasetFile[];
   selectedFile: string | null;
   worldCount: number;
@@ -32,8 +34,10 @@ export function Controls({
   onPlay,
   onPause,
   onResume,
+  onStop,
   onSpeed,
   isPlaying,
+  isPaused,
   datasets,
   selectedFile,
   worldCount,
@@ -50,6 +54,8 @@ export function Controls({
   const [filterAgents, setFilterAgents] = useState(false);
   const [filterSpotlights, setFilterSpotlights] = useState(false);
   const [showDataset, setShowDataset] = useState(false);
+
+  const active = isPlaying || isPaused;
 
   const computeFiltered = (agents: boolean, spotlights: boolean): number[] | null => {
     if (!agents && !spotlights) return null;
@@ -96,107 +102,140 @@ export function Controls({
   };
 
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-      {!isPlaying ? (
-        <>
-          <button onClick={() => onPlay("live")} style={btnPrimary}>
-            Live Simulation
+    <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+      {/* Transport controls */}
+      <div style={{ display: "flex", gap: 4 }}>
+        {/* Play / Pause toggle */}
+        {isPlaying ? (
+          <button onClick={onPause} style={btnTransport} title="Pause">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+              <rect x="3" y="2" width="4" height="12" rx="1" />
+              <rect x="9" y="2" width="4" height="12" rx="1" />
+            </svg>
           </button>
-
-          <div style={divider} />
-
+        ) : (
           <button
-            onClick={() => setShowDataset(!showDataset)}
-            style={{ ...btnGhost, color: selectedFile ? "#dde" : "#777" }}
+            onClick={isPaused ? onResume : () => onPlay("live")}
+            style={isPaused ? { ...btnTransport, color: "#4ade80" } : btnTransport}
+            title={isPaused ? "Resume" : "Play Live"}
           >
-            {selectedFile || "Dataset..."}
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+              <polygon points="3,1 14,8 3,15" />
+            </svg>
           </button>
+        )}
 
-          {showDataset && (
-            <select
-              value={selectedFile ?? ""}
-              onChange={(e) => { e.target.value && onSelectFile(e.target.value); setShowDataset(false); }}
-              style={selectStyle}
-              autoFocus
-              onBlur={() => setShowDataset(false)}
-            >
-              <option value="">Select...</option>
-              {datasets.map((d) => (
-                <option key={d.name} value={d.name}>
-                  {d.name} ({formatSize(d.size)})
-                </option>
-              ))}
-            </select>
-          )}
-
-          {worldCount > 0 && (
-            <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "14px" }}>
-              <span style={{ color: "#999" }}>W:</span>
-              <input
-                type="number"
-                min={0}
-                max={worldCount - 1}
-                value={selectedWorld}
-                onChange={(e) => handleWorldChange(Number(e.target.value))}
-                style={{ ...selectStyle, width: "52px", textAlign: "center" }}
-              />
-              <span style={{ color: "#666", fontSize: "13px" }}>
-                /{filteredWorlds ? filteredWorlds.length : worldCount}
-              </span>
-              <label style={{ display: "flex", alignItems: "center", gap: 3, cursor: "pointer" }}>
-                <input type="checkbox" checked={filterAgents} onChange={() => handleFilterToggle("agents")} style={{ accentColor: "#e94560" }} />
-                <span style={{ fontSize: "13px", color: "#999" }}>A</span>
-              </label>
-              <label style={{ display: "flex", alignItems: "center", gap: 3, cursor: "pointer" }}>
-                <input type="checkbox" checked={filterSpotlights} onChange={() => handleFilterToggle("spotlights")} style={{ accentColor: "#e94560" }} />
-                <span style={{ fontSize: "13px", color: "#999" }}>S</span>
-              </label>
-            </div>
-          )}
-
-          <button
-            onClick={() => onPlay("file", selectedFile ?? undefined, selectedWorld)}
-            disabled={!selectedFile}
-            style={selectedFile ? btnSecondary : { ...btnSecondary, opacity: 0.35, cursor: "not-allowed" }}
-          >
-            Play
-          </button>
-
-          {models.length > 0 && (
-            <>
-              <div style={divider} />
-              <select
-                value={selectedModel ?? ""}
-                onChange={(e) => e.target.value && onSelectModel(e.target.value)}
-                style={selectStyle}
-              >
-                <option value="">Model...</option>
-                {models.map((m) => (
-                  <option key={m.name} value={m.name}>
-                    {m.name} ({formatSize(m.size)})
-                  </option>
-                ))}
-              </select>
-              <button
-                onClick={() => onPlay("model")}
-                disabled={!selectedModel}
-                style={selectedModel ? btnAccent : { ...btnAccent, opacity: 0.35, cursor: "not-allowed" }}
-              >
-                Infer
-              </button>
-            </>
-          )}
-        </>
-      ) : (
-        <button onClick={onPause} style={btnPrimary}>
-          Pause
+        {/* Stop */}
+        <button
+          onClick={onStop}
+          disabled={!active}
+          style={active ? btnTransport : { ...btnTransport, opacity: 0.3, cursor: "default" }}
+          title="Stop"
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+            <rect x="2" y="2" width="12" height="12" rx="2" />
+          </svg>
         </button>
+      </div>
+
+      <div style={divider} />
+
+      {/* Live sim button */}
+      <button onClick={() => onPlay("live")} style={btnSecondary}>
+        Live
+      </button>
+
+      <div style={divider} />
+
+      {/* Dataset picker */}
+      <button
+        onClick={() => setShowDataset(!showDataset)}
+        style={{ ...btnGhost, color: selectedFile ? "#dde" : "#777" }}
+      >
+        {selectedFile || "Dataset..."}
+      </button>
+
+      {showDataset && (
+        <select
+          value={selectedFile ?? ""}
+          onChange={(e) => { e.target.value && onSelectFile(e.target.value); setShowDataset(false); }}
+          style={selectStyle}
+          autoFocus
+          onBlur={() => setShowDataset(false)}
+        >
+          <option value="">Select...</option>
+          {datasets.map((d) => (
+            <option key={d.name} value={d.name}>
+              {d.name} ({formatSize(d.size)})
+            </option>
+          ))}
+        </select>
       )}
 
-      {!isPlaying && (
-        <button onClick={onResume} style={btnGhost}>
-          Resume
-        </button>
+      {/* World picker */}
+      {worldCount > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "14px" }}>
+          <span style={{ color: "#999" }}>W:</span>
+          <input
+            type="number"
+            min={0}
+            max={worldCount - 1}
+            value={selectedWorld}
+            onChange={(e) => handleWorldChange(Number(e.target.value))}
+            style={{ ...selectStyle, width: "52px", textAlign: "center" }}
+          />
+          <span style={{ color: "#666", fontSize: "13px" }}>
+            /{filteredWorlds ? filteredWorlds.length : worldCount}
+          </span>
+          <label style={{ display: "flex", alignItems: "center", gap: 3, cursor: "pointer" }}>
+            <input type="checkbox" checked={filterAgents} onChange={() => handleFilterToggle("agents")} style={{ accentColor: "#e94560" }} />
+            <span style={{ fontSize: "13px", color: "#999" }}>A</span>
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 3, cursor: "pointer" }}>
+            <input type="checkbox" checked={filterSpotlights} onChange={() => handleFilterToggle("spotlights")} style={{ accentColor: "#e94560" }} />
+            <span style={{ fontSize: "13px", color: "#999" }}>S</span>
+          </label>
+        </div>
+      )}
+
+      {/* Play dataset */}
+      <button
+        onClick={() => onPlay("file", selectedFile ?? undefined, selectedWorld)}
+        disabled={!selectedFile}
+        style={selectedFile ? btnSecondary : { ...btnSecondary, opacity: 0.35, cursor: "not-allowed" }}
+      >
+        <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
+            <polygon points="3,1 14,8 3,15" />
+          </svg>
+          Play
+        </span>
+      </button>
+
+      {/* Model picker */}
+      {models.length > 0 && (
+        <>
+          <div style={divider} />
+          <select
+            value={selectedModel ?? ""}
+            onChange={(e) => e.target.value && onSelectModel(e.target.value)}
+            style={selectStyle}
+          >
+            <option value="">Model...</option>
+            {models.map((m) => (
+              <option key={m.name} value={m.name}>
+                {m.name} ({formatSize(m.size)})
+              </option>
+            ))}
+          </select>
+          <button
+            onClick={() => onPlay("model")}
+            disabled={!selectedModel}
+            style={selectedModel ? btnAccent : { ...btnAccent, opacity: 0.35, cursor: "not-allowed" }}
+          >
+            Infer
+          </button>
+        </>
       )}
 
       <div style={divider} />
@@ -227,19 +266,19 @@ export function Controls({
   );
 }
 
-const btnPrimary: React.CSSProperties = {
-  padding: "7px 18px",
-  background: "linear-gradient(135deg, #e94560, #c73450)",
-  color: "#fff",
-  border: "none",
+const btnTransport: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  width: "36px",
+  height: "36px",
+  padding: 0,
+  background: "rgba(255, 255, 255, 0.08)",
+  color: "#dde",
+  border: "1px solid rgba(255, 255, 255, 0.14)",
   borderRadius: "6px",
   cursor: "pointer",
-  fontWeight: 700,
-  fontSize: "14px",
-  fontFamily: "inherit",
-  letterSpacing: "0.5px",
-  boxShadow: "0 0 12px rgba(233, 69, 96, 0.3)",
-  transition: "box-shadow 0.2s ease",
+  transition: "all 0.15s ease",
 };
 
 const btnSecondary: React.CSSProperties = {

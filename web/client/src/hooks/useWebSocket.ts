@@ -40,6 +40,7 @@ export function useWebSocket() {
   const [species, setSpecies] = useState<SpeciesInfo[]>([]);
   const [agents, setAgents] = useState<AgentSnapshot[]>([]);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
   const [info, setInfo] = useState<SimulationInfo | null>(null);
   const [interpolateDuration, setInterpolateDuration] = useState(66.7);
   const [datasets, setDatasets] = useState<DatasetFile[]>([]);
@@ -181,11 +182,13 @@ export function useWebSocket() {
 
     socket.on("simulation_complete", () => {
       setIsPlaying(false);
+      setIsPaused(false);
     });
 
     socket.on("error", (data: { message: string }) => {
       console.error("Server error:", data.message);
       setIsPlaying(false);
+      setIsPaused(false);
     });
 
     socket.on("dataset_list", (data: DatasetFile[]) => {
@@ -296,6 +299,7 @@ export function useWebSocket() {
     viewIndexRef.current = null;
     setViewIndex(null);
     setIsPlaying(true);
+    setIsPaused(false);
     setBiomes([]);
     biomesRef.current = [];
     popHistoryRef.current = new Map();
@@ -324,11 +328,31 @@ export function useWebSocket() {
   const pause = useCallback(() => {
     socketRef.current?.emit("pause");
     setIsPlaying(false);
+    setIsPaused(true);
   }, []);
 
   const resume = useCallback(() => {
     socketRef.current?.emit("resume");
     setIsPlaying(true);
+    setIsPaused(false);
+    // Snap back to following live
+    viewIndexRef.current = null;
+    setViewIndex(null);
+    const last = historyRef.current[historyRef.current.length - 1];
+    if (last) {
+      setTick(last.tick);
+      setEpoch(last.epoch);
+      setSpecies(last.species);
+      setAgents(last.agents);
+      setBiomes(last.biomes);
+      setEvents(last.events);
+    }
+  }, []);
+
+  const stop = useCallback(() => {
+    socketRef.current?.emit("pause");
+    setIsPlaying(false);
+    setIsPaused(false);
   }, []);
 
   const setSpeed = useCallback((speed: number) => {
@@ -352,6 +376,7 @@ export function useWebSocket() {
     // Find the history frame matching this tick, pause, and seek
     socketRef.current?.emit("pause");
     setIsPlaying(false);
+    setIsPaused(true);
     const history = historyRef.current;
     let idx = -1;
     for (let i = 0; i < history.length; i++) {
@@ -413,11 +438,13 @@ export function useWebSocket() {
     species,
     agents,
     isPlaying,
+    isPaused,
     info,
     interpolateDuration,
     play,
     pause,
     resume,
+    stop,
     setSpeed,
     datasets,
     selectedFile,
