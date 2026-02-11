@@ -99,7 +99,7 @@ function App() {
       {/* Right side — species panel + event log */}
       <div style={{ position: "absolute", top: 16, right: 16, zIndex: 10, display: "flex", flexDirection: "column", gap: 8, maxHeight: "calc(100vh - 100px)" }}>
         <div style={{ ...glassPanel, padding: "12px 14px", maxHeight: "55vh", overflowY: "auto" }}>
-          <SpeciesPanel species={species} populationHistory={populationHistory} />
+          <SpeciesPanel species={species} agents={agents} populationHistory={populationHistory} />
         </div>
         <div style={{ ...glassPanel, padding: "12px 14px", maxHeight: "35vh", overflowY: "auto" }}>
           <EventLog eventLog={eventLog} onSeekToTick={seekToTick} />

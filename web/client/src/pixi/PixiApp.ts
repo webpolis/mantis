@@ -47,6 +47,7 @@ export class PixiApp {
   private minimapSize = 150;
   private minimapBorder!: Graphics;
   private minimapViewport!: Graphics;
+  private minimapDragging = false;
   private resizeObserver?: ResizeObserver;
 
   // Track previous agent set for birth/death detection
@@ -280,6 +281,32 @@ export class PixiApp {
     const vh = viewH * minimapScale;
     this.minimapViewport.rect(vx, vy, vw, vh);
     this.minimapViewport.stroke({ color: 0xffffff, alpha: 0.5, width: 1 });
+  }
+
+  /** Check if screen coordinates fall within the minimap bounds. */
+  hitTestMinimap(screenX: number, screenY: number): boolean {
+    if (!this.initialized || this.destroyed) return false;
+    const mx = this.minimapSprite.x;
+    const my = this.minimapSprite.y;
+    return screenX >= mx && screenX <= mx + this.minimapSize
+        && screenY >= my && screenY <= my + this.minimapSize;
+  }
+
+  /** Convert screen coords on the minimap to world coords and pan camera there. */
+  minimapPanTo(screenX: number, screenY: number) {
+    if (!this.initialized || this.destroyed) return;
+    const minimapScale = this.minimapSize / this.worldSize;
+    const worldX = (screenX - this.minimapSprite.x) / minimapScale;
+    const worldY = (screenY - this.minimapSprite.y) / minimapScale;
+    this.camera.panTo(worldX, worldY);
+  }
+
+  get isMinimapDragging(): boolean {
+    return this.minimapDragging;
+  }
+
+  set isMinimapDragging(v: boolean) {
+    this.minimapDragging = v;
   }
 
   destroy() {

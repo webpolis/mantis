@@ -66,6 +66,12 @@ export class Camera {
     this.clampTarget();
   }
 
+  panTo(worldX: number, worldY: number) {
+    this.state.targetX = worldX;
+    this.state.targetY = worldY;
+    this.clampTarget();
+  }
+
   reset() {
     this.state.targetX = this.worldSize / 2;
     this.state.targetY = this.worldSize / 2;

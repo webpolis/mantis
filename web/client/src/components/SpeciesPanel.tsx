@@ -1,9 +1,10 @@
-import { useEffect, useRef } from "react";
-import type { SpeciesInfo } from "../types/simulation";
+import { useEffect, useMemo, useRef } from "react";
+import type { AgentSnapshot, SpeciesInfo } from "../types/simulation";
 import { getCreatureIconDataURL, BODY_PLAN_COLORS } from "../pixi/creatures";
 
 interface Props {
   species: SpeciesInfo[];
+  agents: AgentSnapshot[];
   populationHistory: Map<number, number[]>;
 }
 
@@ -16,13 +17,24 @@ function getIcon(plan: string): string {
   return iconCache.get(plan)!;
 }
 
-export function SpeciesPanel({ species, populationHistory }: Props) {
+export function SpeciesPanel({ species, agents, populationHistory }: Props) {
+  // Count visible agents per species (respecting count field for aggregated agents)
+  const agentCounts = useMemo(() => {
+    const counts = new Map<number, number>();
+    for (const a of agents) {
+      if (a.dead) continue;
+      counts.set(a.species_sid, (counts.get(a.species_sid) || 0) + (a.count || 1));
+    }
+    return counts;
+  }, [agents]);
+
   return (
     <div style={{ minWidth: 240 }}>
       <h3 style={{ marginBottom: 8, fontSize: "15px", fontWeight: 700, color: "#e94560", letterSpacing: "1px", textTransform: "uppercase" }}>
         Species ({species.length})
       </h3>
       {species.map((sp) => {
+        const visibleCount = agentCounts.get(sp.sid) || 0;
         const history = populationHistory.get(sp.sid) || [];
         const prevPop = history.length >= 2 ? history[history.length - 2] : sp.population;
         const delta = sp.population - prevPop;
@@ -67,7 +79,10 @@ export function SpeciesPanel({ species, populationHistory }: Props) {
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 2 }}>
                 <span style={{ fontSize: "13px", color: "#bbb" }}>
-                  {sp.population.toLocaleString()}
+                  {visibleCount > 0 && visibleCount !== sp.population
+                    ? <>{visibleCount.toLocaleString()} <span style={{ color: "#666", fontSize: "12px" }}>/ {sp.population.toLocaleString()}</span></>
+                    : sp.population.toLocaleString()
+                  }
                 </span>
                 {history.length > 2 && (
                   <Sparkline data={history} color={color} />

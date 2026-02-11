@@ -123,17 +123,33 @@ export function SimulationCanvas({
   // Mouse handlers
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     const pixi = pixiRef.current;
-    if (!pixi || !pixi.camera.isZoomed) return;
+    if (!pixi) return;
+
+    // Minimap click — pan camera to that world position
+    if (pixi.hitTestMinimap(e.clientX, e.clientY)) {
+      pixi.isMinimapDragging = true;
+      pixi.minimapPanTo(e.clientX, e.clientY);
+      return;
+    }
+
+    if (!pixi.camera.isZoomed) return;
     dragRef.current = { active: true, lastX: e.clientX, lastY: e.clientY };
   }, []);
 
   const handleMouseUp = useCallback(() => {
     dragRef.current.active = false;
+    if (pixiRef.current) pixiRef.current.isMinimapDragging = false;
   }, []);
 
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
     const pixi = pixiRef.current;
     if (!pixi) return;
+
+    // Minimap drag
+    if (pixi.isMinimapDragging) {
+      pixi.minimapPanTo(e.clientX, e.clientY);
+      return;
+    }
 
     // Pan
     if (dragRef.current.active) {
@@ -213,6 +229,7 @@ export function SimulationCanvas({
   const handleMouseLeave = useCallback(() => {
     setHovered(null);
     dragRef.current.active = false;
+    if (pixiRef.current) pixiRef.current.isMinimapDragging = false;
   }, []);
 
   const handleDoubleClick = useCallback(() => {

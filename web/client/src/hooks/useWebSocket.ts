@@ -33,6 +33,52 @@ function generateDeterministicPatches(lid: number, vegetation: number): Vegetati
   return patches;
 }
 
+/**
+ * Generate proxy agent dots from species data when no real agents exist.
+ * Uses species locations (biome IDs) and population to place dots deterministically.
+ */
+function generateProxyAgents(
+  speciesList: SpeciesInfo[],
+  biomes: BiomeData[],
+  worldSize: number,
+): AgentSnapshot[] {
+  if (speciesList.length === 0) return [];
+  const biomeCenterMap = new Map<string, { x: number; y: number }>();
+  for (const b of biomes) {
+    biomeCenterMap.set(`L${b.lid}`, { x: (b.lid % 3 + 0.5) * (worldSize / 3), y: (Math.floor(b.lid / 3) + 0.5) * (worldSize / 3) });
+  }
+
+  const result: AgentSnapshot[] = [];
+  for (const sp of speciesList) {
+    if (sp.population <= 0) continue;
+    const rng = mulberry32(sp.sid * 9973 + 31);
+    // Cap proxy dots at a reasonable number
+    const dotCount = Math.min(sp.population, 80);
+    const locs = sp.locations.length > 0 ? sp.locations : ["L0"];
+    for (let i = 0; i < dotCount; i++) {
+      const locKey = locs[i % locs.length];
+      const center = biomeCenterMap.get(locKey) || { x: worldSize / 2, y: worldSize / 2 };
+      // Spread around the biome center
+      const angle = rng() * Math.PI * 2;
+      const dist = rng() * worldSize * 0.12;
+      result.push({
+        uid: `proxy_${sp.sid}_${i}`,
+        aid: i,
+        species_sid: sp.sid,
+        x: Math.max(0, Math.min(worldSize, center.x + Math.cos(angle) * dist)),
+        y: Math.max(0, Math.min(worldSize, center.y + Math.sin(angle) * dist)),
+        energy: 50,
+        age: 0,
+        state: "rest",
+        target_aid: null,
+        dead: false,
+        count: Math.max(1, Math.round(sp.population / dotCount)),
+      });
+    }
+  }
+  return result;
+}
+
 export function useWebSocket() {
   const socketRef = useRef<Socket | null>(null);
   const [tick, setTick] = useState(0);
@@ -97,7 +143,8 @@ export function useWebSocket() {
         const prevAgents = historyRef.current.length > 0
           ? historyRef.current[historyRef.current.length - 1].agents
           : [];
-        const agentMap = new Map(prevAgents.map((a) => [a.uid, a]));
+        // Drop proxy agents when real agents arrive
+        const agentMap = new Map(prevAgents.filter((a) => !a.uid.startsWith("proxy_")).map((a) => [a.uid, a]));
         for (const a of data.agents) {
           if (a.dead) {
             agentMap.delete(a.uid);
@@ -142,6 +189,12 @@ export function useWebSocket() {
         });
         biomesRef.current = updated;
         if (viewIndexRef.current === null) setBiomes(updated);
+      }
+
+      // Generate proxy agents when no real agents exist but species have population
+      const hasRealAgents = mergedAgents.some((a) => !a.uid.startsWith("proxy_"));
+      if (!hasRealAgents && mergedSpecies.some((s) => s.population > 0)) {
+        mergedAgents = generateProxyAgents(mergedSpecies, biomesRef.current, 1000);
       }
 
       const frame: HistoryFrame = {
