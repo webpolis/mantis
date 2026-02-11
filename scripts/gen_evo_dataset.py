@@ -105,10 +105,14 @@ def simulate_world(wid: int, seed: int, max_gens: int, keyframe_interval: int,
         if f is not None:
             f.close()
 
+    epoch_val = world.epoch.value
+    if max_epoch is not None:
+        epoch_val = min(epoch_val, epoch_cap)
+
     stats = {
         "wid": wid,
         "ticks": world.tick,
-        "epoch": world.epoch.value,
+        "epoch": epoch_val,
         "alive": sum(1 for sp in world.species if sp.alive),
         "total_species": len(world.species),
         "max_tier": max((sp.max_tier() for sp in world.species if sp.alive), default=0),
