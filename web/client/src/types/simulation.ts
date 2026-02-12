@@ -16,6 +16,7 @@ export interface SpeciesInfo {
   sid: number;
   plan: string;
   population: number;
+  age: number;
   locations: string[];
 }
 

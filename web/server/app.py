@@ -258,6 +258,7 @@ def handle_start_live(data=None):
                 "sid": sp.sid,
                 "plan": sp.body_plan.name,
                 "population": sp.population,
+                "age": sp.age,
                 "locations": list(sp.locations),
             })
             if sp.agent_manager is not None:

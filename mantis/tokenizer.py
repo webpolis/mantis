@@ -141,7 +141,7 @@ GLUE_TOKENS = [
     "outcome=", "reason=", "Cmem", "dur",
     "low_var", "low_variance",
     "grid+",
-    "gen",
+    "gen", "age",
     "loc+=", "locs", "inf",
 ]
 

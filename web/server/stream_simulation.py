@@ -30,6 +30,7 @@ class ParsedSpecies:
     sid: int
     plan: str = ""
     population: int = 0
+    age: int = 0
     locations: list[str] = field(default_factory=list)
     traits: dict[str, float] = field(default_factory=dict)
     energy_in: float = 0
@@ -339,6 +340,11 @@ def _parse_species_header(line: str) -> ParsedSpecies | None:
                 sp.population = int(pop_str)
             except ValueError:
                 pass
+        elif part.startswith("age="):
+            try:
+                sp.age = int(part[4:])
+            except ValueError:
+                pass
         elif part.startswith("L") or "," in part:
             sp.locations = [p.strip() for p in part.split(",")]
 
@@ -389,6 +395,16 @@ def _parse_compact_species_header(line: str) -> ParsedSpecies | None:
         else:
             try:
                 sp.population = int(tok)
+                idx += 1
+            except ValueError:
+                pass
+
+    # Species age: "age 42"
+    if idx < len(tokens) and tokens[idx] == "age":
+        idx += 1
+        if idx < len(tokens):
+            try:
+                sp.age = int(tokens[idx])
                 idx += 1
             except ValueError:
                 pass
@@ -652,6 +668,7 @@ def serialize_species_for_frontend(sp: ParsedSpecies) -> dict:
         "sid": sp.sid,
         "plan": sp.plan,
         "population": sp.population,
+        "age": sp.age,
         "locations": sp.locations,
     }
 

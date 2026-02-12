@@ -292,6 +292,29 @@ export function SimulationCanvas({
 function AgentTooltip({ entity }: { entity: Extract<HoveredEntity, { type: "agent" }> }) {
   const { agent, species: sp } = entity;
   const isCluster = agent.uid.startsWith("cluster_");
+  const isProxy = agent.uid.startsWith("proxy_");
+
+  if (isProxy) {
+    return (
+      <>
+        <div style={{ fontWeight: 700, color: "#fff", marginBottom: 2, fontSize: "14px" }}>
+          S{agent.species_sid}
+          {sp && <span style={{ color: "#888" }}> ({sp.plan})</span>}
+        </div>
+        <div>
+          <span style={{ color: "#666" }}>Pop:</span> {sp?.population ?? "?"}
+        </div>
+        <div>
+          <span style={{ color: "#666" }}>Species Age:</span> {agent.age}
+        </div>
+        {agent.count > 1 && (
+          <div>
+            <span style={{ color: "#666" }}>Group:</span> ~{agent.count}
+          </div>
+        )}
+      </>
+    );
+  }
 
   if (isCluster) {
     return (

@@ -66,6 +66,9 @@ export function SpeciesPanel({ species, agents, populationHistory }: Props) {
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                 <span style={{ fontSize: "14px", fontWeight: 600 }}>S{sp.sid}</span>
                 <span style={{ fontSize: "13px", color: "#999" }}>{sp.plan}</span>
+                {sp.age > 0 && (
+                  <span style={{ fontSize: "11px", color: "#777" }}>t{sp.age}</span>
+                )}
                 {delta !== 0 && (
                   <span style={{
                     fontSize: "12px",

@@ -208,8 +208,8 @@ class Serializer:
         repro_rate = sp.traits["repro"].mean if "repro" in sp.traits else 1.0
 
         if c:
-            # v2: @SP S0 L0 scavenger 6565 D det 51 plt 35 sol 14
-            header = f"@SP S{sp.sid} {locs} {sp.body_plan.name} {sp.population} D {diet_str}"
+            # v2: @SP S0 L0 scavenger 6565 age 42 D det 51 plt 35 sol 14
+            header = f"@SP S{sp.sid} {locs} {sp.body_plan.name} {sp.population} age {sp.age} D {diet_str}"
             lines.append(header)
 
             # Trait line — space-separated, ×10 int-scaled
@@ -232,7 +232,7 @@ class Serializer:
 
             header = (
                 f"@SP|S{sp.sid}|{locs}|plan={sp.body_plan.name}"
-                f"|pop={sp.population}\u00b1{pop_var}{agent_info}|diet={{{diet_str}}}"
+                f"|pop={sp.population}\u00b1{pop_var}{agent_info}|age={sp.age}|diet={{{diet_str}}}"
             )
             lines.append(header)
 

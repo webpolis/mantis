@@ -68,7 +68,7 @@ function generateProxyAgents(
         x: Math.max(0, Math.min(worldSize, center.x + Math.cos(angle) * dist)),
         y: Math.max(0, Math.min(worldSize, center.y + Math.sin(angle) * dist)),
         energy: 50,
-        age: 0,
+        age: sp.age ?? 0,
         state: "rest",
         target_aid: null,
         dead: false,
@@ -129,6 +129,7 @@ export function useWebSocket() {
           resultMap.set(s.sid, {
             ...s,
             plan: s.plan || prev?.plan || "",
+            age: s.age || prev?.age || 0,
             locations: s.locations.length > 0 ? s.locations : prev?.locations ?? [],
           });
         }
