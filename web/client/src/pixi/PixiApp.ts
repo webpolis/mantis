@@ -4,8 +4,8 @@
  */
 import { Application, Container, Graphics, Sprite, Texture, RenderTexture } from "pixi.js";
 import { Camera } from "./camera";
-import { BiomeRenderer } from "./biomes";
-import { CreatureRenderer } from "./creatures";
+import { BiomeRenderer, biomeCenters } from "./biomes";
+import { CreatureRenderer, destroySpriteSheet } from "./creatures";
 import { ParticleSystem } from "./particles";
 import type { AgentSnapshot, SpeciesInfo, BiomeData, SimulationEvent } from "../types/simulation";
 
@@ -173,6 +173,9 @@ export class PixiApp {
   updateBiomes(biomes: BiomeData[]) {
     if (!this.initialized || this.destroyed) return;
     this.biomeRenderer.update(biomes);
+    // Pass biome data to creature renderer for per-agent tinting
+    const centers = biomeCenters(biomes, this.worldSize);
+    this.creatureRenderer.updateBiomes(biomes, centers);
   }
 
   updateAgents(agents: AgentSnapshot[], species: SpeciesInfo[], hoveredUid?: string | null, rawAgents?: AgentSnapshot[]) {
@@ -321,6 +324,7 @@ export class PixiApp {
       this.creatureRenderer?.destroy();
       this.biomeRenderer?.destroy();
       this.particleSystem?.destroy();
+      destroySpriteSheet();
       this.minimapTexture?.destroy(true);
       this.app?.destroy(true, { children: true });
     };

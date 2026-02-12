@@ -145,54 +145,6 @@ def handle_start(data=None):
         emit("simulation_complete", {"total_ticks": len(ticks)})
 
 
-def _grid_aggregate_agents(species, cell_size=500):
-    """Aggregate a species' agents into grid cells for the frontend.
-
-    Returns list of dicts matching the agent payload format, one per occupied cell.
-    """
-    if species.agent_manager is None or not species.agent_manager.agents:
-        return []
-
-    from collections import Counter
-    cells: dict[tuple[int, int], dict] = {}
-    for a in species.agent_manager.agents:
-        col = int(a.x) // cell_size
-        row = int(a.y) // cell_size
-        key = (col, row)
-        if key not in cells:
-            cells[key] = {
-                "count": 0, "total_energy": 0.0, "total_age": 0,
-                "behaviors": Counter(),
-            }
-        c = cells[key]
-        c["count"] += 1
-        c["total_energy"] += a.energy
-        c["total_age"] += a.age
-        c["behaviors"][a.state] += 1
-
-    result = []
-    for (col, row), c in cells.items():
-        n = c["count"]
-        cx = col * cell_size + cell_size // 2
-        cy = row * cell_size + cell_size // 2
-        aid = -(col * 1000 + row + 1)
-        dominant = c["behaviors"].most_common(1)[0][0] if c["behaviors"] else "rest"
-        result.append({
-            "uid": f"{species.sid}_{aid}",
-            "aid": aid,
-            "species_sid": species.sid,
-            "x": float(cx),
-            "y": float(cy),
-            "energy": int(round(c["total_energy"] / n)),
-            "age": int(round(c["total_age"] / n)),
-            "state": dominant,
-            "target_aid": None,
-            "dead": False,
-            "count": n,
-        })
-    return result
-
-
 def _classify_live_event(target: str, raw: str) -> dict | None:
     """Convert a raw event string from the simulation engine into a frontend event dict.
 
@@ -285,12 +237,22 @@ def handle_start_live(data=None):
         agent_data = []
         for sp in world.species:
             if not sp.alive:
-                # Emit grid-based death markers so frontend merge cleans them up
+                # Emit death markers for any remaining agents
                 if sp.agent_manager is not None:
-                    for cell in _grid_aggregate_agents(sp):
-                        cell["dead"] = True
-                        cell["energy"] = 0
-                        agent_data.append(cell)
+                    for a in sp.agent_manager.agents:
+                        agent_data.append({
+                            "uid": f"{sp.sid}_{a.aid}",
+                            "aid": a.aid,
+                            "species_sid": sp.sid,
+                            "x": a.x,
+                            "y": a.y,
+                            "energy": 0,
+                            "age": a.age,
+                            "state": a.state,
+                            "target_aid": None,
+                            "dead": True,
+                            "count": 1,
+                        })
                 continue
             # Trait means
             traits = {t: round(td.mean, 2) for t, td in sp.traits.items()}
@@ -313,7 +275,30 @@ def handle_start_live(data=None):
                 "repro_strategy": sp.reproduction_strategy(),
             })
             if sp.agent_manager is not None:
-                agent_data.extend(_grid_aggregate_agents(sp))
+                for a in sp.agent_manager.agents:
+                    agent_data.append({
+                        "uid": f"{sp.sid}_{a.aid}",
+                        "aid": a.aid,
+                        "species_sid": sp.sid,
+                        "x": a.x,
+                        "y": a.y,
+                        "energy": a.energy,
+                        "age": a.age,
+                        "state": a.state,
+                        "target_aid": a.target_aid,
+                        "dead": not a.alive,
+                        "count": 1,
+                    })
+                for dead_aid in sp.agent_manager.event_log.deaths:
+                    agent_data.append({
+                        "uid": f"{sp.sid}_{dead_aid}",
+                        "aid": dead_aid,
+                        "species_sid": sp.sid,
+                        "x": 0, "y": 0,
+                        "energy": 0, "age": 0,
+                        "state": "rest", "target_aid": None,
+                        "dead": True, "count": 1,
+                    })
 
         # Collect events from world
         event_data = []
