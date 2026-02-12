@@ -477,7 +477,7 @@ const INITIAL_POOL_SIZE = 500;
 
 const COUNT_LABEL_STYLE = new TextStyle({
   fontFamily: "Rajdhani, monospace",
-  fontSize: 11,
+  fontSize: 13,
   fontWeight: "700",
   fill: "#ffffff",
   stroke: { color: "#000000", width: 3 },

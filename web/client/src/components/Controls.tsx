@@ -174,7 +174,7 @@ export function Controls({
 
       {/* World picker */}
       {worldCount > 0 && (
-        <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "14px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "17px" }}>
           <span style={{ color: "#999" }}>W:</span>
           <input
             type="number"
@@ -184,16 +184,16 @@ export function Controls({
             onChange={(e) => handleWorldChange(Number(e.target.value))}
             style={{ ...selectStyle, width: "52px", textAlign: "center" }}
           />
-          <span style={{ color: "#666", fontSize: "13px" }}>
+          <span style={{ color: "#666", fontSize: "16px" }}>
             /{filteredWorlds ? filteredWorlds.length : worldCount}
           </span>
           <label style={{ display: "flex", alignItems: "center", gap: 3, cursor: "pointer" }}>
             <input type="checkbox" checked={filterAgents} onChange={() => handleFilterToggle("agents")} style={{ accentColor: "#e94560" }} />
-            <span style={{ fontSize: "13px", color: "#999" }}>A</span>
+            <span style={{ fontSize: "16px", color: "#999" }}>A</span>
           </label>
           <label style={{ display: "flex", alignItems: "center", gap: 3, cursor: "pointer" }}>
             <input type="checkbox" checked={filterSpotlights} onChange={() => handleFilterToggle("spotlights")} style={{ accentColor: "#e94560" }} />
-            <span style={{ fontSize: "13px", color: "#999" }}>S</span>
+            <span style={{ fontSize: "16px", color: "#999" }}>S</span>
           </label>
         </div>
       )}
@@ -252,7 +252,7 @@ export function Controls({
               color: speed === s ? "#fff" : "#999",
               border: "none",
               cursor: "pointer",
-              fontSize: "14px",
+              fontSize: "17px",
               fontWeight: speed === s ? 700 : 400,
               fontFamily: "inherit",
               transition: "all 0.15s ease",
@@ -289,7 +289,7 @@ const btnSecondary: React.CSSProperties = {
   borderRadius: "6px",
   cursor: "pointer",
   fontWeight: 600,
-  fontSize: "14px",
+  fontSize: "17px",
   fontFamily: "inherit",
   transition: "all 0.15s ease",
 };
@@ -302,7 +302,7 @@ const btnAccent: React.CSSProperties = {
   borderRadius: "6px",
   cursor: "pointer",
   fontWeight: 700,
-  fontSize: "14px",
+  fontSize: "17px",
   fontFamily: "inherit",
   boxShadow: "0 0 12px rgba(22, 163, 74, 0.3)",
 };
@@ -315,7 +315,7 @@ const btnGhost: React.CSSProperties = {
   borderRadius: "6px",
   cursor: "pointer",
   fontWeight: 500,
-  fontSize: "14px",
+  fontSize: "17px",
   fontFamily: "inherit",
 };
 
@@ -325,7 +325,7 @@ const selectStyle: React.CSSProperties = {
   color: "#dde",
   border: "1px solid rgba(255, 255, 255, 0.14)",
   borderRadius: "4px",
-  fontSize: "14px",
+  fontSize: "17px",
   fontFamily: "inherit",
 };
 

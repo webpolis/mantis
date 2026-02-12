@@ -129,7 +129,7 @@ export function EventLog({ eventLog, onSeekToTick }: Props) {
                   borderRadius: "6px",
                   border: isHighlight ? `1px solid ${color}55` : "1px solid rgba(255,255,255,0.06)",
                   boxShadow: isHighlight ? `0 0 12px ${color}33` : "none",
-                  fontSize: isMut ? "12px" : "14px",
+                  fontSize: isMut ? "14px" : "17px",
                   fontFamily: "monospace",
                   opacity: t.exiting ? 0 : 1,
                   transform: t.exiting ? "translateX(20px)" : "translateX(0)",
@@ -163,11 +163,11 @@ export function EventLog({ eventLog, onSeekToTick }: Props) {
         onClick={() => setExpanded(!expanded)}
         style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", marginBottom: 6 }}
       >
-        <h3 style={{ fontSize: "16px", fontWeight: 700, color: "#e94560", letterSpacing: "1px", textTransform: "uppercase" }}>
+        <h3 style={{ fontSize: "19px", fontWeight: 700, color: "#e94560", letterSpacing: "1px", textTransform: "uppercase" }}>
           Events
         </h3>
-        <span style={{ fontSize: "14px", color: "#777" }}>({eventLog.length})</span>
-        <span style={{ fontSize: "13px", color: "#666", marginLeft: "auto" }}>
+        <span style={{ fontSize: "17px", color: "#777" }}>({eventLog.length})</span>
+        <span style={{ fontSize: "16px", color: "#666", marginLeft: "auto" }}>
           {expanded ? "\u25b2" : "\u25bc"}
         </span>
       </div>
@@ -186,7 +186,7 @@ export function EventLog({ eventLog, onSeekToTick }: Props) {
                 key={`${entry.tick}-${evtType}-${i}`}
                 onClick={() => onSeekToTick(entry.tick)}
                 style={{
-                  fontSize: isMut ? "12px" : "14px",
+                  fontSize: isMut ? "14px" : "17px",
                   fontFamily: "monospace",
                   marginBottom: isMut ? 1 : 3,
                   lineHeight: 1.5,
@@ -215,7 +215,7 @@ export function EventLog({ eventLog, onSeekToTick }: Props) {
             );
           })}
           {eventLog.length === 0 && (
-            <div style={{ color: "#666", fontSize: "14px" }}>No events yet.</div>
+            <div style={{ color: "#666", fontSize: "17px" }}>No events yet.</div>
           )}
         </div>
       )}
@@ -269,7 +269,7 @@ function MutationSummary({ eventLog }: { eventLog: EventLogEntry[] }) {
       display: "flex", alignItems: "center", gap: 6,
       padding: "3px 6px", marginBottom: 4,
       background: "rgba(255,255,255,0.03)", borderRadius: 4,
-      fontSize: "11px", fontFamily: "monospace",
+      fontSize: "13px", fontFamily: "monospace",
     }}>
       <span style={{ color: "#666", textTransform: "uppercase", letterSpacing: "0.5px" }}>
         Mutations

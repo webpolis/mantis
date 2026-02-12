@@ -47,7 +47,7 @@ export function EpochIndicator({ epoch, tick, agentCount, speciesCount }: Props)
       padding: "12px 18px",
     }}>
       <div style={{
-        fontSize: animate ? "30px" : "24px",
+        fontSize: animate ? "36px" : "29px",
         fontWeight: 700,
         color,
         textShadow: `0 0 20px ${color}66, 0 0 40px ${color}33`,
@@ -68,8 +68,8 @@ export function EpochIndicator({ epoch, tick, agentCount, speciesCount }: Props)
 
 function Stat({ label, value }: { label: string; value: number }) {
   return (
-    <div style={{ fontSize: "14px", letterSpacing: "0.5px" }}>
-      <span style={{ color: "#888", textTransform: "uppercase", fontSize: "11px" }}>{label}</span>
+    <div style={{ fontSize: "17px", letterSpacing: "0.5px" }}>
+      <span style={{ color: "#888", textTransform: "uppercase", fontSize: "13px" }}>{label}</span>
       <br />
       <span style={{ color: "#ddd", fontWeight: 600, fontFamily: "monospace" }}>
         {value.toLocaleString()}

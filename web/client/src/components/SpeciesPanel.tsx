@@ -63,7 +63,7 @@ export function SpeciesPanel({ species, agents, populationHistory }: Props) {
 
   return (
     <div style={{ minWidth: 250 }}>
-      <h3 style={{ marginBottom: 8, fontSize: "15px", fontWeight: 700, color: "#e94560", letterSpacing: "1px", textTransform: "uppercase" }}>
+      <h3 style={{ marginBottom: 8, fontSize: "18px", fontWeight: 700, color: "#e94560", letterSpacing: "1px", textTransform: "uppercase" }}>
         Species ({species.length})
       </h3>
       {species.map((sp) => {
@@ -97,27 +97,27 @@ export function SpeciesPanel({ species, agents, populationHistory }: Props) {
                 style={{ imageRendering: "pixelated", flexShrink: 0 }}
                 alt={sp.plan}
               />
-              <span style={{ fontSize: "14px", fontWeight: 700, color: "#ddd" }}>S{sp.sid}</span>
-              <span style={{ fontSize: "13px", color: "#888" }}>{sp.plan}</span>
+              <span style={{ fontSize: "17px", fontWeight: 700, color: "#ddd" }}>S{sp.sid}</span>
+              <span style={{ fontSize: "16px", color: "#888" }}>{sp.plan}</span>
               {sp.repro_strategy && (
                 <span style={{
-                  fontSize: "11px", fontWeight: 700,
+                  fontSize: "13px", fontWeight: 700,
                   color: sp.repro_strategy === "r" ? "#4ade80" : "#60a5fa",
                   background: sp.repro_strategy === "r" ? "rgba(74,222,128,0.12)" : "rgba(96,165,250,0.12)",
                   padding: "1px 4px", borderRadius: "3px",
                 }}>{sp.repro_strategy}</span>
               )}
               {sp.age > 0 && (
-                <span style={{ fontSize: "11px", color: "#666" }}>t{sp.age}</span>
+                <span style={{ fontSize: "13px", color: "#666" }}>t{sp.age}</span>
               )}
               <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 4 }}>
                 {delta !== 0 && (
                   <span style={{
-                    fontSize: "12px", fontWeight: 700,
+                    fontSize: "14px", fontWeight: 700,
                     color: delta > 0 ? "#4ade80" : "#f87171",
                   }}>{delta > 0 ? "+" : ""}{delta}</span>
                 )}
-                <span style={{ fontSize: "13px", color: "#bbb", fontWeight: 600 }}>
+                <span style={{ fontSize: "16px", color: "#bbb", fontWeight: 600 }}>
                   {sp.population.toLocaleString()}
                 </span>
               </span>
@@ -158,7 +158,7 @@ export function SpeciesPanel({ species, agents, populationHistory }: Props) {
         );
       })}
       {species.length === 0 && (
-        <div style={{ color: "#666", fontSize: "14px" }}>
+        <div style={{ color: "#666", fontSize: "17px" }}>
           No species data yet. Start a simulation.
         </div>
       )}
@@ -177,7 +177,7 @@ function TraitBars({ traits }: { traits: Record<string, number> }) {
 
   return (
     <div style={{ marginBottom: 6 }}>
-      <div style={{ fontSize: "11px", color: "#666", textTransform: "uppercase", marginBottom: 3, letterSpacing: "0.5px" }}>
+      <div style={{ fontSize: "13px", color: "#666", textTransform: "uppercase", marginBottom: 3, letterSpacing: "0.5px" }}>
         Traits
       </div>
       {sorted.map(([name, val]) => {
@@ -185,7 +185,7 @@ function TraitBars({ traits }: { traits: Record<string, number> }) {
         const pct = Math.min(100, (val / 10) * 100);
         return (
           <div key={name} style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 2 }}>
-            <span style={{ fontSize: "11px", color: "#999", width: 62, textAlign: "right", flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            <span style={{ fontSize: "13px", color: "#999", width: 62, textAlign: "right", flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
               {name.replace("*", "")}
             </span>
             <div style={{
@@ -199,7 +199,7 @@ function TraitBars({ traits }: { traits: Record<string, number> }) {
                 transition: "width 0.3s ease",
               }} />
             </div>
-            <span style={{ fontSize: "11px", color: "#888", width: 24, textAlign: "right", flexShrink: 0 }}>
+            <span style={{ fontSize: "13px", color: "#888", width: 24, textAlign: "right", flexShrink: 0 }}>
               {val.toFixed(1)}
             </span>
           </div>
@@ -260,14 +260,14 @@ function DietChart({ diet }: { diet: Record<string, number> }) {
 
   return (
     <div style={{ marginBottom: 6 }}>
-      <div style={{ fontSize: "11px", color: "#666", textTransform: "uppercase", marginBottom: 3, letterSpacing: "0.5px" }}>
+      <div style={{ fontSize: "13px", color: "#666", textTransform: "uppercase", marginBottom: 3, letterSpacing: "0.5px" }}>
         Diet
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <canvas ref={canvasRef} width={40} height={40} style={{ flexShrink: 0 }} />
         <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
           {entries.map(([src, pct]) => (
-            <div key={src} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: "11px" }}>
+            <div key={src} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: "13px" }}>
               <div style={{ width: 6, height: 6, borderRadius: "50%", background: DIET_COLORS[src] || "#666", flexShrink: 0 }} />
               <span style={{ color: "#aaa" }}>{src}</span>
               <span style={{ color: "#777" }}>{Math.round(pct * 100)}%</span>
@@ -309,28 +309,28 @@ function EnergyDetail({ energyIn, energyOut, energyStore }: {
 
   return (
     <div style={{ marginBottom: 4 }}>
-      <div style={{ fontSize: "11px", color: "#666", textTransform: "uppercase", marginBottom: 3, letterSpacing: "0.5px" }}>
+      <div style={{ fontSize: "13px", color: "#666", textTransform: "uppercase", marginBottom: 3, letterSpacing: "0.5px" }}>
         Energy
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
         {/* Income bar */}
         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-          <span style={{ fontSize: "11px", color: "#4ade80", width: 14, textAlign: "right" }}>+</span>
+          <span style={{ fontSize: "13px", color: "#4ade80", width: 14, textAlign: "right" }}>+</span>
           <div style={{ flex: 1, height: 5, background: "rgba(255,255,255,0.06)", borderRadius: 3, overflow: "hidden" }}>
             <div style={{ width: `${(energyIn / max) * 100}%`, height: "100%", background: "#4ade80", borderRadius: 3 }} />
           </div>
-          <span style={{ fontSize: "10px", color: "#888", width: 32, textAlign: "right" }}>{fmtNum(energyIn)}</span>
+          <span style={{ fontSize: "12px", color: "#888", width: 32, textAlign: "right" }}>{fmtNum(energyIn)}</span>
         </div>
         {/* Cost bar */}
         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-          <span style={{ fontSize: "11px", color: "#f87171", width: 14, textAlign: "right" }}>-</span>
+          <span style={{ fontSize: "13px", color: "#f87171", width: 14, textAlign: "right" }}>-</span>
           <div style={{ flex: 1, height: 5, background: "rgba(255,255,255,0.06)", borderRadius: 3, overflow: "hidden" }}>
             <div style={{ width: `${(energyOut / max) * 100}%`, height: "100%", background: "#f87171", borderRadius: 3 }} />
           </div>
-          <span style={{ fontSize: "10px", color: "#888", width: 32, textAlign: "right" }}>{fmtNum(energyOut)}</span>
+          <span style={{ fontSize: "12px", color: "#888", width: 32, textAlign: "right" }}>{fmtNum(energyOut)}</span>
         </div>
         {/* Net + Store */}
-        <div style={{ display: "flex", gap: 8, fontSize: "11px", marginTop: 1 }}>
+        <div style={{ display: "flex", gap: 8, fontSize: "13px", marginTop: 1 }}>
           <span style={{ color: net >= 0 ? "#4ade80" : "#f87171" }}>
             Net: {net >= 0 ? "+" : ""}{fmtNum(net)}
           </span>

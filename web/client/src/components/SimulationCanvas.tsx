@@ -271,7 +271,7 @@ export function SimulationCanvas({
             color: "#dde",
             padding: "9px 12px",
             borderRadius: "6px",
-            fontSize: "13px",
+            fontSize: "16px",
             fontFamily: "'Rajdhani', monospace",
             lineHeight: "1.5",
             pointerEvents: "none",
@@ -297,7 +297,7 @@ function AgentTooltip({ entity }: { entity: Extract<HoveredEntity, { type: "agen
   if (isProxy) {
     return (
       <>
-        <div style={{ fontWeight: 700, color: "#fff", marginBottom: 2, fontSize: "14px" }}>
+        <div style={{ fontWeight: 700, color: "#fff", marginBottom: 2, fontSize: "17px" }}>
           S{agent.species_sid}
           {sp && <span style={{ color: "#888" }}> ({sp.plan})</span>}
         </div>
@@ -319,7 +319,7 @@ function AgentTooltip({ entity }: { entity: Extract<HoveredEntity, { type: "agen
   if (isCluster) {
     return (
       <>
-        <div style={{ fontWeight: 700, color: "#fff", marginBottom: 2, fontSize: "14px" }}>
+        <div style={{ fontWeight: 700, color: "#fff", marginBottom: 2, fontSize: "17px" }}>
           Cluster ({agent.count} agents)
         </div>
         <div>
@@ -347,7 +347,7 @@ function AgentTooltip({ entity }: { entity: Extract<HoveredEntity, { type: "agen
 
   return (
     <>
-      <div style={{ fontWeight: 700, color: "#fff", marginBottom: 2, fontSize: "14px" }}>
+      <div style={{ fontWeight: 700, color: "#fff", marginBottom: 2, fontSize: "17px" }}>
         Agent #{agent.aid}
       </div>
       <div>
@@ -385,7 +385,7 @@ function VegetationTooltip({ entity }: { entity: Extract<HoveredEntity, { type: 
   const { patch, biome } = entity;
   return (
     <>
-      <div style={{ fontWeight: 700, color: "#6c6", marginBottom: 2, fontSize: "14px" }}>
+      <div style={{ fontWeight: 700, color: "#6c6", marginBottom: 2, fontSize: "17px" }}>
         Vegetation Patch
       </div>
       <div>
@@ -407,7 +407,7 @@ function BiomeTooltip({ entity }: { entity: Extract<HoveredEntity, { type: "biom
   const { biome } = entity;
   return (
     <>
-      <div style={{ fontWeight: 700, color: "#8cf", marginBottom: 2, fontSize: "14px" }}>
+      <div style={{ fontWeight: 700, color: "#8cf", marginBottom: 2, fontSize: "17px" }}>
         {biome.name} <span style={{ color: "#666", fontWeight: 400 }}>L{biome.lid}</span>
       </div>
       <div>
@@ -457,7 +457,7 @@ function CatastropheBanner({ events }: { events: SimulationEvent[] }) {
         background: bg,
         backdropFilter: "blur(4px)",
         color: "#fff",
-        fontSize: "16px",
+        fontSize: "19px",
         fontWeight: 700,
         textAlign: "center",
         pointerEvents: "none",
