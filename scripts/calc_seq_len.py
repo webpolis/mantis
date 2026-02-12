@@ -104,7 +104,7 @@ def component_tokens(text: str, tokenizer) -> dict[str, int]:
             key = "EVT"
         elif stripped.startswith("@SPOT") or stripped.startswith("CTX") or stripped.startswith("ACTORS") or stripped.startswith("INTENT") or stripped.startswith("REACT") or stripped.startswith("RESOLVE") or stripped.startswith("EFFECT"):
             key = "SPOT"
-        elif stripped.startswith("@AGENT") or stripped.startswith("N A") or stripped.startswith("N:A") or (stripped.startswith("A") and stripped.endswith("\u2020")):
+        elif stripped.startswith("@AGENT") or stripped.startswith("N A") or stripped.startswith("N:A") or stripped.startswith("G ") or stripped.startswith("G(") or (stripped.startswith("A") and stripped.endswith("\u2020")):
             key = "AGENT"
         elif stripped == "---":
             key = "SEP"

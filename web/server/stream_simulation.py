@@ -189,13 +189,33 @@ _ABBREV_TO_BEHAVIOR = {
 }
 
 
-def _parse_grid_line(line: str, compact: bool, cell_size: int = 100) -> list[ParsedAgent]:
+def _parse_grid_line(line: str, compact: bool, cell_size: int = 500) -> list[ParsedAgent]:
     """Parse a grid cell line into pseudo-agents at the cell center.
 
     v2: G col,row count avg_energy beh:count ...
     v1: G(col,row):n=N,E=avg|beh:count,...
+    Death: G col,row † (compact) or G:(col,row)|† (v1)
     """
     line = line.strip()
+
+    # Death marker: compact "G col,row †" or v1 "G:(col,row)|†"
+    if compact:
+        death_m = re.match(r"G\s+(\d+),(\d+)\s+\u2020", line)
+        if death_m:
+            col, row = int(death_m.group(1)), int(death_m.group(2))
+            cx = col * cell_size + cell_size // 2
+            cy = row * cell_size + cell_size // 2
+            aid = -(col * 1000 + row + 1)
+            return [ParsedAgent(aid=aid, x=float(cx), y=float(cy), energy=0, dead=True, count=0)]
+    else:
+        death_m = re.match(r"G:\((\d+),(\d+)\)\|\u2020", line)
+        if death_m:
+            col, row = int(death_m.group(1)), int(death_m.group(2))
+            cx = col * cell_size + cell_size // 2
+            cy = row * cell_size + cell_size // 2
+            aid = -(col * 1000 + row + 1)
+            return [ParsedAgent(aid=aid, x=float(cx), y=float(cy), energy=0, dead=True, count=0)]
+
     avg_age = 0
     if compact:
         # v2: G 1,3 17 45 [avg_age] f:12 h:3 fl:2
@@ -235,8 +255,8 @@ def _parse_grid_line(line: str, compact: bool, cell_size: int = 100) -> list[Par
                 except ValueError:
                     pass
     else:
-        # v1: G(col,row):n=N,E=avg[,age=A]|beh:count,...
-        m = re.match(r"G\((\d+),(\d+)\):n=(\d+),E=(\d+)(?:,age=(\d+))?\|(.+)", line)
+        # v1: G:(col,row)|n=N|E=avg[|age=A]|beh:count,...
+        m = re.match(r"G:\((\d+),(\d+)\)\|n=(\d+)\|E=(\d+)(?:\|age=(\d+))?\|(.+)", line)
         if not m:
             return []
         col, row = int(m.group(1)), int(m.group(2))
