@@ -33,9 +33,11 @@ class ParsedSpecies:
     age: int = 0
     locations: list[str] = field(default_factory=list)
     traits: dict[str, float] = field(default_factory=dict)
+    diet: dict[str, float] = field(default_factory=dict)
     energy_in: float = 0
     energy_out: float = 0
     energy_store: float = 0
+    repro_strategy: str = ""
 
 
 @dataclass
@@ -345,6 +347,16 @@ def _parse_species_header(line: str) -> ParsedSpecies | None:
                 sp.age = int(part[4:])
             except ValueError:
                 pass
+        elif part.startswith("diet={"):
+            # diet={det:0.69,plt:0.31}
+            inner = part[6:].rstrip("}")
+            for pair in inner.split(","):
+                if ":" in pair:
+                    src, val = pair.split(":", 1)
+                    try:
+                        sp.diet[src.strip()] = float(val)
+                    except ValueError:
+                        pass
         elif part.startswith("L") or "," in part:
             sp.locations = [p.strip() for p in part.split(",")]
 
@@ -409,6 +421,20 @@ def _parse_compact_species_header(line: str) -> ParsedSpecies | None:
             except ValueError:
                 pass
 
+    # Diet: "D det 69 plt 31" — pairs of (abbreviation, percentage)
+    if idx < len(tokens) and tokens[idx] == "D":
+        idx += 1
+        while idx + 1 < len(tokens):
+            abbrev = tokens[idx]
+            if abbrev in ("D", "T", "E") or abbrev.startswith("L") or abbrev.startswith("@"):
+                break
+            try:
+                pct = int(tokens[idx + 1])
+                sp.diet[abbrev] = pct / 100.0
+                idx += 2
+            except ValueError:
+                break
+
     # Delta may also have "locs L0 L1 ..."
     if idx < len(tokens) and tokens[idx] == "locs":
         idx += 1
@@ -417,6 +443,120 @@ def _parse_compact_species_header(line: str) -> ParsedSpecies | None:
             idx += 1
 
     return sp
+
+
+# ------------------------------------------------------------------
+# Species sub-line parsing (T/E/M lines under @SP)
+# ------------------------------------------------------------------
+
+
+def _parse_trait_line(line: str, sp: ParsedSpecies, compact: bool) -> None:
+    """Parse a T (trait) line and update species traits.
+
+    v2: T speed 45±22 armor 30±15  OR  T Δspeed +15
+    v1: T:speed=4.5±2.2,armor=3.0±1.5  OR  T:Δspeed=+1.5
+    """
+    if compact:
+        # Strip "T " prefix
+        content = line[2:] if line.startswith("T ") else line
+        tokens = content.split()
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok.startswith("Δ") or tok.startswith("\u0394"):
+                # Delta: Δspeed +15  → trait "speed", skip the delta value
+                trait_name = tok[1:].lstrip("*")
+                i += 2  # skip the +/-N value
+            elif "±" in tok:
+                # Inline "name mean±var" was already read: tok is "45±22"
+                i += 1
+            else:
+                # Full trait: "speed 45±22"
+                trait_name = tok.lstrip("*")
+                if i + 1 < len(tokens) and "±" in tokens[i + 1]:
+                    mean_str = tokens[i + 1].split("±")[0]
+                    try:
+                        sp.traits[trait_name] = float(mean_str) / 10.0
+                    except ValueError:
+                        pass
+                    i += 2
+                elif i + 1 < len(tokens):
+                    try:
+                        val = int(tokens[i + 1])
+                        sp.traits[trait_name] = val / 10.0
+                        i += 2
+                    except ValueError:
+                        i += 1
+                else:
+                    i += 1
+    else:
+        # v1: T:speed=4.5±2.2,armor=3.0±1.5
+        content = line[2:] if line.startswith("T:") else line
+        for part in content.split(","):
+            part = part.strip()
+            if part.startswith("Δ") or part.startswith("\u0394"):
+                continue
+            if "=" in part:
+                name, val_str = part.split("=", 1)
+                name = name.lstrip("*")
+                mean_str = val_str.split("±")[0]
+                try:
+                    sp.traits[name] = float(mean_str)
+                except ValueError:
+                    pass
+
+
+def _parse_energy_line(line: str, sp: ParsedSpecies, compact: bool) -> None:
+    """Parse an E (energy) line.
+
+    v2: E 1407 8344 0 K 10
+    v1: E:in=1407,out=8344,store=0|repro=K(rate=1.0)
+    """
+    if compact:
+        tokens = line.split()
+        # tokens[0] = "E", then: income, cost, store, strategy, rate×10
+        if len(tokens) >= 4:
+            try:
+                sp.energy_in = float(tokens[1])
+                sp.energy_out = float(tokens[2])
+                sp.energy_store = float(tokens[3])
+            except ValueError:
+                pass
+        if len(tokens) >= 5 and tokens[4] in ("r", "K"):
+            sp.repro_strategy = tokens[4]
+    else:
+        content = line[2:] if line.startswith("E:") else line
+        for part in content.split("|"):
+            for kv in part.split(","):
+                kv = kv.strip()
+                if kv.startswith("in="):
+                    try:
+                        sp.energy_in = float(kv[3:])
+                    except ValueError:
+                        pass
+                elif kv.startswith("out="):
+                    try:
+                        sp.energy_out = float(kv[4:])
+                    except ValueError:
+                        pass
+                elif kv.startswith("store="):
+                    try:
+                        sp.energy_store = float(kv[6:])
+                    except ValueError:
+                        pass
+                elif kv.startswith("repro="):
+                    sp.repro_strategy = kv[6:7]  # "r" or "K"
+
+
+def _parse_mutation_line(line: str, sp_sid: int, compact: bool) -> ParsedEvent | None:
+    """Parse an M-prefixed mutation line into an event.
+
+    v2: Mleap endurance -20  OR  Mpoint camo 5  OR  M- metab -7
+    v1: Mleap:endurance=-2.0
+    """
+    tag = line.split()[0] if compact else line.split(":")[0]
+    detail = line[len(tag):].strip().lstrip(":")
+    return ParsedEvent(target=f"S{sp_sid}", event_type=tag, detail=detail)
 
 
 # ------------------------------------------------------------------
@@ -609,6 +749,20 @@ def parse_protocol_to_ticks(text: str) -> list[ParsedTick]:
                     current_tick.species.append(sp)
                 continue
 
+        # Species sub-lines: T (traits), E (energy), M (mutations)
+        if current_species is not None and not stripped.startswith("@"):
+            if stripped.startswith("T") and (len(stripped) < 2 or stripped[1] in (" ", ":")):
+                _parse_trait_line(stripped, current_species, compact)
+                continue
+            if stripped.startswith("E") and (len(stripped) < 2 or stripped[1] in (" ", ":")):
+                _parse_energy_line(stripped, current_species, compact)
+                continue
+            if stripped[0] == "M":
+                evt = _parse_mutation_line(stripped, current_species.sid, compact)
+                if evt:
+                    current_tick.events.append(evt)
+                continue
+
         # Events
         if stripped.startswith("@EVT"):
             evt = _parse_event_line(stripped, compact)
@@ -670,6 +824,12 @@ def serialize_species_for_frontend(sp: ParsedSpecies) -> dict:
         "population": sp.population,
         "age": sp.age,
         "locations": sp.locations,
+        "traits": sp.traits,
+        "diet": sp.diet,
+        "energy_in": sp.energy_in,
+        "energy_out": sp.energy_out,
+        "energy_store": sp.energy_store,
+        "repro_strategy": sp.repro_strategy,
     }
 
 

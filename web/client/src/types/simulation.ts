@@ -18,6 +18,12 @@ export interface SpeciesInfo {
   population: number;
   age: number;
   locations: string[];
+  traits: Record<string, number>;
+  diet: Record<string, number>;
+  energy_in: number;
+  energy_out: number;
+  energy_store: number;
+  repro_strategy: string;
 }
 
 export interface TickData {

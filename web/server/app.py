@@ -254,12 +254,25 @@ def handle_start_live(data=None):
                             "count": 1,
                         })
                 continue
+            # Trait means
+            traits = {t: round(td.mean, 2) for t, td in sp.traits.items()}
+            traits.update({f"*{t}": round(td.mean, 2) for t, td in sp.fused_traits.items()})
+            # Diet composition
+            diet = {src: round(pct, 2) for src, pct in sp.diet.sources().items() if pct >= 0.01}
+            # Energy
+            e_in, e_out = world.energy_log.get(sp.sid, (0.0, 0.0))
             species_data.append({
                 "sid": sp.sid,
                 "plan": sp.body_plan.name,
                 "population": sp.population,
                 "age": sp.age,
                 "locations": list(sp.locations),
+                "traits": traits,
+                "diet": diet,
+                "energy_in": round(e_in),
+                "energy_out": round(e_out),
+                "energy_store": round(sp.energy_store),
+                "repro_strategy": sp.reproduction_strategy(),
             })
             if sp.agent_manager is not None:
                 for a in sp.agent_manager.agents:

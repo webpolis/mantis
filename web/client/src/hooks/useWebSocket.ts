@@ -131,6 +131,12 @@ export function useWebSocket() {
             plan: s.plan || prev?.plan || "",
             age: s.age || prev?.age || 0,
             locations: s.locations.length > 0 ? s.locations : prev?.locations ?? [],
+            traits: Object.keys(s.traits ?? {}).length > 0 ? s.traits : prev?.traits ?? {},
+            diet: Object.keys(s.diet ?? {}).length > 0 ? s.diet : prev?.diet ?? {},
+            energy_in: s.energy_in || prev?.energy_in || 0,
+            energy_out: s.energy_out || prev?.energy_out || 0,
+            energy_store: s.energy_store || prev?.energy_store || 0,
+            repro_strategy: s.repro_strategy || prev?.repro_strategy || "",
           });
         }
         mergedSpecies = Array.from(resultMap.values());
