@@ -49,7 +49,7 @@ Each species has:
 - T3 Cultural (5): `language tooluse ritual teaching trade`
 - T4 Abstract (5): `subconscious theory_of_mind creativity abstraction ethics`
 
-Higher tiers require prerequisites from lower tiers (e.g., `intel` needs `curiosity≥3` + `social≥3`).
+Higher tiers require prerequisites from lower tiers (e.g., `intel` needs `curiosity≥2` + `social≥2`).
 
 **Trait distributions** store `(mean, variance)` — predation success is computed from distribution overlap, not simple value comparison. Selection pressure narrows or widens variance.
 
@@ -85,11 +85,11 @@ Simulations pass through 4 timescale epochs, triggered by complexity milestones:
 | Epoch        | Tick =            | Trigger                     | Dynamics                               |
 | ------------ | ----------------- | --------------------------- | -------------------------------------- |
 | PRIMORDIAL   | ~1000 generations | Start                       | Chemical/solar energy, rapid evolution |
-| CAMBRIAN     | ~10 generations   | First multicellular         | Body plan diversification, arms races  |
-| ECOSYSTEM    | ~1 generation     | Stable food web (3+ levels) | Niche specialization, migration        |
-| INTELLIGENCE | Sub-generational  | Spotlight score > threshold | Individual-level events, culture       |
+| CAMBRIAN     | ~10 generations   | Any species evolves T1 trait | Body plan diversification, arms races  |
+| ECOSYSTEM    | ~1 generation     | 3+ trophic levels exist     | Niche specialization, migration        |
+| INTELLIGENCE | Sub-generational  | Spotlight score > 3.0       | Individual-level events, culture       |
 
-Mutation rates are normalized **per generation** (raw `mutation_rate_mult / tick_scale`), so PRIMORDIAL (1000 gen/tick) and INTELLIGENCE (0.1 gen/tick) evolve at comparable per-generation rates despite vastly different tick scales. Speciation probabilities and serialization detail also adjust per epoch.
+Mutation rates are normalized **per generation** (raw `mutation_rate_mult / tick_scale`), so PRIMORDIAL (1000 gen/tick) and INTELLIGENCE (0.1 gen/tick) evolve at comparable per-generation rates despite vastly different tick scales. Speciation probabilities and serialization detail also adjust per epoch. Speciation is capped at 20 alive species per world.
 
 ---
 
@@ -154,51 +154,45 @@ Keyframes dump full state every ~20 generations; intermediate ticks use delta en
 
 ### Agent blocks
 
-When agent-based simulation is active, species blocks include `@AGENT` sub-blocks using grid+notable hybrid format. Agents are aggregated into 100-unit spatial grid cells with behavior distributions, plus a small set of individually-tracked "notable" agents (top 5 by energy).
+When agent-based simulation is active, species blocks include `@AGENT` sub-blocks listing every agent with 10-unit quantized positions. Each agent gets an individual line with position, energy, age, and behavioral state.
 
 v1 keyframe:
 ```
-  @AGENT|count=420|mode=grid+5|cell=100
-    G(1,3):n=17,E=45|f:12,h:3,fl:2
-    G(2,3):n=8,E=38|f:5,h:2,r:1
+  @AGENT|count=420
     N:A1:(130,350,E=52,age=10,hunt->A3)
     N:A7:(400,100,E=89,age=15,forage)
+    N:A12:(220,510,E=35,age=5,flee)
 ```
 
 v2 keyframe:
 ```
-  @AGENT 420 grid+5 100
-   G 1,3 17 45 f:12 h:3 fl:2
-   G 2,3 8 38 f:5 h:2 r:1
+  @AGENT 420
    N A1 130 350 52 10 hunt->A3
    N A7 400 100 89 15 forage
+   N A12 220 510 35 5 flee
 ```
 
-Delta ticks encode only changed grid cells (count changed >2, avg energy changed >5, or dominant behavior changed) and changed/dead notables:
+Delta ticks encode only changed agents (position moved >5 units, energy changed >2, or age changed) and dead agents:
 
 v1 delta:
 ```
-  @AGENT|Δpos|cell=100
-    G(1,3):n=15,E=42|f:10,h:3,fl:2
-    N:A1:(140,360,E=48)
+  @AGENT|Δpos
+    N:A1:(140,360,E=48,age=11,forage)
     A7:†
 ```
 
 v2 delta:
 ```
-  @AGENT Δ 100
-   G 1,3 15 42 f:10 h:3 fl:2
-   N A1 140 360 48
+  @AGENT Δ
+   N A1 140 360 48 11 forage
    A7 †
 ```
-
-Behavior abbreviations: `r`=rest, `f`=forage, `h`=hunt, `m`=mate, `fl`=flee, `fk`=flock.
 
 ---
 
 ## Tokenization
 
-`MANTISTokenizer` is a custom trie-based longest-match tokenizer with 282 domain tokens padded to 512 for tensor core alignment. No GPT-2 / BPE / `transformers` dependency.
+`MANTISTokenizer` is a custom trie-based longest-match tokenizer with 283 domain tokens padded to 512 for tensor core alignment. No GPT-2 / BPE / `transformers` dependency.
 
 **Why custom over GPT-2 BPE**: The simulation format is ~98% structured protocol — not English. GPT-2's 50,257-token vocabulary wastes 1.5+ GB VRAM on dead embedding weights (at d=2048), runs softmax over 50K logits when only ~300 matter, and splits numbers inconsistently (`"2429"` → `["24","29"]` but `"2430"` differently). The custom tokenizer fixes all three:
 
@@ -212,7 +206,7 @@ Behavior abbreviations: `r`=rest, `f`=forage, `h`=hunt, `m`=mate, `fl`=flee, `fk
 | `"@SPOT"` encoding  | 3 tokens          | 1 token           |
 | Vocab utilization   | ~2-5%            | ~60-90%           |
 
-**Vocabulary (282 real + 230 reserved = 512)**:
+**Vocabulary (283 real + 229 reserved = 512)**:
 
 - Special (4): `<pad>` `<eos>` `<bos>` `<unk>`
 - Digits (10): `0`–`9` (numbers always digit-by-digit)
@@ -228,7 +222,7 @@ Behavior abbreviations: `r`=rest, `f`=forage, `h`=hunt, `m`=mate, `fl`=flee, `fk
 - Events/diseases/catastrophes (~25): `speciation` `extinction` `plague` `volcanic_winter` etc.
 - Diet (5): `det` `plt` `sol` `chemical` `none`
 - Agent behaviors (7): `forage` `rest` `flock` `flee` `mate` `fl` `fk`
-- Glue prefixes (15): `pop` `plan=` `inf+=` `loc+=` `locs` `outcome=` `reason=` `Cmem` `grid+` etc.
+- Glue prefixes (16): `pop` `plan=` `D` `inf+=` `loc+=` `locs` `outcome=` `reason=` `Cmem` `dur` `low_var` `low_variance` `grid+` `gen` `age` `inf`
 - Symbols (18): `±` `Δ` `+` `-` `=` `|` `:` `(` `)` `{` `}` `*` `.` `,` `/` `->` `†` `_`
 - ID prefixes (12): `S` `L` `H` `W` `G` `A` `N` `T` `E` `K` `D` `P`
 - Letters (52): `a`–`z` `A`–`Z` (character fallback for rare/unknown text)
@@ -308,7 +302,7 @@ Note: `train.py` uses plain cross-entropy (no per-token weighting) and `TextData
 
 ### Agent-enabled training
 
-Agent blocks use grid+notable hybrid format. A single ECOSYSTEM agent keyframe tick has a median of ~721 tokens (p95 = 6,139) with the 512-token trie tokenizer. Use `--enable-agents` on the eco and intel partitions (agents only activate at `--agent-epoch`, default ECOSYSTEM — the bio partition never reaches that epoch).
+Agent blocks use a per-agent format where every agent gets an individual line with quantized position, energy, age, and behavioral state. Use `--enable-agents` on the eco and intel partitions (agents only activate at `--agent-epoch`, default ECOSYSTEM — the bio partition never reaches that epoch).
 
 ```bash
 # Agent-enabled with longer sequences (24GB GPU)
@@ -380,9 +374,9 @@ Delta blocks (between `---` markers) across all epochs: median=164, P90=429, P95
 
 Keyframes in ECOSYSTEM/INTELLIGENCE are 3K–23K tokens — far too large for any single training window. The model learns keyframe structure across multiple overlapping windows via stride-based sliding. Delta blocks (the vast majority of training data) fit comfortably within seq-len=2048.
 
-**With agent simulation (estimated):**
+**With agent simulation (per-agent format):**
 
-Agent `@AGENT` sub-blocks add ~50-75% more tokens to ECOSYSTEM/INTELLIGENCE keyframes. Use `--seq-len 4096` minimum with `--gradient-checkpointing`.
+Agent `@AGENT` sub-blocks list every agent individually (~1 line per agent, up to 250/species). Keyframe token counts scale linearly with agent count. Use `--seq-len 4096` minimum with `--gradient-checkpointing`.
 
 ### World boundary handling
 
