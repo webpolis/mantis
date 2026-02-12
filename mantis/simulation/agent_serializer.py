@@ -1,10 +1,9 @@
 """
 Serialization for agent-based simulation blocks.
 
-Produces @AGENT protocol blocks using grid+notable hybrid format:
-- Grid cells: 100-unit spatial aggregation with count, avg energy, behavior distribution
-- Notable agents: top-N by energy, individually tracked with 10-unit quantized positions
-- Delta encoding: only changed grid cells and changed/dead notables
+Produces @AGENT protocol blocks with per-agent positions:
+- Each agent gets an individual line with 10-unit quantized position
+- Delta encoding: only changed/new/dead agents emitted between keyframes
 """
 
 from __future__ import annotations
@@ -15,7 +14,6 @@ if TYPE_CHECKING:
     from .agent import Agent, AgentManager
 
 QUANTIZE_GRID = 10
-NOTABLE_COUNT = 5
 
 BEHAVIOR_ABBREV = {
     "rest": "r",
@@ -29,53 +27,37 @@ BEHAVIOR_ABBREV = {
 ABBREV_TO_BEHAVIOR = {v: k for k, v in BEHAVIOR_ABBREV.items()}
 
 
-def _get_cell(x: float, y: float) -> tuple[int, int]:
-    """Bin position to 100-unit grid cell (col, row)."""
-    from .agent import CELL_SIZE
-    return (int(x // CELL_SIZE), int(y // CELL_SIZE))
-
-
-def _bin_agents_to_cells(agents: list[Agent]) -> dict[tuple[int, int], list[Agent]]:
-    """Group agents by grid cell."""
-    cells: dict[tuple[int, int], list[Agent]] = {}
-    for a in agents:
-        cell = _get_cell(a.x, a.y)
-        cells.setdefault(cell, []).append(a)
-    return cells
-
-
-def _aggregate_cell(agents: list[Agent]) -> tuple[int, int, dict[str, int]]:
-    """Aggregate agents in a cell: (count, avg_energy_int, {behavior_abbrev: count})."""
-    count = len(agents)
-    avg_energy = int(round(sum(a.energy for a in agents) / count))
-    behaviors: dict[str, int] = {}
-    for a in agents:
-        abbrev = BEHAVIOR_ABBREV.get(a.state, a.state)
-        behaviors[abbrev] = behaviors.get(abbrev, 0) + 1
-    return count, avg_energy, behaviors
-
-
-def _dominant_behavior(behaviors: dict[str, int]) -> str:
-    """Return the behavior abbreviation with highest count."""
-    return max(behaviors, key=behaviors.__getitem__)
-
-
-def _select_notables(agents: list[Agent], n: int = NOTABLE_COUNT) -> list[Agent]:
-    """Top N agents by energy, deterministic (sorted by energy desc, then aid asc)."""
-    sorted_agents = sorted(agents, key=lambda a: (-a.energy, a.aid))
-    return sorted_agents[:n]
-
-
 def _quantize(x: float) -> int:
-    """Round to nearest 10 units for notable positions."""
+    """Round to nearest 10 units for positions."""
     return int(round(x / QUANTIZE_GRID)) * QUANTIZE_GRID
+
+
+def _format_agent_line(a: Agent, compact: bool) -> str:
+    """Format a single agent as a protocol line."""
+    qx = _quantize(a.x)
+    qy = _quantize(a.y)
+    e = int(round(a.energy))
+    state_str = a.state
+    if a.state == "hunt" and a.target_aid is not None:
+        state_str = f"hunt->A{a.target_aid}"
+
+    if compact:
+        return f"   N A{a.aid} {qx} {qy} {e} {a.age} {state_str}"
+    else:
+        return f"    N:A{a.aid}:({qx},{qy},E={e},age={a.age},{state_str})"
+
+
+def _snapshot_agent(a: Agent) -> tuple[int, int, int, int, str, int | None]:
+    """Snapshot an agent's state for delta comparison."""
+    return (_quantize(a.x), _quantize(a.y), int(round(a.energy)),
+            a.age, a.state, a.target_aid)
 
 
 def serialize_agents_keyframe(
     manager: AgentManager,
     compact: bool = False,
 ) -> tuple[list[str], dict]:
-    """Full agent state dump for a keyframe tick.
+    """Full agent state dump — every agent with its quantized position.
 
     Returns (lines, snapshot).
     """
@@ -83,63 +65,19 @@ def serialize_agents_keyframe(
     if not agents:
         return [], {}
 
-    from .agent import CELL_SIZE
-
     total = len(agents)
-    cells = _bin_agents_to_cells(agents)
-    notables = _select_notables(agents)
-
     lines = []
     if compact:
-        lines.append(f"  @AGENT {total} grid+{len(notables)} {CELL_SIZE}")
+        lines.append(f"  @AGENT {total}")
     else:
-        lines.append(
-            f"  @AGENT|count={total}"
-            f"|mode=grid+{len(notables)}"
-            f"|cell={CELL_SIZE}"
-        )
+        lines.append(f"  @AGENT|count={total}")
 
-    # Grid lines sorted by cell coord
-    grid_snapshot = {}
-    for (col, row) in sorted(cells.keys()):
-        count, avg_e, behaviors = _aggregate_cell(cells[(col, row)])
-        dominant = _dominant_behavior(behaviors)
-        grid_snapshot[(col, row)] = (count, avg_e, dominant)
+    snapshot: dict[int, tuple] = {}
+    for a in agents:
+        lines.append(_format_agent_line(a, compact))
+        snapshot[a.aid] = _snapshot_agent(a)
 
-        # Sort behaviors by count desc
-        sorted_beh = sorted(behaviors.items(), key=lambda x: -x[1])
-        if compact:
-            beh_str = " ".join(f"{b}:{c}" for b, c in sorted_beh)
-            lines.append(f"   G {col},{row} {count} {avg_e} {beh_str}")
-        else:
-            beh_str = ",".join(f"{b}:{c}" for b, c in sorted_beh)
-            lines.append(f"    G({col},{row}):n={count},E={avg_e}|{beh_str}")
-
-    # Notable lines with 10-unit quantized positions
-    notable_snapshot = {}
-    notable_ids = set()
-    for a in notables:
-        qx = _quantize(a.x)
-        qy = _quantize(a.y)
-        e = int(round(a.energy))
-        notable_snapshot[a.aid] = (qx, qy, e, a.age, a.state, a.target_aid)
-        notable_ids.add(a.aid)
-
-        state_str = a.state
-        if a.state == "hunt" and a.target_aid is not None:
-            state_str = f"hunt->A{a.target_aid}"
-
-        if compact:
-            lines.append(f"   N A{a.aid} {qx} {qy} {e} {a.age} {state_str}")
-        else:
-            lines.append(f"    N:A{a.aid}:({qx},{qy},E={e},age={a.age},{state_str})")
-
-    snapshot = {
-        "grid": grid_snapshot,
-        "notables": notable_snapshot,
-        "notable_ids": notable_ids,
-    }
-    return lines, snapshot
+    return lines, {"agents": snapshot}
 
 
 def serialize_agents_delta(
@@ -147,117 +85,54 @@ def serialize_agents_delta(
     prev_snapshot: dict,
     compact: bool = False,
 ) -> tuple[list[str], dict]:
-    """Delta encoding: only changed grid cells and changed/dead notables.
+    """Delta encoding: only changed, new, or dead agents.
 
     Returns (lines, new_snapshot).
-    Grid cell emitted if count changed >2 OR avg energy changed >5 OR dominant behavior changed.
-    Notable emitted if position moved >5 units or energy changed >2.
+    Agent emitted if position moved >5 units, energy changed >2, or age changed.
     """
     agents = manager.agents
     if not agents and not manager.event_log.deaths:
         return [], prev_snapshot
 
-    from .agent import CELL_SIZE
-
-    cells = _bin_agents_to_cells(agents)
-    prev_grid = prev_snapshot.get("grid", {})
-    prev_notables = prev_snapshot.get("notables", {})
-    prev_notable_ids = prev_snapshot.get("notable_ids", set())
-
+    prev_agents = prev_snapshot.get("agents", {})
     changed_lines: list[str] = []
 
-    # Build new grid snapshot and emit changed cells
-    new_grid = {}
-    all_cells = set(cells.keys()) | set(prev_grid.keys())
-    for (col, row) in sorted(all_cells):
-        cell_agents = cells.get((col, row), [])
-        if not cell_agents:
-            # Cell went empty — skip (don't emit empty cells)
-            continue
+    new_agents: dict[int, tuple] = {}
+    for a in agents:
+        snap = _snapshot_agent(a)
+        new_agents[a.aid] = snap
+        qx, qy, e, age = snap[0], snap[1], snap[2], snap[3]
 
-        count, avg_e, behaviors = _aggregate_cell(cell_agents)
-        dominant = _dominant_behavior(behaviors)
-        new_grid[(col, row)] = (count, avg_e, dominant)
-
-        prev = prev_grid.get((col, row))
+        prev = prev_agents.get(a.aid)
         if prev is None:
-            # New cell
-            sorted_beh = sorted(behaviors.items(), key=lambda x: -x[1])
-            if compact:
-                beh_str = " ".join(f"{b}:{c}" for b, c in sorted_beh)
-                changed_lines.append(f"   G {col},{row} {count} {avg_e} {beh_str}")
-            else:
-                beh_str = ",".join(f"{b}:{c}" for b, c in sorted_beh)
-                changed_lines.append(f"    G({col},{row}):n={count},E={avg_e}|{beh_str}")
+            # New agent
+            changed_lines.append(_format_agent_line(a, compact))
         else:
-            p_count, p_avg_e, p_dominant = prev
-            if abs(count - p_count) > 2 or abs(avg_e - p_avg_e) > 5 or dominant != p_dominant:
-                sorted_beh = sorted(behaviors.items(), key=lambda x: -x[1])
-                if compact:
-                    beh_str = " ".join(f"{b}:{c}" for b, c in sorted_beh)
-                    changed_lines.append(f"   G {col},{row} {count} {avg_e} {beh_str}")
-                else:
-                    beh_str = ",".join(f"{b}:{c}" for b, c in sorted_beh)
-                    changed_lines.append(f"    G({col},{row}):n={count},E={avg_e}|{beh_str}")
+            px, py, pe, p_age = prev[0], prev[1], prev[2], prev[3]
+            moved = abs(qx - px) > 5 or abs(qy - py) > 5
+            energy_changed = abs(e - pe) > 2
+            age_changed = age != p_age
+            if moved or energy_changed or age_changed:
+                changed_lines.append(_format_agent_line(a, compact))
 
-    # Notable agents — same IDs from last keyframe, no replacements
-    new_notables = {}
-    agent_by_aid = {a.aid: a for a in agents}
-    for aid in prev_notable_ids:
-        a = agent_by_aid.get(aid)
-        if a is not None:
-            qx = _quantize(a.x)
-            qy = _quantize(a.y)
-            e = int(round(a.energy))
-            state_str = a.state
-            if a.state == "hunt" and a.target_aid is not None:
-                state_str = f"hunt->A{a.target_aid}"
-            new_notables[aid] = (qx, qy, e, a.age, a.state, a.target_aid)
-
-            prev_n = prev_notables.get(aid)
-            if prev_n is not None:
-                px, py, pe = prev_n[0], prev_n[1], prev_n[2]
-                moved = abs(qx - px) > 5 or abs(qy - py) > 5
-                energy_changed = abs(e - pe) > 2
-                if moved or energy_changed:
-                    if compact:
-                        changed_lines.append(f"   N A{aid} {qx} {qy} {e} {a.age} {state_str}")
-                    else:
-                        changed_lines.append(f"    N:A{aid}:({qx},{qy},E={e},age={a.age},{state_str})")
-            else:
-                # Was notable but no prev data — emit full
-                if compact:
-                    changed_lines.append(f"   N A{aid} {qx} {qy} {e} {a.age} {state_str}")
-                else:
-                    changed_lines.append(f"    N:A{aid}:({qx},{qy},E={e},age={a.age},{state_str})")
-
-    # Dead notables
+    # Dead agents
     for dead_aid in manager.event_log.deaths:
-        if dead_aid in prev_notable_ids:
+        if dead_aid in prev_agents:
             if compact:
                 changed_lines.append(f"   A{dead_aid} \u2020")
             else:
                 changed_lines.append(f"    A{dead_aid}:\u2020")
 
     if not changed_lines:
-        return [], {
-            "grid": new_grid,
-            "notables": new_notables,
-            "notable_ids": prev_notable_ids,
-        }
+        return [], {"agents": new_agents}
 
     if compact:
-        lines = [f"  @AGENT \u0394 {CELL_SIZE}"]
+        lines = [f"  @AGENT \u0394"]
     else:
-        lines = [f"  @AGENT|\u0394pos|cell={CELL_SIZE}"]
+        lines = [f"  @AGENT|\u0394pos"]
     lines.extend(changed_lines)
 
-    new_snapshot = {
-        "grid": new_grid,
-        "notables": new_notables,
-        "notable_ids": prev_notable_ids,
-    }
-    return lines, new_snapshot
+    return lines, {"agents": new_agents}
 
 
 class AgentSerializerState:

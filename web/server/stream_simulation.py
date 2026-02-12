@@ -196,8 +196,9 @@ def _parse_grid_line(line: str, compact: bool, cell_size: int = 100) -> list[Par
     v1: G(col,row):n=N,E=avg|beh:count,...
     """
     line = line.strip()
+    avg_age = 0
     if compact:
-        # v2: G 1,3 17 45 f:12 h:3 fl:2
+        # v2: G 1,3 17 45 [avg_age] f:12 h:3 fl:2
         parts = line.split()
         if len(parts) < 4:
             return []
@@ -211,10 +212,19 @@ def _parse_grid_line(line: str, compact: bool, cell_size: int = 100) -> list[Par
         except (ValueError, IndexError):
             return []
 
+        # 5th token may be avg_age (numeric) or start of behaviors (contains ':')
+        beh_start = 4
+        if len(parts) > 4 and ":" not in parts[4]:
+            try:
+                avg_age = int(parts[4])
+                beh_start = 5
+            except ValueError:
+                pass
+
         # Find dominant behavior from remaining tokens
         dominant = "rest"
         max_beh_count = 0
-        for tok in parts[4:]:
+        for tok in parts[beh_start:]:
             if ":" in tok:
                 beh_abbrev, beh_count_str = tok.split(":", 1)
                 try:
@@ -225,14 +235,16 @@ def _parse_grid_line(line: str, compact: bool, cell_size: int = 100) -> list[Par
                 except ValueError:
                     pass
     else:
-        # v1: G(col,row):n=N,E=avg|beh:count,...
-        m = re.match(r"G\((\d+),(\d+)\):n=(\d+),E=(\d+)\|(.+)", line)
+        # v1: G(col,row):n=N,E=avg[,age=A]|beh:count,...
+        m = re.match(r"G\((\d+),(\d+)\):n=(\d+),E=(\d+)(?:,age=(\d+))?\|(.+)", line)
         if not m:
             return []
         col, row = int(m.group(1)), int(m.group(2))
         count = int(m.group(3))
         avg_energy = float(m.group(4))
-        beh_str = m.group(5)
+        if m.group(5) is not None:
+            avg_age = int(m.group(5))
+        beh_str = m.group(6)
         dominant = "rest"
         max_beh_count = 0
         for pair in beh_str.split(","):
@@ -256,6 +268,7 @@ def _parse_grid_line(line: str, compact: bool, cell_size: int = 100) -> list[Par
         x=float(center_x),
         y=float(center_y),
         energy=avg_energy,
+        age=avg_age,
         state=dominant,
         count=count,
     )]

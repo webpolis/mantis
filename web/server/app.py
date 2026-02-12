@@ -289,6 +289,17 @@ def handle_start_live(data=None):
                         "dead": not a.alive,
                         "count": 1,
                     })
+                # Death markers for agents that died this tick
+                for dead_aid in sp.agent_manager.event_log.deaths:
+                    agent_data.append({
+                        "uid": f"{sp.sid}_{dead_aid}",
+                        "aid": dead_aid,
+                        "species_sid": sp.sid,
+                        "x": 0, "y": 0,
+                        "energy": 0, "age": 0,
+                        "state": "rest", "target_aid": None,
+                        "dead": True, "count": 1,
+                    })
 
         # Collect events from world
         event_data = []
