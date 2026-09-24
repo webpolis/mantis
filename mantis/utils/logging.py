@@ -5,7 +5,6 @@ Logging utilities for MANTIS training and inference.
 import logging
 import sys
 from typing import Optional
-import wandb
 
 
 def setup_logger(
@@ -63,8 +62,11 @@ class MetricsLogger:
         run_name: Optional[str] = None
     ):
         self.use_wandb = use_wandb
+        self._wandb = None
 
         if use_wandb:
+            import wandb
+            self._wandb = wandb
             wandb.init(project=project_name, name=run_name)
 
         self.metrics = {}
@@ -80,17 +82,17 @@ class MetricsLogger:
         self.metrics.update(metrics)
 
         if self.use_wandb:
-            wandb.log(metrics, step=step)
+            self._wandb.log(metrics, step=step)
 
     def log_histogram(self, name: str, values, step: Optional[int] = None):
         """Log histogram of values."""
         if self.use_wandb:
-            wandb.log({name: wandb.Histogram(values)}, step=step)
+            self._wandb.log({name: self._wandb.Histogram(values)}, step=step)
 
     def finish(self):
         """Finish logging session."""
         if self.use_wandb:
-            wandb.finish()
+            self._wandb.finish()
 
     def get_metrics(self) -> dict:
         """Get current metrics."""

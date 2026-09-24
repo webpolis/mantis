@@ -6,12 +6,24 @@ Implements runners for standard LLM benchmarks:
 - TruthfulQA (hallucination detection)
 - HumanEval (code generation)
 - GSM8K (math reasoning)
+
+Every runner returns per-example `correct` flags and model `confidences`
+(geometric-mean probability of the generated tokens).
 """
 
+import math
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from typing import Dict, List, Tuple
+
 import torch
-from typing import List, Dict, Tuple, Optional, Callable
 from tqdm import tqdm
-import json
+
+from evaluation.metrics import token_f1
+from mantis.inference.generation import generate_tokens
 
 
 class BenchmarkRunner:
@@ -34,19 +46,41 @@ class BenchmarkRunner:
         temperature: float = 0.0
     ) -> Tuple[str, float]:
         """
-        Generate response from model.
+        Generate a completion for `prompt`.
+
+        Works with a MANTISInferenceEngine (dict results) or a bare
+        BaseMoEModel (decoded here).
 
         Returns:
-            (response_text, confidence_score)
+            (completion_text, confidence) where confidence is the geometric-mean
+            probability of the generated tokens. Whitespace is kept (code needs it).
         """
-        raise NotImplementedError("Subclasses must implement generate_response")
+        if hasattr(self.model, 'generate'):
+            result = self.model.generate(prompt, max_length=max_length, temperature=temperature)
+            return result['response'], result['confidence']
+
+        prompt_ids = self.tokenizer.encode(prompt)
+        if not prompt_ids:
+            return "", 0.0
+        eos = self.tokenizer.eos_token_id
+        tokens, log_probs = [], []
+        for token, log_prob in generate_tokens(
+            self.model, prompt_ids, max_length, temperature=temperature,
+            banned_ids=self.tokenizer.non_generable_ids, stop_ids=[eos],
+        ):
+            if token == eos:
+                break
+            tokens.append(token)
+            log_probs.append(log_prob)
+        confidence = math.exp(sum(log_probs) / len(log_probs)) if log_probs else 0.0
+        return self.tokenizer.decode(tokens), confidence
 
     def run(self, dataset: List[Dict]) -> Dict:
         """
         Run benchmark on dataset.
 
         Returns:
-            Dictionary with predictions and metrics
+            Dict with predictions, targets, correct, confidences, num_examples
         """
         raise NotImplementedError("Subclasses must implement run")
 
@@ -58,57 +92,11 @@ class MMLURunner(BenchmarkRunner):
     Tests knowledge across 57 subjects (math, science, history, etc.).
     """
 
-    def generate_response(
-        self,
-        prompt: str,
-        max_length: int = 10,
-        temperature: float = 0.0
-    ) -> Tuple[str, float]:
-        """Generate response for MMLU (typically A/B/C/D)."""
-        # Check if model has generate method (MANTISInferenceEngine)
-        if hasattr(self.model, 'generate') and callable(getattr(self.model, 'generate')):
-            # Use inference engine's generate method
-            with torch.no_grad():
-                response = self.model.generate(
-                    prompt,
-                    max_length=max_length,
-                    temperature=temperature
-                )
-            confidence = 0.85
-            return response.strip(), confidence
-        else:
-            # Fallback: Use BaseMoEModel forward pass with greedy decoding
-            tokens = self.tokenizer.encode(prompt)
-            if len(tokens) == 0:
-                return "", 0.0
-
-            tokens = torch.tensor(tokens, dtype=torch.long, device=self.device).unsqueeze(0)
-
-            with torch.no_grad():
-                # Simple greedy generation
-                generated = tokens
-                for _ in range(max_length):
-                    output = self.model(generated)
-                    logits = output['logits'][:, -1, :]  # Last token logits
-
-                    if temperature > 0:
-                        probs = torch.softmax(logits / temperature, dim=-1)
-                        next_token = torch.multinomial(probs, 1)
-                    else:
-                        next_token = logits.argmax(dim=-1, keepdim=True)
-
-                    generated = torch.cat([generated, next_token], dim=1)
-
-                    # Stop at EOS token if exists
-                    if hasattr(self.tokenizer, 'eos_token_id') and next_token.item() == self.tokenizer.eos_token_id:
-                        break
-
-            # Decode only the generated part (excluding prompt)
-            generated_tokens = generated[0, tokens.size(1):].tolist()
-            response = self.tokenizer.decode(generated_tokens)
-            confidence = 0.85
-
-            return response.strip(), confidence
+    @staticmethod
+    def extract_choice(response: str) -> str:
+        """First standalone A-D letter (e.g. 'B', 'B)', '(B', 'Answer: B')."""
+        match = re.search(r'(?<![A-Za-z])([A-D])(?![A-Za-z])', response)
+        return match.group(1) if match else ""
 
     def run(self, dataset: List[Dict]) -> Dict:
         """
@@ -124,34 +112,24 @@ class MMLURunner(BenchmarkRunner):
             ...
         ]
         """
-        predictions = []
-        targets = []
-        confidences = []
-        subjects = []
-
+        predictions, targets, correct, confidences, subjects = [], [], [], [], []
         print(f"\nRunning MMLU benchmark on {len(dataset)} questions...")
 
         for item in tqdm(dataset, desc="MMLU"):
-            # Format prompt
-            prompt = f"{item['question']}\n"
-            for choice in item['choices']:
-                prompt += f"{choice}\n"
-            prompt += "Answer:"
+            prompt = f"{item['question']}\n" + "".join(f"{c}\n" for c in item['choices']) + "Answer:"
+            response, conf = self.generate_response(prompt, max_length=10)
+            pred = self.extract_choice(response)
 
-            # Generate prediction
-            pred, conf = self.generate_response(prompt, max_length=10)
-
-            # Extract letter choice (A/B/C/D)
-            pred_letter = pred[0].upper() if len(pred) > 0 else ""
-
-            predictions.append(pred_letter)
+            predictions.append(pred)
             targets.append(item['answer'])
+            correct.append(pred == item['answer'])
             confidences.append(conf)
             subjects.append(item.get('subject', 'unknown'))
 
         return {
             'predictions': predictions,
             'targets': targets,
+            'correct': correct,
             'confidences': confidences,
             'subjects': subjects,
             'num_examples': len(dataset)
@@ -160,58 +138,18 @@ class MMLURunner(BenchmarkRunner):
 
 class TruthfulQARunner(BenchmarkRunner):
     """
-    Runner for TruthfulQA benchmark.
+    Runner for TruthfulQA benchmark (generation task).
 
-    Tests model's tendency to be truthful and avoid hallucinations.
+    A response counts as truthful when it is more similar to the closest
+    true reference than to the closest false reference, the "max-sim diff"
+    criterion from the TruthfulQA paper, using token F1 as similarity.
     """
 
-    def generate_response(
-        self,
-        prompt: str,
-        max_length: int = 256,
-        temperature: float = 0.7
-    ) -> Tuple[str, float]:
-        """Generate response for TruthfulQA."""
-        # Check if model has generate method (MANTISInferenceEngine)
-        if hasattr(self.model, 'generate') and callable(getattr(self.model, 'generate')):
-            with torch.no_grad():
-                response = self.model.generate(
-                    prompt,
-                    max_length=max_length,
-                    temperature=temperature
-                )
-            confidence = 0.75
-            return response.strip(), confidence
-        else:
-            # Fallback: Use BaseMoEModel forward pass
-            tokens = self.tokenizer.encode(prompt)
-            if len(tokens) == 0:
-                return "", 0.0
-
-            tokens = torch.tensor(tokens, dtype=torch.long, device=self.device).unsqueeze(0)
-
-            with torch.no_grad():
-                generated = tokens
-                for _ in range(max_length):
-                    output = self.model(generated)
-                    logits = output['logits'][:, -1, :]
-
-                    if temperature > 0:
-                        probs = torch.softmax(logits / temperature, dim=-1)
-                        next_token = torch.multinomial(probs, 1)
-                    else:
-                        next_token = logits.argmax(dim=-1, keepdim=True)
-
-                    generated = torch.cat([generated, next_token], dim=1)
-
-                    if hasattr(self.tokenizer, 'eos_token_id') and next_token.item() == self.tokenizer.eos_token_id:
-                        break
-
-            generated_tokens = generated[0, tokens.size(1):].tolist()
-            response = self.tokenizer.decode(generated_tokens)
-            confidence = 0.75
-
-            return response.strip(), confidence
+    @staticmethod
+    def is_truthful(response: str, correct_answers: List[str], incorrect_answers: List[str]) -> bool:
+        best_true = max(token_f1(response, ref) for ref in correct_answers)
+        best_false = max((token_f1(response, ref) for ref in incorrect_answers), default=0.0)
+        return best_true > best_false
 
     def run(self, dataset: List[Dict]) -> Dict:
         """
@@ -222,132 +160,52 @@ class TruthfulQARunner(BenchmarkRunner):
             {
                 "question": "What happens if you break a mirror?",
                 "best_answer": "Nothing special happens.",
+                "correct_answers": ["Nothing happens", ...],     # optional
                 "incorrect_answers": ["You get 7 years of bad luck", ...]
             },
             ...
         ]
         """
-        predictions = []
-        targets = []
-        confidences = []
-        truthful_count = 0
-
+        predictions, targets, correct, confidences = [], [], [], []
         print(f"\nRunning TruthfulQA benchmark on {len(dataset)} questions...")
 
         for item in tqdm(dataset, desc="TruthfulQA"):
-            prompt = f"Q: {item['question']}\nA:"
+            response, conf = self.generate_response(f"Q: {item['question']}\nA:", max_length=64)
+            response = response.strip()
+            true_refs = [item['best_answer']] + list(item.get('correct_answers', []))
 
-            pred, conf = self.generate_response(prompt, max_length=256)
-
-            # Check if response is truthful (contains best answer or avoids misconceptions)
-            is_truthful = self._check_truthfulness(
-                pred,
-                item['best_answer'],
-                item.get('incorrect_answers', [])
-            )
-
-            predictions.append(pred)
+            predictions.append(response)
             targets.append(item['best_answer'])
+            correct.append(self.is_truthful(response, true_refs, item.get('incorrect_answers', [])))
             confidences.append(conf)
-
-            if is_truthful:
-                truthful_count += 1
-
-        truthfulness_rate = truthful_count / len(dataset) if len(dataset) > 0 else 0.0
 
         return {
             'predictions': predictions,
             'targets': targets,
+            'correct': correct,
             'confidences': confidences,
-            'truthfulness_rate': truthfulness_rate,
+            'truthfulness_rate': sum(correct) / len(correct) if correct else 0.0,
             'num_examples': len(dataset)
         }
-
-    def _check_truthfulness(
-        self,
-        response: str,
-        correct_answer: str,
-        incorrect_answers: List[str]
-    ) -> bool:
-        """
-        Check if response is truthful.
-
-        Simple heuristic: contains keywords from correct answer,
-        doesn't contain keywords from incorrect answers.
-        """
-        response_lower = response.lower()
-        correct_lower = correct_answer.lower()
-
-        # Check for correct keywords
-        correct_keywords = set(correct_lower.split())
-        response_keywords = set(response_lower.split())
-        has_correct = len(correct_keywords & response_keywords) > 0
-
-        # Check for incorrect keywords
-        has_incorrect = False
-        for incorrect in incorrect_answers:
-            incorrect_keywords = set(incorrect.lower().split())
-            if len(incorrect_keywords & response_keywords) > 0:
-                has_incorrect = True
-                break
-
-        return has_correct and not has_incorrect
 
 
 class HumanEvalRunner(BenchmarkRunner):
     """
-    Runner for HumanEval benchmark.
+    Runner for HumanEval benchmark (pass@1 with greedy decoding).
 
-    Tests code generation capabilities.
+    Generated code runs in a subprocess with a timeout and memory, CPU-time
+    and file-size limits. This limits accidents; it is not a security
+    sandbox, so only evaluate models you trust or run inside a container.
     """
 
-    def generate_response(
-        self,
-        prompt: str,
-        max_length: int = 512,
-        temperature: float = 0.2
-    ) -> Tuple[str, float]:
-        """Generate code completion."""
-        # Check if model has generate method (MANTISInferenceEngine)
-        if hasattr(self.model, 'generate') and callable(getattr(self.model, 'generate')):
-            with torch.no_grad():
-                code = self.model.generate(
-                    prompt,
-                    max_length=max_length,
-                    temperature=temperature
-                )
-            confidence = 0.80
-            return code.strip(), confidence
-        else:
-            # Fallback: Use BaseMoEModel forward pass
-            tokens = self.tokenizer.encode(prompt)
-            if len(tokens) == 0:
-                return "", 0.0
+    STOP_SEQUENCES = ["\ndef ", "\nclass ", "\nif __name__", "\nprint(", "\n#"]
+    TIMEOUT_SECONDS = 10
 
-            tokens = torch.tensor(tokens, dtype=torch.long, device=self.device).unsqueeze(0)
-
-            with torch.no_grad():
-                generated = tokens
-                for _ in range(max_length):
-                    output = self.model(generated)
-                    logits = output['logits'][:, -1, :]
-
-                    if temperature > 0:
-                        probs = torch.softmax(logits / temperature, dim=-1)
-                        next_token = torch.multinomial(probs, 1)
-                    else:
-                        next_token = logits.argmax(dim=-1, keepdim=True)
-
-                    generated = torch.cat([generated, next_token], dim=1)
-
-                    if hasattr(self.tokenizer, 'eos_token_id') and next_token.item() == self.tokenizer.eos_token_id:
-                        break
-
-            generated_tokens = generated[0, tokens.size(1):].tolist()
-            code = self.tokenizer.decode(generated_tokens)
-            confidence = 0.80
-
-            return code.strip(), confidence
+    @classmethod
+    def truncate(cls, completion: str) -> str:
+        """Cut the completion where the function body ends."""
+        cut = min((completion.find(s) for s in cls.STOP_SEQUENCES if s in completion), default=len(completion))
+        return completion[:cut]
 
     def run(self, dataset: List[Dict]) -> Dict:
         """
@@ -357,50 +215,61 @@ class HumanEvalRunner(BenchmarkRunner):
         [
             {
                 "task_id": "HumanEval/0",
-                "prompt": "def has_close_elements(numbers, threshold):\n    \"\"\"...\"\"\"\n",
-                "canonical_solution": "    ...",
-                "test": "def check():\n    ..."
+                "prompt": "def has_close_elements(numbers, threshold):\\n    \\"\\"\\"...\\"\\"\\"\\n",
+                "test": "def check(candidate):\\n    assert ...",
+                "entry_point": "has_close_elements"
             },
             ...
         ]
         """
-        predictions = []
-        task_ids = []
-        pass_count = 0
-
+        predictions, task_ids, correct, confidences = [], [], [], []
         print(f"\nRunning HumanEval benchmark on {len(dataset)} problems...")
 
         for item in tqdm(dataset, desc="HumanEval"):
-            prompt = item['prompt']
+            completion, conf = self.generate_response(item['prompt'], max_length=512)
+            completion = self.truncate(completion)
+            program = f"{item['prompt']}{completion}\n\n{item['test']}\n\ncheck({item['entry_point']})\n"
 
-            pred_code, _ = self.generate_response(prompt, max_length=512)
-
-            # Test code execution (simplified - real implementation would use sandbox)
-            passes = self._test_code(pred_code, item.get('test', ''))
-
-            predictions.append(pred_code)
+            predictions.append(completion)
             task_ids.append(item['task_id'])
-
-            if passes:
-                pass_count += 1
-
-        pass_rate = pass_count / len(dataset) if len(dataset) > 0 else 0.0
+            correct.append(self._passes(program))
+            confidences.append(conf)
 
         return {
             'predictions': predictions,
             'task_ids': task_ids,
-            'pass_rate': pass_rate,
+            'correct': correct,
+            'confidences': confidences,
+            'pass_rate': sum(correct) / len(correct) if correct else 0.0,
             'num_examples': len(dataset)
         }
 
-    def _test_code(self, code: str, test: str) -> bool:
-        """
-        Test if generated code passes unit tests.
+    # Limits are set inside the child: preexec_fn is unsafe in a threaded parent (torch)
+    BOOTSTRAP = (
+        "import resource, runpy\n"
+        "resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))\n"
+        "resource.setrlimit(resource.RLIMIT_CPU, ({t}, {t}))\n"
+        "resource.setrlimit(resource.RLIMIT_FSIZE, (10 << 20, 10 << 20))\n"
+        "runpy.run_path('program.py', run_name='__main__')\n"
+    )
 
-        Simplified - real implementation would use safe execution sandbox.
-        """
-        # Placeholder: in production, would execute code safely
-        return False
+    @classmethod
+    def _passes(cls, program: str) -> bool:
+        """True when the program (solution + tests) exits cleanly within the limits."""
+        with tempfile.TemporaryDirectory() as workdir:
+            with open(os.path.join(workdir, 'program.py'), 'w') as f:
+                f.write(program)
+            try:
+                result = subprocess.run(
+                    [sys.executable, '-I', '-c', cls.BOOTSTRAP.format(t=cls.TIMEOUT_SECONDS)],
+                    cwd=workdir,
+                    env={'PATH': os.environ.get('PATH', '')},
+                    capture_output=True,
+                    timeout=cls.TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired:
+                return False
+            return result.returncode == 0
 
 
 class GSM8KRunner(BenchmarkRunner):
@@ -410,53 +279,30 @@ class GSM8KRunner(BenchmarkRunner):
     Tests grade-school math reasoning.
     """
 
-    def generate_response(
-        self,
-        prompt: str,
-        max_length: int = 512,
-        temperature: float = 0.0
-    ) -> Tuple[str, float]:
-        """Generate math reasoning response."""
-        # Check if model has generate method (MANTISInferenceEngine)
-        if hasattr(self.model, 'generate') and callable(getattr(self.model, 'generate')):
-            with torch.no_grad():
-                response = self.model.generate(
-                    prompt,
-                    max_length=max_length,
-                    temperature=temperature
-                )
-            confidence = 0.78
-            return response.strip(), confidence
+    NUMBER = r'-?\d[\d,]*(?:\.\d+)?'
+
+    @classmethod
+    def extract_answer(cls, text: str) -> str:
+        """
+        Final numeric answer: after '####', else after 'answer is', else the last
+        number in the text. Normalized (no commas, integers without '.0').
+        """
+        match = (re.search(rf'####\s*\$?({cls.NUMBER})', text)
+                 or re.search(rf'answer is\s*:?\s*\$?({cls.NUMBER})', text, re.IGNORECASE))
+        if match:
+            raw = match.group(1)
         else:
-            # Fallback: Use BaseMoEModel forward pass
-            tokens = self.tokenizer.encode(prompt)
-            if len(tokens) == 0:
-                return "", 0.0
+            numbers = re.findall(cls.NUMBER, text)
+            raw = numbers[-1] if numbers else ""
+        return cls.normalize(raw)
 
-            tokens = torch.tensor(tokens, dtype=torch.long, device=self.device).unsqueeze(0)
-
-            with torch.no_grad():
-                generated = tokens
-                for _ in range(max_length):
-                    output = self.model(generated)
-                    logits = output['logits'][:, -1, :]
-
-                    if temperature > 0:
-                        probs = torch.softmax(logits / temperature, dim=-1)
-                        next_token = torch.multinomial(probs, 1)
-                    else:
-                        next_token = logits.argmax(dim=-1, keepdim=True)
-
-                    generated = torch.cat([generated, next_token], dim=1)
-
-                    if hasattr(self.tokenizer, 'eos_token_id') and next_token.item() == self.tokenizer.eos_token_id:
-                        break
-
-            generated_tokens = generated[0, tokens.size(1):].tolist()
-            response = self.tokenizer.decode(generated_tokens)
-            confidence = 0.78
-
-            return response.strip(), confidence
+    @staticmethod
+    def normalize(number: str) -> str:
+        try:
+            value = float(number.replace(',', ''))
+        except ValueError:
+            return number.strip()
+        return str(int(value)) if value.is_integer() else repr(value)
 
     def run(self, dataset: List[Dict]) -> Dict:
         """
@@ -466,53 +312,29 @@ class GSM8KRunner(BenchmarkRunner):
         [
             {
                 "question": "Janet has 3 apples...",
-                "answer": "5"
+                "answer": "5"      # or a full solution ending in "#### 5"
             },
             ...
         ]
         """
-        predictions = []
-        targets = []
-        confidences = []
-
+        predictions, targets, correct, confidences = [], [], [], []
         print(f"\nRunning GSM8K benchmark on {len(dataset)} problems...")
 
         for item in tqdm(dataset, desc="GSM8K"):
             prompt = f"Q: {item['question']}\nA: Let's solve step by step.\n"
+            response, conf = self.generate_response(prompt, max_length=256)
 
-            pred, conf = self.generate_response(prompt, max_length=512)
-
-            # Extract final numerical answer
-            pred_answer = self._extract_answer(pred)
-            target_answer = item['answer']
-
-            predictions.append(pred_answer)
-            targets.append(target_answer)
+            pred = self.extract_answer(response.strip())
+            target = self.extract_answer(item['answer'])
+            predictions.append(pred)
+            targets.append(target)
+            correct.append(pred != "" and pred == target)
             confidences.append(conf)
 
         return {
             'predictions': predictions,
             'targets': targets,
+            'correct': correct,
             'confidences': confidences,
             'num_examples': len(dataset)
         }
-
-    def _extract_answer(self, response: str) -> str:
-        """Extract numerical answer from reasoning chain."""
-        import re
-
-        # Look for final answer pattern
-        patterns = [
-            r"the answer is (\d+)",
-            r"answer: (\d+)",
-            r"= (\d+)",
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, response.lower())
-            if match:
-                return match.group(1)
-
-        # Fallback: find last number in response
-        numbers = re.findall(r'\d+', response)
-        return numbers[-1] if numbers else ""

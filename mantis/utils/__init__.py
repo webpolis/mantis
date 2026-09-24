@@ -3,13 +3,22 @@ MANTIS Utilities Module
 """
 
 from .logging import setup_logger, MetricsLogger
-from .checkpoints import save_checkpoint, load_checkpoint, get_latest_checkpoint, compat_load
+from .checkpoints import (
+    compat_load,
+    check_tokenizer,
+    load_tokenizer,
+    load_base_model,
+    save_training_checkpoint,
+    restore_training_state,
+)
 
 __all__ = [
     'setup_logger',
     'MetricsLogger',
-    'save_checkpoint',
-    'load_checkpoint',
-    'get_latest_checkpoint',
-    'compat_load'
+    'compat_load',
+    'check_tokenizer',
+    'load_tokenizer',
+    'load_base_model',
+    'save_training_checkpoint',
+    'restore_training_state',
 ]

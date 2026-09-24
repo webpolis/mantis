@@ -69,14 +69,7 @@ class EvaluationHarness:
         runner = self.runners[benchmark_name]
         results = runner.run(dataset)
 
-        # Compute metrics
-        if 'predictions' in results and 'targets' in results:
-            metrics = compute_metrics_summary(
-                results['predictions'],
-                results['targets'],
-                results.get('confidences')
-            )
-            results['metrics'] = metrics
+        results['metrics'] = compute_metrics_summary(results['correct'], results.get('confidences'))
 
         return results
 

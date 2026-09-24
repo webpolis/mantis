@@ -25,10 +25,9 @@ class BaseMoEConfig:
 
 @dataclass
 class MetaControllerConfig:
-    """Configuration for Meta-Controller."""
+    """Configuration for Meta-Controller (residual MLP policy)."""
     d_model: int = 2048  # Must match BaseMoEConfig.d_model for input alignment
     n_layers: int = 6
-    n_heads: int = 16
     d_ff: int = 4096
     dropout: float = 0.1
     n_experts: int = 8
@@ -71,29 +70,15 @@ class SemanticMemoryConfig:
 
 @dataclass
 class TrainingConfig:
-    """Configuration for Training."""
-
-    # Stage 1: Pre-training
-    pretrain_lr: float = 3e-4
-    pretrain_batch_size: int = 2048
-    pretrain_steps: int = 100000
-    pretrain_warmup: int = 2000
-    pretrain_weight_decay: float = 0.01
-    pretrain_gradient_clip: float = 1.0
+    """Stage 2/3 defaults (Stage 1 is configured from the train.py CLI)."""
 
     # Stage 2: Memory fine-tuning
     finetune_lr: float = 1e-5
-    finetune_batch_size: int = 512
-    finetune_steps: int = 20000
-    finetune_warmup: int = 1000
     episodic_loss_weight: float = 1.0
     semantic_loss_weight: float = 0.5
-    consolidation_loss_weight: float = 0.3
 
     # Stage 3: RL training
     rl_lr: float = 1e-5
-    rl_batch_size: int = 256
-    rl_episodes: int = 50000
     rl_ppo_epsilon: float = 0.2
 
     # Reward weights
@@ -102,25 +87,19 @@ class TrainingConfig:
     gamma_compute: float = 0.2
     delta_calibration: float = 0.5
 
-    # General
-    seed: int = 42
-    use_mixed_precision: bool = True
-    use_wandb: bool = False
-    checkpoint_dir: str = './checkpoints'
-    log_interval: int = 100
-    save_interval: int = 10000
+    # Critic training
+    critic_lr: float = 1e-4
 
 
 @dataclass
 class InferenceConfig:
-    """Configuration for Inference."""
+    """Configuration for the full MANTIS inference engine."""
     max_length: int = 512
     temperature: float = 0.7
     top_p: float = 0.9
     routing_threshold: float = 0.5
     early_exit_uncertainty_threshold: float = 0.2
     verification_confidence_threshold: float = 0.6
-    device: str = 'cuda'
 
 
 @dataclass
@@ -138,12 +117,28 @@ class MANTISConfig:
     inference: InferenceConfig = field(default_factory=InferenceConfig)
 
     def __post_init__(self):
-        assert self.meta_controller.d_model == self.base_moe.d_model, \
-            f"MetaController d_model ({self.meta_controller.d_model}) must match BaseMoE d_model ({self.base_moe.d_model})"
-        assert self.meta_controller.n_experts == self.base_moe.n_experts, \
-            f"MetaController n_experts ({self.meta_controller.n_experts}) must match BaseMoE n_experts ({self.base_moe.n_experts})"
-        assert self.semantic_memory.dimension == self.base_moe.d_model, \
-            f"SemanticMemory dimension ({self.semantic_memory.dimension}) must match BaseMoE d_model ({self.base_moe.d_model})"
+        self.validate()
+
+    def validate(self):
+        """Check cross-component alignment. Call again after mutating a config."""
+        d = self.base_moe.d_model
+        checks = [
+            (self.meta_controller.d_model == d, f"MetaController d_model ({self.meta_controller.d_model})"),
+            (self.semantic_memory.dimension == d, f"SemanticMemory dimension ({self.semantic_memory.dimension})"),
+            (self.episodic_memory.d_model == d, f"EpisodicMemory d_model ({self.episodic_memory.d_model})"),
+        ]
+        for ok, what in checks:
+            if not ok:
+                raise ValueError(f"{what} must match BaseMoE d_model ({d})")
+        if self.meta_controller.n_experts != self.base_moe.n_experts:
+            raise ValueError(
+                f"MetaController n_experts ({self.meta_controller.n_experts}) must match "
+                f"BaseMoE n_experts ({self.base_moe.n_experts})"
+            )
+        if d % self.base_moe.n_heads != 0 or (d // self.base_moe.n_heads) % 2 != 0:
+            raise ValueError(f"d_model ({d}) / n_heads ({self.base_moe.n_heads}) must be an even integer for RoPE")
+        if self.base_moe.top_k > self.base_moe.n_experts:
+            raise ValueError(f"top_k ({self.base_moe.top_k}) cannot exceed n_experts ({self.base_moe.n_experts})")
 
     def save(self, path: str):
         """Save configuration to file."""
@@ -173,48 +168,37 @@ class MANTISConfig:
 
 
 # Default configurations for different scales
+def _sized_config(d_model: int, n_layers: int, n_heads: int, d_ff: int,
+                  n_experts: int, top_k: int) -> MANTISConfig:
+    """Build a preset with every d_model / n_experts-dependent field aligned."""
+    config = MANTISConfig()
+    config.base_moe.d_model = d_model
+    config.base_moe.n_layers = n_layers
+    config.base_moe.n_heads = n_heads
+    config.base_moe.d_ff = d_ff
+    config.base_moe.n_experts = n_experts
+    config.base_moe.top_k = top_k
+    config.meta_controller.d_model = d_model
+    config.meta_controller.n_experts = n_experts
+    config.semantic_memory.dimension = d_model
+    config.episodic_memory.d_model = d_model
+    config.validate()
+    return config
+
+
 def get_micro_config() -> MANTISConfig:
     """Micro model for TinyStories dataset (10-15M parameters, dense)."""
-    config = MANTISConfig()
-    config.base_moe.d_model = 256
-    config.base_moe.n_layers = 4
-    config.base_moe.n_heads = 4
-    config.base_moe.d_ff = 1024
-    config.base_moe.n_experts = 1  # Dense, not MoE
-    config.base_moe.top_k = 1
-    config.base_moe.dropout = 0.1
-    config.meta_controller.d_model = 256  # Must match base_moe.d_model
-    config.meta_controller.n_experts = 1  # Must match base_moe.n_experts
-    config.semantic_memory.dimension = 256  # Must match base_moe.d_model
-    return config
+    return _sized_config(d_model=256, n_layers=4, n_heads=4, d_ff=1024, n_experts=1, top_k=1)
 
 
 def get_tiny_config() -> MANTISConfig:
     """Tiny model for rapid testing (~100M parameters)."""
-    config = MANTISConfig()
-    config.base_moe.d_model = 512
-    config.base_moe.n_layers = 6
-    config.base_moe.n_heads = 8
-    config.base_moe.d_ff = 2048
-    config.base_moe.n_experts = 4
-    config.base_moe.top_k = 2
-    config.meta_controller.d_model = 512  # Must match base_moe.d_model
-    config.meta_controller.n_experts = 4  # Must match base_moe.n_experts
-    config.semantic_memory.dimension = 512  # Must match base_moe.d_model
-    return config
+    return _sized_config(d_model=512, n_layers=6, n_heads=8, d_ff=2048, n_experts=4, top_k=2)
 
 
 def get_small_config() -> MANTISConfig:
     """Small model for testing (~1B parameters)."""
-    config = MANTISConfig()
-    config.base_moe.d_model = 1024
-    config.base_moe.n_layers = 12
-    config.base_moe.d_ff = 4096
-    config.base_moe.n_experts = 4
-    config.meta_controller.d_model = 1024  # Must match base_moe.d_model
-    config.meta_controller.n_experts = 4  # Must match base_moe.n_experts
-    config.semantic_memory.dimension = 1024  # Must match base_moe.d_model
-    return config
+    return _sized_config(d_model=1024, n_layers=12, n_heads=32, d_ff=4096, n_experts=4, top_k=2)
 
 
 def get_base_config() -> MANTISConfig:
@@ -224,15 +208,7 @@ def get_base_config() -> MANTISConfig:
 
 def get_large_config() -> MANTISConfig:
     """Large model (~30B parameters)."""
-    config = MANTISConfig()
-    config.base_moe.d_model = 4096
-    config.base_moe.n_layers = 32
-    config.base_moe.d_ff = 16384
-    config.base_moe.n_experts = 16
-    config.meta_controller.d_model = 4096  # Must match base_moe.d_model
-    config.meta_controller.n_experts = 16  # Must match base_moe.n_experts
-    config.semantic_memory.dimension = 4096  # Must match base_moe.d_model
-    return config
+    return _sized_config(d_model=4096, n_layers=32, n_heads=32, d_ff=16384, n_experts=16, top_k=2)
 
 
 def get_extmem_config() -> MANTISConfig:
@@ -240,5 +216,5 @@ def get_extmem_config() -> MANTISConfig:
     config = MANTISConfig()
     config.episodic_memory.max_seq_len = 32768  # 32K tokens
     config.base_moe.max_seq_len = 32768  # Match the base model too
-    config.meta_controller.n_experts = config.base_moe.n_experts  # Keep in sync
+    config.validate()
     return config

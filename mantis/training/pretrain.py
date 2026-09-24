@@ -14,7 +14,6 @@ import os
 from typing import Dict, Optional
 from tqdm import tqdm
 from mantis.utils.checkpoints import compat_load
-import wandb
 
 
 class PreTrainer:
@@ -41,6 +40,7 @@ class PreTrainer:
         log_interval: Steps between logging (default: 100)
         save_interval: Steps between checkpoints (default: 10000)
         use_wandb: Enable W&B logging (default: False)
+        config: MANTISConfig saved with checkpoints so inference can rebuild the model
         device: Training device (default: 'cuda' if available else 'cpu')
     """
 
@@ -59,9 +59,11 @@ class PreTrainer:
         log_interval: int = 100,
         save_interval: int = 10000,
         use_wandb: bool = False,
+        config=None,
         device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
     ):
         self.model = model.to(device)
+        self.config = config
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device
@@ -105,6 +107,7 @@ class PreTrainer:
         print(f"Starting pre-training for {self.total_steps} steps")
 
         if self.use_wandb:
+            import wandb
             wandb.init(project='mantis-pretrain', config={
                 'learning_rate': self.optimizer.param_groups[0]['lr'],
                 'warmup_steps': self.warmup_steps,
@@ -132,6 +135,7 @@ class PreTrainer:
         self._save_checkpoint('final')
 
         if self.use_wandb:
+            import wandb
             wandb.finish()
 
     def _train_epoch(self) -> float:
@@ -160,6 +164,7 @@ class PreTrainer:
                 pbar.set_postfix({'loss': f'{avg_loss:.4f}', 'step': self.global_step})
 
                 if self.use_wandb:
+                    import wandb
                     wandb.log({
                         'train/loss': avg_loss,
                         'train/lr': self.optimizer.param_groups[0]['lr'],
@@ -174,10 +179,20 @@ class PreTrainer:
 
         return total_loss / max(num_batches, 1)
 
+    @staticmethod
+    def _inputs_and_labels(batch: Dict, device) -> tuple:
+        """
+        Batches carry `labels` already shifted by one (labels[t] = input_ids[t + 1]).
+        Without labels, derive next-token targets from input_ids.
+        """
+        input_ids = batch['input_ids'].to(device)
+        if 'labels' in batch:
+            return input_ids, batch['labels'].to(device)
+        return input_ids[:, :-1], input_ids[:, 1:]
+
     def _train_step(self, batch: Dict) -> float:
         """Single training step."""
-        input_ids = batch['input_ids'].to(self.device)
-        labels = batch['labels'].to(self.device) if 'labels' in batch else input_ids
+        input_ids, labels = self._inputs_and_labels(batch, self.device)
 
         # Warmup learning rate
         if self.global_step < self.warmup_steps:
@@ -193,8 +208,8 @@ class PreTrainer:
 
             # Language modeling loss
             lm_loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
+                logits.reshape(-1, logits.size(-1)),
+                labels.reshape(-1),
                 ignore_index=-100
             )
 
@@ -229,15 +244,14 @@ class PreTrainer:
         num_batches = 0
 
         for batch in tqdm(self.val_loader, desc="Validation"):
-            input_ids = batch['input_ids'].to(self.device)
-            labels = batch['labels'].to(self.device) if 'labels' in batch else input_ids
+            input_ids, labels = self._inputs_and_labels(batch, self.device)
 
             output = self.model(input_ids)
             logits = output['logits']
 
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
+                logits.reshape(-1, logits.size(-1)),
+                labels.reshape(-1),
                 ignore_index=-100
             )
 
@@ -257,7 +271,8 @@ class PreTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'global_step': self.global_step,
-            'epoch': self.epoch
+            'epoch': self.epoch,
+            'config': self.config
         }, checkpoint_path)
 
         print(f"Checkpoint saved: {checkpoint_path}")
@@ -277,11 +292,11 @@ class PreTrainer:
 
 if __name__ == '__main__':
     # Example usage
-    from ..models import BaseMoEModel
+    from mantis.models import BaseMoEModel
 
     # Initialize model
     model = BaseMoEModel(
-        vocab_size=128000,
+        vocab_size=512,
         d_model=2048,
         n_layers=24,
         n_heads=32,
@@ -298,8 +313,7 @@ if __name__ == '__main__':
 
         def __getitem__(self, idx):
             return {
-                'input_ids': torch.randint(0, 128000, (512,)),
-                'labels': torch.randint(0, 128000, (512,))
+                'input_ids': torch.randint(0, 512, (513,))
             }
 
     train_loader = DataLoader(DummyDataset(), batch_size=4, shuffle=True)

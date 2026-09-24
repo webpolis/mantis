@@ -1,8 +1,8 @@
 """
 Pre-tokenize datasets for efficient training.
 
-Uses HuggingFace datasets library with automatic caching.
-Tokenize once, train many times - industry best practice.
+Input files hold documents separated by blank lines. Uses HuggingFace
+datasets for storage. Tokenize once, train many times.
 
 Usage:
     # Tokenize training data
@@ -22,61 +22,30 @@ Usage:
 
 import argparse
 import json
+import os
+import sys
 from pathlib import Path
-from datasets import load_dataset
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from datasets import Dataset, Features, Sequence, Value
+from mantis.data import encode_documents, iter_documents, pack_windows
 from mantis.tokenizer import MANTISTokenizer
-from tqdm import tqdm
 
 
-def tokenize_and_chunk(examples, tokenizer, seq_len, stride):
+def _windows(input_file, tokenizer, seq_len, stride, source_mtime):
+    """Yield packed windows; `source_mtime` only invalidates the datasets cache."""
+    for window in pack_windows(encode_documents(iter_documents(input_file), tokenizer), seq_len, stride):
+        yield {'input_ids': window[:-1], 'labels': window[1:]}
+
+
+def preprocess_dataset(input_file, output_path, tokenizer, seq_len, stride):
     """
-    Tokenize text and create fixed-length sequences.
+    Preprocess a text file into a tokenized dataset of packed windows.
 
-    This function:
-    1. Tokenizes all texts in the batch
-    2. Concatenates all tokens
-    3. Splits into fixed-length chunks with stride
-    4. Creates input_ids and labels for next-token prediction
-    """
-    # Tokenize all texts, inserting EOS between documents
-    all_tokens = []
-    eos_id = tokenizer.eos_token_id
-    for text in examples['text']:
-        tokens = tokenizer.encode(text, add_special_tokens=False)
-        all_tokens.extend(tokens)
-        all_tokens.append(eos_id)
-
-    # Create sequences with stride
-    sequences = []
-    for i in range(0, len(all_tokens) - seq_len, stride):
-        chunk = all_tokens[i:i + seq_len + 1]  # +1 for label
-        if len(chunk) == seq_len + 1:
-            sequences.append({
-                'input_ids': chunk[:-1],
-                'labels': chunk[1:]
-            })
-
-    # Transpose list of dicts to dict of lists
-    if sequences:
-        return {
-            'input_ids': [s['input_ids'] for s in sequences],
-            'labels': [s['labels'] for s in sequences]
-        }
-    else:
-        return {'input_ids': [], 'labels': []}
-
-
-def preprocess_dataset(input_file, output_path, tokenizer, seq_len, stride, num_proc=4):
-    """
-    Preprocess a text file into tokenized dataset.
-
-    Args:
-        input_file: Path to input text file
-        output_path: Path to save tokenized dataset
-        tokenizer: MANTISTokenizer instance
-        seq_len: Sequence length
-        stride: Stride for overlapping sequences
-        num_proc: Number of processes for parallel tokenization
+    Documents are separated by blank lines; each gets one EOS. Windows hold
+    seq_len inputs and seq_len shifted labels, cut every `stride` tokens,
+    exactly as train.py builds them from raw text.
     """
     print(f"\n{'='*80}")
     print(f"Preprocessing: {input_file}")
@@ -84,40 +53,37 @@ def preprocess_dataset(input_file, output_path, tokenizer, seq_len, stride, num_
     print(f"Sequence length: {seq_len}, Stride: {stride}")
     print(f"{'='*80}\n")
 
-    # Load raw text
-    print("Loading text file...")
-    dataset = load_dataset('text', data_files=str(input_file), split='train')
-    print(f"Loaded {len(dataset):,} lines")
-
-    # Tokenize and create sequences
-    print("\nTokenizing and creating sequences...")
-    print("(This will be cached - future runs will be instant!)")
-
-    tokenized_dataset = dataset.map(
-        lambda examples: tokenize_and_chunk(examples, tokenizer, seq_len, stride),
-        batched=True,
-        batch_size=1000,
-        remove_columns=['text'],
-        num_proc=num_proc,
-        desc="Tokenizing"
+    features = Features({
+        'input_ids': Sequence(Value('int32')),
+        'labels': Sequence(Value('int32')),
+    })
+    tokenized_dataset = Dataset.from_generator(
+        _windows,
+        features=features,
+        gen_kwargs={
+            'input_file': str(input_file),
+            'tokenizer': tokenizer,
+            'seq_len': seq_len,
+            'stride': stride,
+            'source_mtime': os.path.getmtime(input_file),
+        },
     )
+    if len(tokenized_dataset) == 0:
+        raise ValueError(f"{input_file} has fewer than {seq_len + 1} tokens")
 
-    print(f"\nCreated {len(tokenized_dataset):,} training sequences")
-
-    # Save to disk
     print(f"\nSaving tokenized dataset to {output_path}...")
     tokenized_dataset.save_to_disk(output_path)
 
-    # Save preprocessing config so train.py can read actual seq_len/stride
-    config_path = Path(output_path) / "preprocessing_config.json"
-    with open(config_path, 'w') as f:
-        json.dump({"seq_len": seq_len, "stride": stride}, f)
+    # Save preprocessing config so train.py can read seq_len/stride and verify the tokenizer
+    with open(Path(output_path) / "preprocessing_config.json", 'w') as f:
+        json.dump({
+            "seq_len": seq_len,
+            "stride": stride,
+            "tokenizer_fingerprint": tokenizer.fingerprint(),
+        }, f)
 
-    # Show stats
-    total_tokens = len(tokenized_dataset) * seq_len
     print(f"\n✓ Preprocessing complete!")
     print(f"  Sequences: {len(tokenized_dataset):,}")
-    print(f"  Total tokens: {total_tokens:,}")
     print(f"  Saved to: {output_path}")
 
     return tokenized_dataset
@@ -177,10 +143,6 @@ Examples:
     parser.add_argument('--stride', type=int,
                        help='Stride for sequences (default: seq-len for non-overlapping)')
 
-    # Performance
-    parser.add_argument('--num-proc', type=int, default=4,
-                       help='Number of processes for parallel tokenization (default: 4)')
-
     args = parser.parse_args()
 
     # Validate
@@ -197,6 +159,9 @@ Examples:
         return
 
     stride = args.stride or args.seq_len
+    if not 0 < stride <= args.seq_len:
+        print(f"Error: --stride must be between 1 and --seq-len ({args.seq_len})")
+        return
 
     # Load or create tokenizer
     if args.tokenizer:
@@ -220,7 +185,6 @@ Examples:
         tokenizer,
         args.seq_len,
         stride,
-        args.num_proc
     )
 
     # Preprocess validation data
@@ -231,7 +195,6 @@ Examples:
             tokenizer,
             args.seq_len,
             args.seq_len,  # No overlap for validation
-            args.num_proc
         )
 
     print(f"\n{'='*80}")

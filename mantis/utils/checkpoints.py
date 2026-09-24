@@ -1,11 +1,18 @@
 """
 Checkpoint management utilities.
+
+Every training checkpoint carries its model config, the tokenizer fingerprint,
+optimizer/scheduler/AMP-scaler state, RNG state and the exact training position
+(completed epochs plus micro-batches consumed in the current epoch).
 """
 
-import pickle
-import torch
 import os
+import pickle
+import random
 from typing import Dict, Optional
+
+import numpy as np
+import torch
 
 
 class _HmstCompatUnpickler(pickle.Unpickler):
@@ -35,113 +42,145 @@ def compat_load(path, *, map_location='cpu'):
     return torch.load(path, map_location=map_location, weights_only=False, pickle_module=_CompatPickle())
 
 
-def save_checkpoint(
-    model: torch.nn.Module,
-    optimizer: Optional[torch.optim.Optimizer],
-    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
-    epoch: int,
-    step: int,
-    path: str,
-    metadata: Optional[Dict] = None
-):
+def check_tokenizer(checkpoint: Dict, tokenizer, source: str) -> None:
+    """Fail when a checkpoint was trained with a different vocabulary."""
+    expected = checkpoint.get('tokenizer_fingerprint')
+    if expected is not None and expected != tokenizer.fingerprint():
+        raise ValueError(
+            f"Tokenizer mismatch for {source}: checkpoint expects fingerprint {expected}, "
+            f"got {tokenizer.fingerprint()}. Use the tokenizer saved with that checkpoint."
+        )
+
+
+def load_tokenizer(checkpoint_path: str, checkpoint: Dict, tokenizer_path: Optional[str] = None):
     """
-    Save model checkpoint.
-
-    Args:
-        model: Model to save
-        optimizer: Optional optimizer
-        scheduler: Optional learning rate scheduler
-        epoch: Current epoch
-        step: Current step
-        path: Save path
-        metadata: Optional additional metadata
+    Load the tokenizer for a checkpoint: an explicit path, else the `tokenizer/`
+    directory next to the checkpoint, else the built-in vocabulary. The result
+    must match the fingerprint recorded in the checkpoint.
     """
-    checkpoint = {
-        'model_state_dict': model.state_dict(),
-        'epoch': epoch,
-        'step': step
-    }
+    from mantis.tokenizer import MANTISTokenizer
 
-    if optimizer:
-        checkpoint['optimizer_state_dict'] = optimizer.state_dict()
-
-    if scheduler:
-        checkpoint['scheduler_state_dict'] = scheduler.state_dict()
-
-    if metadata:
-        checkpoint['metadata'] = metadata
-
-    # Create directory
-    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
-
-    torch.save(checkpoint, path)
-    print(f"Checkpoint saved: {path}")
+    path = tokenizer_path or os.path.join(os.path.dirname(checkpoint_path), 'tokenizer')
+    if os.path.isdir(path):
+        tokenizer = MANTISTokenizer.load(path)
+    elif tokenizer_path:
+        raise FileNotFoundError(f"Tokenizer not found: {tokenizer_path}")
+    else:
+        tokenizer = MANTISTokenizer()
+    check_tokenizer(checkpoint, tokenizer, checkpoint_path)
+    return tokenizer
 
 
-def load_checkpoint(
-    path: str,
-    model: torch.nn.Module,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
-    device: str = 'cpu'
-) -> Dict:
+def load_base_model(checkpoint_path: str, device: str = 'cpu', tokenizer_path: Optional[str] = None):
     """
-    Load model checkpoint.
-
-    Args:
-        path: Checkpoint path
-        model: Model to load state into
-        optimizer: Optional optimizer to restore
-        scheduler: Optional scheduler to restore
-        device: Device to load to
+    Load a Stage 1 base model in eval mode.
 
     Returns:
-        Dict with checkpoint metadata
+        (model, tokenizer, checkpoint_dict)
     """
-    checkpoint = compat_load(path, map_location=device)
+    from mantis.models.base_moe import BaseMoEModel
 
+    checkpoint = compat_load(checkpoint_path)
+    if 'config' not in checkpoint or 'model_state_dict' not in checkpoint:
+        raise ValueError(f"Not a base model checkpoint (needs 'config' and 'model_state_dict'): {checkpoint_path}")
+
+    config = checkpoint['config']
+    tokenizer = load_tokenizer(checkpoint_path, checkpoint, tokenizer_path)
+    if config.base_moe.vocab_size != len(tokenizer):
+        raise ValueError(
+            f"Checkpoint vocab_size {config.base_moe.vocab_size} != tokenizer size {len(tokenizer)}"
+        )
+
+    model = BaseMoEModel.from_config(config.base_moe)
     model.load_state_dict(checkpoint['model_state_dict'])
+    model.to(device).eval()
+    return model, tokenizer, checkpoint
 
-    if optimizer and 'optimizer_state_dict' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
-    if scheduler and 'scheduler_state_dict' in checkpoint:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+def save_training_checkpoint(
+    path: str,
+    *,
+    model: torch.nn.Module,
+    config,
+    tokenizer,
+    epoch: int,
+    epoch_step: int,
+    optimizer_step: int,
+    global_step: int,
+    optimizer=None,
+    scheduler=None,
+    scaler=None,
+    **extra,
+) -> None:
+    """
+    Save a resumable training checkpoint.
 
-    print(f"Checkpoint loaded: {path}")
+    Args:
+        epoch: Number of fully completed epochs
+        epoch_step: Micro-batches already consumed in epoch `epoch` (0 at an epoch boundary)
+        optimizer: Pass None when its state is sharded (DeepSpeed ZeRO)
+        extra: Additional fields (val_loss, best_val_loss, ...)
+    """
+    state = {
+        'config': config,
+        'tokenizer_fingerprint': tokenizer.fingerprint(),
+        'model_state_dict': model.state_dict(),
+        'epoch': epoch,
+        'epoch_step': epoch_step,
+        'step': optimizer_step,
+        'global_step': global_step,
+        'rng_state': {
+            'python': random.getstate(),
+            'numpy': np.random.get_state(),
+            'torch': torch.get_rng_state(),
+            'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
+    }
+    if optimizer is not None:
+        state['optimizer_state_dict'] = optimizer.state_dict()
+    if scheduler is not None:
+        state['scheduler_state_dict'] = scheduler.state_dict()
+    if scaler is not None:
+        state['scaler_state_dict'] = scaler.state_dict()
+    state.update(extra)
+
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    torch.save(state, path)
+
+
+def restore_training_state(checkpoint: Dict, *, optimizer=None, scheduler=None, scaler=None) -> Dict:
+    """
+    Restore optimizer/scheduler/scaler/RNG state saved by save_training_checkpoint.
+
+    Returns:
+        Dict with epoch, epoch_step, step, global_step, best_val_loss,
+        epochs_without_improvement and a list of warnings for missing state.
+    """
+    warnings = []
+    for obj, key in ((optimizer, 'optimizer_state_dict'), (scheduler, 'scheduler_state_dict'),
+                     (scaler, 'scaler_state_dict')):
+        if obj is None:
+            continue
+        if key in checkpoint:
+            obj.load_state_dict(checkpoint[key])
+        else:
+            warnings.append(f"No {key} in checkpoint; starting it fresh")
+
+    rng = checkpoint.get('rng_state')
+    if rng:
+        random.setstate(rng['python'])
+        np.random.set_state(rng['numpy'])
+        torch.set_rng_state(rng['torch'])
+        if rng['cuda'] is not None and torch.cuda.is_available() \
+                and len(rng['cuda']) == torch.cuda.device_count():
+            torch.cuda.set_rng_state_all(rng['cuda'])
 
     return {
         'epoch': checkpoint.get('epoch', 0),
+        'epoch_step': checkpoint.get('epoch_step', 0),
         'step': checkpoint.get('step', 0),
-        'metadata': checkpoint.get('metadata', {})
+        'global_step': checkpoint.get('global_step', 0),
+        'best_val_loss': checkpoint.get('best_val_loss', float('inf')),
+        'epochs_without_improvement': checkpoint.get('epochs_without_improvement', 0),
+        'warnings': warnings,
     }
-
-
-def get_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
-    """
-    Find the latest checkpoint in a directory.
-
-    Args:
-        checkpoint_dir: Directory to search
-
-    Returns:
-        Path to latest checkpoint or None
-    """
-    if not os.path.exists(checkpoint_dir):
-        return None
-
-    checkpoints = [
-        f for f in os.listdir(checkpoint_dir)
-        if f.endswith('.pt') or f.endswith('.pth')
-    ]
-
-    if not checkpoints:
-        return None
-
-    # Sort by modification time
-    checkpoints.sort(
-        key=lambda f: os.path.getmtime(os.path.join(checkpoint_dir, f)),
-        reverse=True
-    )
-
-    return os.path.join(checkpoint_dir, checkpoints[0])
