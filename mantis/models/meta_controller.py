@@ -1,7 +1,7 @@
 """
 Meta-Controller for MANTIS Architecture
 
-Lightweight transformer that outputs routing decisions for dynamic query processing.
+Residual MLP policy that outputs routing decisions for dynamic query processing.
 """
 
 import math

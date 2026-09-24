@@ -851,7 +851,7 @@ Examples:
 
     # Model
     parser.add_argument('--model-size', type=str, choices=['micro', 'tiny', 'small', 'base'], default='tiny',
-                        help='Model size: micro (10M), tiny (100M), small (1B), base (12B) (default: tiny)')
+                        help='Model size: micro (3M), tiny (57M), small (454M), base (6.8B) (default: tiny)')
 
     # Training Stage
     parser.add_argument('--stage', type=int, choices=[1, 2, 3, 4], default=1,

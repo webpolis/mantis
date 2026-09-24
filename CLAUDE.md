@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 MANTIS (Metacognitive Adaptive Network with Tiered Inference Strategies) is a research prototype LLM architecture exploring hallucination mitigation and long-context memory through metacognitive routing and hierarchical memory systems. The architecture consists of:
 
-- **Base MoE Model**: Sparse Mixture-of-Experts transformer (~12B total, ~2B active parameters)
+- **Base MoE Model**: Sparse Mixture-of-Experts transformer (~6.8B total, ~2B active parameters)
 - **Three-tier memory**: Attention (8K) → Episodic SSM → Semantic FAISS
 - **Meta-controller**: RL-trainable routing with 5 decision gates
 - **Critic model**: Integrated hallucination detection
@@ -250,7 +250,7 @@ web/                     # Simulation playground: Flask + Socket.IO server, Reac
 Sparse MoE transformer with:
 - 8 experts, top-2 routing (dense feedforward when `n_experts == 1`, e.g. micro)
 - Load balancing loss, weighted by `load_balance_weight`
-- Scales from 10M (micro, dense) to 12B parameters
+- Scales from 3M (micro, dense) to 6.8B parameters (base)
 - Pre-norm transformer backbone with rotary positional embeddings and `scaled_dot_product_attention`
 - `max_seq_len` is the attention window; new models set it to the training `--seq-len`
 
@@ -294,18 +294,18 @@ A residual MLP over the pooled query embedding and a state summary. Trained with
 
 #### Critic Model (`mantis/models/critic.py`)
 
-1-2B parameter verification model for hallucination detection via consistency checking. Trained in Stage 4. Used when meta-controller triggers verification gate; inputs are truncated to its `max_seq_len` budget.
+~155M-parameter verification model (12-layer encoder) for hallucination detection via consistency checking. Trained in Stage 4. Used when meta-controller triggers verification gate; inputs are truncated to its `max_seq_len` budget.
 
 ### Model Configuration
 
 Model sizes are defined in `mantis/configs/model_config.py`:
 
-- **micro**: ~10M parameters (dense, not MoE) - ultra-fast testing
-- **tiny**: ~100M parameters (4 experts) - development/debugging
-- **small**: ~1B parameters (4 experts) - experimentation
-- **base**: ~12B parameters (8 experts) - production target
+- **micro**: ~3M parameters (dense, not MoE) - ultra-fast testing
+- **tiny**: ~57M parameters, ~32M active (4 experts) - development/debugging
+- **small**: ~454M parameters, ~252M active (4 experts) - experimentation
+- **base**: ~6.8B parameters, ~2B active (8 experts) - production target
 
-`get_large_config()` (~30B, 16 experts) and `get_extmem_config()` (32K windows) exist too, but `--model-size` does not offer them.
+`get_large_config()` (~71B, 16 experts) and `get_extmem_config()` (32K windows) exist too, but `--model-size` does not offer them.
 
 **Vocabulary**: All models use 512 tokens (custom domain-specific trie tokenizer, synced at runtime via `len(tokenizer)`).
 
@@ -425,7 +425,7 @@ KV caching is implemented in `BaseMoEModel` for efficient inference. When adding
 
 ## Important Notes
 
-- **No trained weights**: This is a research prototype with architecture only. Full training requires 500K-1M A100 GPU-hours.
+- **No trained weights**: This is a research prototype with architecture only. Full training of the `base` preset on 2-5T tokens needs roughly 50K-130K A100 GPU-hours.
 - **Validation required**: Design claims (reduced hallucinations, extended context) are unvalidated and require large-scale training + evaluation.
 - **True attention limited to 8K**: Not 1M despite claims. Memory systems extend context, but base attention is 8K max.
 - Always use `--tokenizer-path` when resuming training to ensure vocabulary consistency.

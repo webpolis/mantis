@@ -187,27 +187,27 @@ def _sized_config(d_model: int, n_layers: int, n_heads: int, d_ff: int,
 
 
 def get_micro_config() -> MANTISConfig:
-    """Micro model for TinyStories dataset (10-15M parameters, dense)."""
+    """Micro model for pipeline checks (~3M parameters, dense)."""
     return _sized_config(d_model=256, n_layers=4, n_heads=4, d_ff=1024, n_experts=1, top_k=1)
 
 
 def get_tiny_config() -> MANTISConfig:
-    """Tiny model for rapid testing (~100M parameters)."""
+    """Tiny model for rapid testing (~57M parameters, ~32M active)."""
     return _sized_config(d_model=512, n_layers=6, n_heads=8, d_ff=2048, n_experts=4, top_k=2)
 
 
 def get_small_config() -> MANTISConfig:
-    """Small model for testing (~1B parameters)."""
+    """Small model for experimentation (~454M parameters, ~252M active)."""
     return _sized_config(d_model=1024, n_layers=12, n_heads=32, d_ff=4096, n_experts=4, top_k=2)
 
 
 def get_base_config() -> MANTISConfig:
-    """Base model (~12B parameters)."""
+    """Base model (~6.8B parameters, ~2B active)."""
     return MANTISConfig()
 
 
 def get_large_config() -> MANTISConfig:
-    """Large model (~30B parameters)."""
+    """Large model (~71B parameters, ~11B active)."""
     return _sized_config(d_model=4096, n_layers=32, n_heads=32, d_ff=16384, n_experts=16, top_k=2)
 
 

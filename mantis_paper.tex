@@ -34,8 +34,8 @@
 \maketitle
 
 \begin{abstract}
-Large Language Models (LLMs) exhibit a fundamental trade-off between long-context retention, computational efficiency, and hallucination rates. Existing approaches either scale quadratically with context length (dense transformers), compress information lossy (state-space models), or lack contextual statefulness (retrieval-augmented generation). We propose \textbf{MANTIS} (Metacognitive Adaptive Network with Tiered Inference Strategies), a novel hybrid architecture design that integrates a sparse Mixture-of-Experts (MoE) backbone with a meta-controlled three-tier memory system. We present a complete reference implementation where a lightweight \textit{Meta-Controller}, designed to be optimized via reinforcement learning (PPO), dynamically routes queries between: (1) immediate self-attention, (2) episodic state-space compression (Mamba-based SSM), and (3) semantic vector retrieval (FAISS). An optional critic model is included to provide hallucination detection through output verification. This paper details the architectural design and implementation of MANTIS as a framework for future research into adaptive memory systems. We discuss the theoretical properties of the architecture, its expected computational advantages, and the proposed training methodology required to validate its performance on long-context benchmarks.
-\end{abstract>
+Large Language Models (LLMs) exhibit a fundamental trade-off between long-context retention, computational efficiency, and hallucination rates. Existing approaches either scale quadratically with context length (dense transformers), compress information lossy (state-space models), or lack contextual statefulness (retrieval-augmented generation). We propose \textbf{MANTIS} (Metacognitive Adaptive Network with Tiered Inference Strategies), a hybrid architecture that couples a sparse Mixture-of-Experts (MoE) backbone with a meta-controlled three-tier memory system. We present a complete reference implementation in which a lightweight \textit{Meta-Controller}, trained with reinforcement learning (PPO), routes each query between (1) immediate self-attention, (2) episodic state-space compression (Mamba-based SSM), and (3) semantic vector retrieval (FAISS), and biases the MoE's expert selection. An optional critic model verifies outputs and triggers abstention when it doubts them. This paper describes the architecture and its four-stage training pipeline as a framework for future research into adaptive memory systems. No model has been trained yet, so we discuss the architecture's theoretical properties and the evaluation needed to test its claims on long-context benchmarks.
+\end{abstract}
 
 \section{Introduction}
 
@@ -54,18 +54,18 @@ Existing mitigation strategies exhibit complementary weaknesses. \textit{Retriev
 We propose MANTIS, a metacognitive architecture that integrates three memory tiers under unified RL-based control:
 
 \begin{enumerate}
-    \item \textbf{Sparse MoE Backbone:} A 12B-parameter base model design with 8 experts and top-2 routing, activating only 2B parameters per token for efficient processing.
+    \item \textbf{Sparse MoE Backbone:} A base configuration with 6.8B parameters, 8 experts and top-2 routing, activating about 2B parameters per token.
     \item \textbf{Three-Tier Memory Hierarchy:}
     \begin{itemize}
-        \item \textit{L1 (Working Memory):} Standard self-attention over immediate context ($\sim$2K tokens).
-        \item \textit{L2 (Episodic Memory):} Input-dependent Mamba SSM compressing recent interactions into 256D states (8K effective tokens).
-        \item \textit{L3 (Semantic Memory):} FAISS vector index enabling sub-linear retrieval over 1M+ historical entries.
+        \item \textit{L1 (Working Memory):} Causal self-attention with rotary position embeddings over an 8K-token window.
+        \item \textit{L2 (Episodic Memory):} Stacked Mamba SSM blocks that compress each recent interaction (up to 8K tokens) into a 256-dimensional state.
+        \item \textit{L3 (Semantic Memory):} A FAISS vector index with sub-linear retrieval over 1M+ historical entries.
     \end{itemize}
-    \item \textbf{Meta-Controller Architecture:} A lightweight 6-layer transformer designed to be trained via PPO to dynamically route queries based on complexity, uncertainty, and compute budget.
-    \item \textbf{Integrated Critic Model:} A 1B-parameter verification network designed to detect hallucinations through logical consistency checking.
+    \item \textbf{Meta-Controller Architecture:} A 105M-parameter residual MLP policy, trained with PPO, that routes queries based on the query embedding, model uncertainty and memory state.
+    \item \textbf{Integrated Critic Model:} A 155M-parameter encoder that scores responses against retrieved evidence and triggers abstention.
 \end{enumerate}
 
-We provide a comprehensive description of the system architecture and its implementation, along with a theoretical analysis of its scaling properties and expected benefits over dense baselines.
+We describe the system architecture and its implementation, and analyze its scaling properties and expected benefits over dense baselines.
 
 \section{Related Work}
 
@@ -91,6 +91,28 @@ Given an input sequence $\mathbf{x} = (x_1, \ldots, x_L)$ where $x_i \in \mathca
 
 Let $d_{model}$ denote embedding dimension, $N=8$ the number of experts, and $K=2$ the activation sparsity.
 
+\subsection{Backbone}
+
+The base model is a decoder-only transformer with pre-norm LayerNorm blocks. Attention uses rotary position embeddings \cite{su2021roformer} and fused scaled dot-product attention over a window of $L_{max}$ tokens, with a key/value cache for generation. Input embeddings and the output projection share weights. Every block's feed-forward sublayer is the MoE layer below; with $N=1$ it reduces to a dense feed-forward network. Table~\ref{tab:presets} lists the implemented configurations.
+
+\textbf{Tokenizer.} The implementation uses a 512-token vocabulary matched longest-first through a trie. It holds 283 domain tokens for the text protocol of a synthetic ecological simulator, which the project uses as its first training corpus, plus 18 extra ASCII characters, 161 UTF-8 byte-fallback tokens and 50 reserved slots. Numbers are split into digits. Any string round-trips losslessly, but natural-language text falls back to single characters and bytes, so its sequences are several times longer than under a subword vocabulary.
+
+\begin{table}[h]
+\centering
+\caption{Model presets in the reference implementation (vocabulary of 512 tokens, $L_{max}=8192$).}
+\label{tab:presets}
+\begin{tabular}{lrrrrr}
+\toprule
+Preset & $d_{model}$ & Layers & Experts & Parameters & Active \\
+\midrule
+micro & 256 & 4 & 1 (dense) & 3M & 3M \\
+tiny & 512 & 6 & 4 & 57M & 32M \\
+small & 1024 & 12 & 4 & 454M & 252M \\
+base & 2048 & 24 & 8 & 6.85B & 2.02B \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \subsection{Base Mixture-of-Experts Layer}
 
 Each MoE layer consists of $N$ expert networks $\{E_i\}_{i=1}^N$ where $E_i: \mathbb{R}^{d_{model}} \to \mathbb{R}^{d_{model}}$ is a two-layer feed-forward network:
@@ -101,46 +123,50 @@ where GELU is the Gaussian Error Linear Unit activation \cite{hendrycks2016gelu}
 
 The gating network $G(\mathbf{x})$ computes routing probabilities:
 \begin{align}
-\mathbf{h} &= W_g \mathbf{x} \in \mathbb{R}^N \\
+\mathbf{h} &= W_g \mathbf{x} + \mathbf{b}_g + \boldsymbol{\beta} \in \mathbb{R}^N \\
 \mathbf{p} &= \text{Softmax}(\mathbf{h})
 \end{align}
+where $\boldsymbol{\beta}$ is the expert bias chosen by the Meta-Controller for the whole query (zero when it does not intervene). The bias shifts the learned gate logits rather than replacing them, so learned routing patterns survive.
 
 Top-$K$ routing selects the expert subset $\mathcal{T} = \text{TopK}(\mathbf{p}, K=2)$ and renormalizes:
 \begin{equation}
 \mathbf{y} = \sum_{i \in \mathcal{T}} \frac{p_i}{\sum_{j \in \mathcal{T}} p_j} \, E_i(\mathbf{x})
 \end{equation}
 
-\textbf{Load Balancing.} To prevent expert collapse, we propose minimizing the auxiliary loss:
+\textbf{Load Balancing.} To prevent expert collapse, each MoE layer adds the Switch Transformer auxiliary loss \cite{fedus2022switch}:
 \begin{equation}
 \mathcal{L}_{bal} = \alpha \cdot N \sum_{i=1}^N f_i \cdot \bar{p}_i
 \end{equation}
-where $f_i$ is the fraction of tokens routed to expert $i$ in the batch, $\bar{p}_i = \frac{1}{|\mathcal{B}|}\sum_{x \in \mathcal{B}} p_i(x)$ is the average routing probability across the batch, and $\alpha=0.01$ is a hyperparameter.
+where $f_i$ is the fraction of tokens in the batch whose top-1 expert is $i$, $\bar{p}_i = \frac{1}{|\mathcal{B}|}\sum_{x \in \mathcal{B}} p_i(x)$ is the average routing probability across the batch, and $\alpha=0.01$. The model sums $\mathcal{L}_{bal}$ over its layers.
 
 \subsection{Meta-Controller}
 
-The Meta-Controller $\pi_\theta$ is a 6-layer transformer (150M parameters) that observes query embedding $\mathbf{e}_q$ and state summary $\mathbf{s}_t$:
+The Meta-Controller $\pi_\theta$ sees one vector per query, so it is a residual MLP rather than a sequence model: 6 pre-norm feed-forward blocks (inner width 4096; 105M parameters at $d_{model}=2048$). The base model first runs a forward pass over the query. Its mean-pooled final hidden state is the query embedding $\mathbf{e}_q$, and its next-token distributions yield the features of the state summary:
 \begin{equation}
-\mathbf{s}_t = [\text{pos}_t, \text{uncert}_t, \text{len}_t, \text{conf}_t]
+\mathbf{s}_t = \text{Enc}_\psi(u_t, \ell_t, \mathbf{m}_t, c_t)
 \end{equation}
 where:
 \begin{itemize}
-    \item $\text{pos}_t$: Positional encoding
-    \item $\text{uncert}_t$: Epistemic uncertainty from prior predictions
-    \item $\text{len}_t$: Current context length (normalized)
-    \item $\text{conf}_t$: Moving average of model confidence scores
+    \item $u_t$: mean next-token entropy over the query, normalized by $\log|\mathcal{V}|$
+    \item $\ell_t$: query length relative to the attention window
+    \item $\mathbf{m}_t$: episodic fill (entries over capacity) and whether semantic memory holds any entry
+    \item $c_t$: mean top-1 next-token probability (confidence)
 \end{itemize}
+$\text{Enc}_\psi$ is a small learned encoder that projects these features to a 128-dimensional summary.
 
-The controller outputs five decision gates via separate linear heads:
+The controller computes $\mathbf{z}_t = \text{MLP}_\theta([\mathbf{e}_q; \mathbf{s}_t])$ and outputs four gate probabilities and an expert bias:
 \begin{align}
 g_{exit} &= \sigma(W_{exit} \mathbf{z}_t) \quad \text{(Early Exit)} \\
 g_{epi} &= \sigma(W_{epi} \mathbf{z}_t) \quad \text{(Episodic Access)} \\
 g_{sem} &= \sigma(W_{sem} \mathbf{z}_t) \quad \text{(Semantic Access)} \\
 g_{ver} &= \sigma(W_{ver} \mathbf{z}_t) \quad \text{(Verification)} \\
-\boldsymbol{\pi}_{exp} &= \text{Softmax}(W_{exp} \mathbf{z}_t) \quad \text{(Expert Weights)}
+\boldsymbol{\mu}_{exp} &= W_{exp} \mathbf{z}_t \quad \text{(Expert Bias, raw logits)}
 \end{align}
-where $\mathbf{z}_t = \text{TransformerEncoder}([\mathbf{e}_q; \mathbf{s}_t])$ and $\sigma$ is the sigmoid function.
+where $\sigma$ is the sigmoid function.
 
-Binary decisions are made via thresholding: $a_* = \mathbb{1}[g_* > \tau]$ with $\tau = 0.5$. The proposed training employs Gumbel-Softmax \cite{jang2017gumbel} for differentiability.
+\textbf{Stochastic policy.} During RL, each gate is a Bernoulli variable with probability $g_*$, and the expert bias is drawn from $\mathcal{N}(\boldsymbol{\mu}_{exp}, \text{diag}(\boldsymbol{\sigma}^2))$ with a learned $\boldsymbol{\sigma}$ (initialized to 0.5). At inference the policy is deterministic: $a_* = \mathbb{1}[g_* > \tau]$ with $\tau = 0.5$, and $\boldsymbol{\beta} = \boldsymbol{\mu}_{exp}$. A gate whose component is missing (no episodic memory, semantic store or critic) stays closed and contributes nothing to the policy log-probability.
+
+\textbf{Routing.} The early-exit path requires both an open exit gate and low uncertainty ($u_t < 0.2$). It decodes the query alone, with no memory and no expert bias. Otherwise the open memory gates retrieve context, the retrieved text is prepended to the query within the attention budget, and decoding applies the expert bias $\boldsymbol{\beta}$ in every MoE layer. Verification runs only on this full path.
 
 \subsection{Episodic Memory: Selective State Space Model}
 
@@ -168,35 +194,37 @@ The discrete recurrence becomes:
 \end{align}
 where $\mathbf{B}_t = W_B \mathbf{x}_t$ and $\mathbf{C}_t = W_C \mathbf{x}_t$ provide input-dependent selectivity.
 
-\textbf{Efficiency.} The recurrence processes 8K tokens into a fixed 256D state vector $\mathbf{h}_t$, enabling $O(1)$ memory footprint for retrieval.
+\textbf{Implementation.} The module stacks 8 Mamba blocks (state size 256, expansion 2, convolution width 4) over the base model's hidden states. Mean pooling and a linear projection reduce each interaction of up to 8K tokens to a 256-dimensional state, so every stored entry has an $O(1)$ retrieval key. The engine writes every answered query together with its response. The buffer keeps the latest 100 interactions with their token IDs; retrieval ranks them by cosine similarity between the query's state and the stored states and returns the top 3 as decoded text.
 
 \subsection{Semantic Memory: Vector Index Retrieval}
 
-The L3 semantic memory uses a FAISS index \cite{johnson2019faiss} with IVF (Inverted File) and PQ (Product Quantization):
+The L3 semantic memory uses a FAISS index \cite{johnson2019faiss} in which every vector keeps a stable ID:
 \begin{itemize}
-    \item \textbf{Indexing:} Historical embeddings $\{\mathbf{v}_i\}_{i=1}^M$ are clustered into $n_{clusters}=\sqrt{M}$ Voronoi cells.
-    \item \textbf{Quantization:} Each 1024D vector is compressed into 64 bytes via 8-byte sub-vectors.
+    \item \textbf{Embedding:} Each entry is the mean-pooled base-model embedding of its text, passed through a linear projection $P$ (trained in Stage 2) and L2-normalized, so L2 ranking equals cosine ranking.
+    \item \textbf{Indexing:} Below 10K entries the index searches exhaustively. From 10K entries it trains an inverted file (IVF) over $n_{list} = \min(4\sqrt{M}, M/39)$ Voronoi cells and probes $\min(n_{list}, 16)$ of them per query.
+    \item \textbf{Quantization:} Product quantization with 64 sub-quantizers of 8 bits compresses each 2048-dimensional vector into 64 bytes.
+    \item \textbf{Eviction:} Beyond capacity the oldest entries are evicted. Evicted IDs become tombstones, and the index is rebuilt once more than 20\% of it is stale.
 \end{itemize}
 
 For query $\mathbf{q}$, retrieval proceeds as:
 \begin{equation}
-\mathcal{R}_k(\mathbf{q}) = \underset{\mathbf{v} \in \mathcal{I}}{\text{TopK}} \left( \frac{\mathbf{q}^\top \mathbf{v}}{\|\mathbf{q}\| \|\mathbf{v}\|} \right)
+\mathcal{R}_k(\mathbf{q}) = \underset{\mathbf{v} \in \mathcal{I}}{\text{TopK}} \left( \frac{(P\mathbf{q})^\top (P\mathbf{v})}{\|P\mathbf{q}\| \|P\mathbf{v}\|} \right)
 \end{equation}
-with sub-linear complexity $O(\sqrt{M})$ due to IVF clustering with $\approx\sqrt{M}$ clusters.
+with $k=5$ at inference. Scanning $n_{list}$ centroids and 16 cells of about $M/n_{list}$ vectors each costs $O(\sqrt{M})$.
 
-\textbf{Background Consolidation.} Importance scores $I(\mathbf{h}_t)$ are computed for episodic states:
+\textbf{Background Consolidation.} Every hour, when L2 holds at least 5 entries, a consolidator moves important interactions to L3. The importance of entry $e$ is the mean norm of its hidden states $\mathbf{x}_1,\ldots,\mathbf{x}_T$, min-max normalized across the buffer:
 \begin{equation}
-I(\mathbf{h}_t) = \alpha \cdot \text{novelty}(\mathbf{h}_t) + (1-\alpha) \cdot \text{frequency}(\mathbf{h}_t)
+I(e) = \frac{n(e) - \min_{e'} n(e')}{\max_{e'} n(e') - \min_{e'} n(e')}, \qquad n(e) = \frac{1}{T} \sum_{t=1}^{T} \|\mathbf{x}_t\|_2
 \end{equation}
-High-importance states are intended to be transferred from L2 to L3 during idle cycles.
+Entries with $I(e) \geq 0.7$ are grouped greedily by cosine similarity ($\geq 0.8$) of their SSM states. Each group is represented by the decoded text of its longest interaction, embedded like a query, and written to L3. Only entries whose write succeeded leave L2.
 
 \subsection{Critic Model for Hallucination Detection}
 
-The critic $C_\phi$ is a 1B-parameter model that takes the query $\mathbf{q}$, generated response $\mathbf{r}$, and retrieved facts $\mathcal{F}$ as input:
+The critic $C_\phi$ is a 12-layer pre-norm transformer encoder ($d_{model}=1024$, 16 heads; 155M parameters) that takes the query $\mathbf{q}$, generated response $\mathbf{r}$, and retrieved facts $\mathcal{F}$ as input:
 \begin{equation}
 P_{ver}, C_{ver} = C_\phi([\mathbf{q}; \mathbf{r}; \mathcal{F}])
 \end{equation}
-where $P_{ver} \in [0,1]$ is the correctness probability and $C_{ver} \in [0,1]$ is the confidence score.
+where $P_{ver} \in [0,1]$ is the correctness probability and $C_{ver} \in [0,1]$ is the confidence score. Learned segment embeddings mark the three parts, and the input fits a 2048-token budget: the last 512 query tokens, the first 512 fact tokens, and as much of the response as remains. Mean pooling feeds two sigmoid heads. When $P_{ver} < 0.6$, the engine replaces the response with an abstention.
 
 Training minimizes the calibrated loss:
 \begin{equation}
@@ -206,32 +234,38 @@ with $\lambda=0.5$ for balanced calibration.
 
 \section{Proposed Training Methodology}
 
+Training runs in four stages. Stage 1 is required; Stages 2 and 4 each need only the Stage 1 model, and Stage 3 enables whichever gates the Stage 2 and Stage 4 outputs support.
+
 \subsection{Stage 1: Pre-training}
 
-The base MoE model and memory modules are designed to be jointly trained on language modeling:
+The base MoE model is trained alone on language modeling:
 \begin{equation}
-\mathcal{L}_{total} = \mathcal{L}_{LM} + \alpha \mathcal{L}_{bal}
+\mathcal{L}_{total} = \mathcal{L}_{LM} + \sum_{\text{layers}} \mathcal{L}_{bal}
 \end{equation}
 
-We propose using the AdamW optimizer \cite{loshchilov2019adamw} with learning rate $3 \times 10^{-4}$, batch size 512, and mixed-precision training (bf16). The target training corpus would consist of 2T tokens from diverse sources (web text, books, code).
+The implementation uses AdamW \cite{loshchilov2019adamw} ($\beta = (0.9, 0.95)$, weight decay 0.01) with a peak learning rate of $3 \times 10^{-4}$, linear warmup, cosine decay to 10\% of the peak, and FP16 mixed precision. 8-bit AdamW, gradient checkpointing and DeepSpeed ZeRO-2 are optional. Documents end with an EOS token and are packed into windows of $L+1$ tokens. For natural-language pre-training we propose a corpus of about 2T tokens from web text, books and code.
 
-\subsection{Stage 2: Meta-Controller Reinforcement Learning}
+\subsection{Stage 2: Memory Fine-Tuning}
 
-The Meta-Controller is designed to be optimized via Proximal Policy Optimization (PPO) \cite{schulman2017ppo} to maximize expected reward:
+With the base model frozen, Stage 2 trains the episodic SSM and the semantic projection $P$ on (query, context) pairs. Both use InfoNCE over in-batch negatives with temperature 0.07: the SSM state of a query must match the state of its context, and the projected embedding of a query must retrieve its context. The losses are weighted 1.0 (episodic) and 0.5 (semantic), with learning rate $10^{-5}$. Afterwards every context is written to an L3 store for Stage 3 and inference.
+
+\subsection{Stage 3: Meta-Controller Reinforcement Learning}
+
+The Meta-Controller and the state encoder are optimized with Proximal Policy Optimization (PPO) \cite{schulman2017ppo}. Each query is one episode, so the problem is a contextual bandit and the objective is the expected reward of a single routing decision:
 \begin{equation}
-J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=0}^T \gamma^t R_t \right]
+J(\theta) = \mathbb{E}_{q,\, a \sim \pi_\theta(\cdot|q)} \left[ R(q, a) \right]
 \end{equation}
 
 \textbf{Reward Function:}
 \begin{equation}
-R_t = w_1 \mathbb{1}_{acc} - w_2 \frac{T_{lat}}{T_{base}} - w_3 \mathcal{C}_{compute} + w_4 \mathcal{Q}_{calib}
+R = w_1 r_{acc} - w_2 r_{lat} - w_3 r_{comp} + w_4 r_{calib}
 \end{equation}
 where:
 \begin{itemize}
-    \item $\mathbb{1}_{acc}$: Accuracy (1 if correct, -1 otherwise)
-    \item $T_{lat} / T_{base}$: Normalized latency (vs. full model inference)
-    \item $\mathcal{C}_{compute} = \frac{\text{active\_params}}{\text{total\_params}}$: Compute cost
-    \item $\mathcal{Q}_{calib} = -(u_t - (1 - y_{true}))^2$: Calibration quality
+    \item $r_{acc}$: $+1$ if the reference answer appears in the response, $-1$ otherwise
+    \item $r_{lat}$: latency divided by a running mean of observed latency
+    \item $r_{comp} = 0.5 \cdot \frac{\text{active\_params}}{\text{total\_params}} + 0.3 \cdot \mathbb{1}_{epi} + 0.2 \cdot \mathbb{1}_{sem}$: compute cost, where the indicators mark memory reads on the full path
+    \item $r_{calib} = -(u_t - (1 - y_{true}))^2$: calibration, rewarding low uncertainty on correct answers and high uncertainty on wrong ones
 \end{itemize}
 
 Weights: $w_1=1.0, w_2=0.3, w_3=0.2, w_4=0.5$.
@@ -239,13 +273,13 @@ Weights: $w_1=1.0, w_2=0.3, w_3=0.2, w_4=0.5$.
 \textbf{PPO Update:}
 The policy is updated by minimizing the clipped surrogate loss:
 \begin{equation}
-\mathcal{L}^{PPO}(\theta) = -\mathbb{E}_t \left[ \min \left( r_t(\theta) \hat{A}_t, \text{clip}(r_t(\theta), 1-\epsilon, 1+\epsilon) \hat{A}_t \right) \right]
+\mathcal{L}^{PPO}(\theta) = -\mathbb{E} \left[ \min \left( r(\theta) \hat{A}, \text{clip}(r(\theta), 1-\epsilon, 1+\epsilon) \hat{A} \right) \right]
 \end{equation}
-where $r_t(\theta) = \frac{\pi_\theta(a_t|s_t)}{\pi_{\theta_{old}}(a_t|s_t)}$ is the probability ratio, $\hat{A}_t$ is the Generalized Advantage Estimate \cite{schulman2016gae}, and $\epsilon=0.2$ is the clipping parameter.
+where $r(\theta) = \frac{\pi_\theta(a|s)}{\pi_{\theta_{old}}(a|s)}$ is the probability ratio over the joint gate and expert-bias action, $\hat{A} = R - V_\omega(\mathbf{e}_q, \mathbf{s})$ is the advantage against a learned value network (normalized per batch), and $\epsilon=0.2$. Each update runs 4 epochs over a batch of 256 on-policy episodes in minibatches of 64, with learning rate $10^{-5}$, gradient clipping at 1.0 and a clipped value loss.
 
-\subsection{Stage 3: Critic Fine-Tuning}
+\subsection{Stage 4: Critic Training}
 
-The critic model is intended to be fine-tuned on curated hallucination datasets (HaluEval \cite{li2023halueval}, FaithDial \cite{dziri2022faithdial}) with:
+The critic is trained with supervision on labeled (query, response, facts) triples, using AdamW with learning rate $10^{-4}$ and the loss above. We propose curated hallucination datasets (HaluEval \cite{li2023halueval}, FaithDial \cite{dziri2022faithdial}) as training data, with:
 \begin{itemize}
     \item Positive examples: Factually correct responses with supporting evidence
     \item Negative examples: Plausible but incorrect outputs with contradictory evidence
@@ -282,6 +316,10 @@ We propose comparing MANTIS against the following baselines to validate its effe
     \item \textbf{Calibration Error:} Expected Calibration Error (ECE) \cite{guo2017calibration}
 \end{enumerate}
 
+\subsection{Implemented Harness}
+
+The reference implementation already evaluates MMLU \cite{hendrycks2021mmlu}, TruthfulQA \cite{lin2022truthfulqa}, HumanEval \cite{chen2021codex} and GSM8K \cite{cobbe2021gsm8k}, loaded from the HuggingFace Hub, for either the base model alone or the full engine rebuilt from a Stage 3 policy. A response's confidence is the geometric-mean probability of its generated tokens. TruthfulQA counts a response as truthful when its token F1 is higher against a true reference than against every false one. HumanEval runs generated code in a resource-limited subprocess, which is not a security sandbox.
+
 \section{Expected Properties}
 
 \subsection{Computational Efficiency}
@@ -305,14 +343,16 @@ The critic model is designed to improve calibration by conditioning verification
 \subsection{Limitations}
 
 \begin{itemize}
-    \item \textbf{Training Complexity:} RL optimization of the meta-controller presents a non-trivial stability challenge and requires careful hyperparameter tuning.
-    \item \textbf{Memory Maintenance:} L3 index rebuilding scales as $O(M \log M)$ for $M$ entries, which may become a bottleneck for extremely large historical contexts.
+    \item \textbf{No Trained Weights:} Every component ships untrained. The design claims above remain hypotheses until large-scale training and evaluation test them.
+    \item \textbf{Training Complexity:} RL optimization of the meta-controller presents a non-trivial stability challenge and requires careful hyperparameter tuning. Its accuracy reward uses substring matching against a reference answer, which misjudges paraphrases.
+    \item \textbf{Memory Maintenance:} Each L3 rebuild retrains the IVF-PQ codebooks over all live entries, a cost that grows faster than linearly in $M$ and may become a bottleneck for very large stores. Semantic memory also keeps its full-precision vectors in RAM (more than 8GB for 1M entries at $d_{model}=2048$).
+    \item \textbf{Tokenizer Specialization:} The 512-token vocabulary targets the simulation protocol, so natural-language workloads pay for longer sequences.
     \item \textbf{Cold Start:} The system requires a warmup period to populate the episodic memory before it can effectively leverage historical context.
 \end{itemize}
 
 \section{Conclusion}
 
-We have presented MANTIS, a proposed metacognitive adaptive network designed to address fundamental trade-offs in long-context LLM design. By combining sparse MoE computation with tiered inference strategies under RL-based meta-control, MANTIS offers a promising direction for achieving superior efficiency and factual accuracy. This paper details the complete architectural design and implementation, laying the groundwork for future training and evaluation. The proposed design suggests that learned routing policies could dynamically balance compute allocation based on query complexity.
+We have presented MANTIS, a proposed metacognitive adaptive network designed to address fundamental trade-offs in long-context LLM design. It combines sparse MoE computation with tiered memory under RL-based meta-control, in the hope of improving both efficiency and factual accuracy. This paper details the architecture, its four-stage training pipeline and its reference implementation, which are ready for training and evaluation. If the design holds, learned routing policies could allocate compute according to query complexity.
 
 Pending validation of the core architecture, future work could explore: (1) scaling memory capacity to 10M+ entries, (2) continual learning protocols for memory consolidation, and (3) integration with tool-augmented reasoning systems.
 
@@ -391,9 +431,6 @@ L. Kuhn et al., ``Semantic Uncertainty: Linguistic Invariances for Uncertainty E
 \bibitem{hendrycks2016gelu}
 D. Hendrycks and K. Gimpel, ``Gaussian Error Linear Units (GELUs),'' \textit{arXiv:1606.08415}, 2016.
 
-\bibitem{jang2017gumbel}
-E. Jang et al., ``Categorical Reparameterization with Gumbel-Softmax,'' \textit{ICLR}, 2017.
-
 \bibitem{johnson2019faiss}
 J. Johnson et al., ``Billion-scale Similarity Search with GPUs,'' \textit{IEEE Trans. Big Data}, 2019.
 
@@ -403,8 +440,17 @@ I. Loshchilov and F. Hutter, ``Decoupled Weight Decay Regularization,'' \textit{
 \bibitem{schulman2017ppo}
 J. Schulman et al., ``Proximal Policy Optimization Algorithms,'' \textit{arXiv:1707.06347}, 2017.
 
-\bibitem{schulman2016gae}
-J. Schulman et al., ``High-Dimensional Continuous Control Using Generalized Advantage Estimation,'' \textit{ICLR}, 2016.
+\bibitem{su2021roformer}
+J. Su et al., ``RoFormer: Enhanced Transformer with Rotary Position Embedding,'' \textit{arXiv:2104.09864}, 2021.
+
+\bibitem{hendrycks2021mmlu}
+D. Hendrycks et al., ``Measuring Massive Multitask Language Understanding,'' \textit{ICLR}, 2021.
+
+\bibitem{chen2021codex}
+M. Chen et al., ``Evaluating Large Language Models Trained on Code,'' \textit{arXiv:2107.03374}, 2021.
+
+\bibitem{cobbe2021gsm8k}
+K. Cobbe et al., ``Training Verifiers to Solve Math Word Problems,'' \textit{arXiv:2110.14168}, 2021.
 
 \bibitem{li2023halueval}
 Y. Li et al., ``HaluEval: A Large-Scale Hallucination Evaluation Benchmark,'' \textit{EMNLP}, 2023.

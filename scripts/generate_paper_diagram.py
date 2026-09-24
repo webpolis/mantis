@@ -6,8 +6,7 @@ Creates a TikZ LaTeX file that can be compiled to PDF.
 
 import os
 
-tikz_content = r"""
-\documentclass[tikz,border=10pt]{standalone}
+tikz_content = r"""\documentclass[tikz,border=10pt]{standalone}
 \usepackage{tikz}
 \usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, calc, backgrounds, shadows}
 
@@ -22,7 +21,7 @@ tikz_content = r"""
 \begin{document}
 
 \begin{tikzpicture}[
-    node distance=1.5cm and 2cm,
+    node distance=2cm and 2.5cm,
     font=\sffamily\small,
     >={Latex[width=2mm,length=2mm]},
     % Node Styles
@@ -58,31 +57,25 @@ tikz_content = r"""
         fill=mantisGreen!10,
         thick
     },
-    expert/.style={
+    moe_model/.style={
         rectangle,
-        minimum size=0.8cm,
+        rounded corners,
+        minimum width=3.5cm,
+        minimum height=2cm,
+        text centered,
         draw=mantisBlue!80,
-        fill=white,
-        thick
-    },
-    router/.style={
-        trapezium,
-        trapezium stretches body,
-        trapezium angle=70,
-        minimum width=1.5cm,
-        minimum height=0.6cm,
-        draw=mantisRed!80,
-        fill=mantisRed!5,
+        fill=mantisBlue!20,
         thick,
-        font=\tiny
+        double
     },
     decision/.style={
         diamond,
         aspect=1.5,
-        minimum width=1.5cm,
+        minimum width=1.8cm,
+        minimum height=1cm,
         draw=mantisRed!80,
         fill=white,
-        font=\tiny
+        font=\small
     },
     critic/.style={
         trapezium,
@@ -94,13 +87,6 @@ tikz_content = r"""
         fill=mantisYellow!20,
         thick
     },
-    state_summary/.style={
-        rectangle,
-        dashed,
-        draw=gray,
-        fill=gray!5,
-        font=\tiny
-    },
     % Connector Styles
     flow/.style={->, thick, darkGray},
     control/.style={->, thick, mantisRed, dashed},
@@ -108,96 +94,132 @@ tikz_content = r"""
     consolidation/.style={->, double, thick, mantisGreen!60}
 ]
 
-% --- 1. Central Spine ---
+% --- Step 1: Query Input & Full Encoding ---
 
-% Input
-\node (input) [process, fill=white] {User Query ($Q$)};
+\node (input) [process, fill=white] {User Query};
 
-% Encoding
-\node (encoder) [process, above=1cm of input] {Base Encoder};
+% Base MoE for encoding (FIRST PASS)
+\node (encoder) [moe_model, above=1.5cm of input, align=center] {
+    \textbf{Base MoE Model}\\
+    {\footnotesize (base preset: 24 layers,}\\
+    {\footnotesize 6.8B params, 2B active)}\\
+    {\tiny Forward pass + mean pool}
+};
 \draw[flow] (input) -- (encoder);
 
-% Meta-Controller
-\node (meta) [controller, above=1.5cm of encoder] {\textbf{Meta-Controller}\\(6-Layer Transformer)};
-\draw[flow] (encoder) -- (meta);
+% Uncertainty and confidence from the query's next-token distribution
+\node (uncertainty) [process, right=1.5cm of encoder, scale=0.7, align=center] {Uncertainty \&\\Confidence\\{\tiny (next-token entropy)}};
+\draw[flow] (encoder.east) -- (uncertainty.west);
 
-% State Summary Input
-\node (state) [state_summary, left=0.5cm of meta] {State Summary\\(Context/Uncertainty)};
-\draw[flow, dashed] (state) -- (meta);
+% --- Step 2: Meta-Controller Routing ---
 
-% --- 2. Memory Hierarchy (Left Flank) ---
+\node (meta) [controller, above=1.5cm of encoder, align=center] {
+    \textbf{Meta-Controller}\\
+    {\footnotesize (6 Residual MLP Blocks)}
+};
+\draw[flow] (encoder) -- node[right, font=\tiny] {Query embedding} (meta);
 
-% L2 Episodic
-\node (episodic) [process, left=3cm of meta, align=center, fill=mantisGreen!10] {L2: Episodic\\(SSM/Mamba State)};
-\draw[control] (meta) to[bend right=10] node[midway, above, font=\tiny, text=mantisRed] {Gate 2} (episodic);
-\draw[memory_link] (episodic) to[bend right=10] (meta);
+% State Encoder
+\node (state) [process, left=2cm of meta, scale=0.7, align=center] {State Encoder\\{\tiny uncertainty, confidence,}\\{\tiny context \& memory fill}};
+\draw[flow] (uncertainty.south) -- ++(0,-0.9) -| (state.south);
+\draw[flow] (state) -- (meta);
 
-% L3 Semantic
-\node (semantic) [memory, below=1.5cm of episodic, align=center] {L3: Semantic\\(FAISS Index)};
-\draw[control] (meta) to[bend left=10] node[midway, below, font=\tiny, text=mantisRed] {Gate 3} (semantic);
-\draw[memory_link] (semantic) to[bend left=10] (meta);
+% --- Step 3: Routing Decision ---
 
-% Consolidation Flow (outer left edge, asynchronous)
-\draw[consolidation] (episodic.west) to[out=180, in=180] node[midway, left, font=\tiny, text=darkGray, align=right] {Background\\Consolidator} (semantic.west);
+\node (early_check) [decision, above=1.5cm of meta, align=center] {Early\\Exit?};
+\draw[control] (meta.north) -- node[right, font=\tiny] {Gate 1} (early_check);
 
-% L1 Attention (Implied/Small)
-\node (l1) [process, above=0.5cm of episodic, scale=0.8, dashed] {L1: Local Context};
-\draw[dotted] (l1) -- (meta);
+% --- LEFT PATH: Early Exit (uses Base MoE again) ---
 
-% --- 3. Compute Layer (Top) ---
+\node (simple_gen) [moe_model, left=5cm of early_check, align=center, scale=0.85] {
+    \textbf{Base MoE}\\
+    {\footnotesize Query only}\\
+    {\tiny (no memory, no expert bias)}
+};
+\draw[flow] (early_check) -- node[above, font=\tiny, align=center] {Yes: Gate 1 open and\\uncertainty $<$ 0.2} (simple_gen);
 
-% Router Node (explicit decision point)
-\node (router) [router, above=1.2cm of meta] {Router\\(Gate 4)};
-\draw[control] (meta.north) -- node[midway, right, font=\tiny, text=mantisRed] {Expert Weights} (router.south);
+\node (simple_out) [process, above=1.5cm of simple_gen, fill=white] {Response};
+\draw[flow] (simple_gen) -- (simple_out);
 
-% Experts Container
-\node (moe_hub) [above=1.2cm of router] {};
+% --- RIGHT PATH: Memory + Expert Routing ---
 
-% Draw 8 Experts
-\foreach \i in {1,2,...,8} {
-    \node (exp\i) [expert] at ($(moe_hub) + ({(\i-4.5)*1.0}, 0)$) {E\i};
-}
+\node (mem_gate) [process, right=4.5cm of early_check, scale=0.8, align=center] {Memory\\Gates};
+\draw[control] (early_check) -- node[above, font=\tiny] {No} (mem_gate);
 
-% Routing Lines from Router to Experts
-\draw[control] (router.north) -- (exp4.south);
-\draw[control] (router.north) -- (exp5.south);
-% Connect others lightly (inactive experts)
-\foreach \i in {1,2,3,6,7,8} {
-    \draw[control, opacity=0.3] (router.north) -- (exp\i.south);
-}
+% L2: Episodic Memory
+\node (episodic) [memory, above=0.8cm of mem_gate, align=center] {L2: Episodic\\{\tiny (Mamba SSM states)}};
+\draw[control] ($(meta.east)+(0, 0.2)$) to[out=15, in=180] node[pos=0.4, above, font=\tiny] {Gate 2} (episodic.west);
+\draw[memory_link] (episodic.south) -- (mem_gate.north);
 
-% --- 4. Verification & Output (Right/Top) ---
+% L3: Semantic Memory
+\node (semantic) [memory, below=0.8cm of mem_gate, align=center] {L3: Semantic\\{\tiny (FAISS IVF-PQ)}};
+\draw[control] ($(meta.east)-(0, 0.2)$) to[out=-15, in=180] node[pos=0.4, below, font=\tiny] {Gate 3} (semantic.west);
+\draw[memory_link] (semantic.north) -- (mem_gate.south);
 
-% Aggregation
-\coordinate (agg) at ($(moe_hub) + (0, 1.5)$);
-\node (aggregate) [process, at=(agg), scale=0.8] {Aggregation};
-\foreach \i in {1,...,8} {
-    \draw[flow, opacity=0.5] (exp\i.north) -- (aggregate.south);
-}
+% Consolidation - route around to avoid crossing mem_gate
+\coordinate (consol_turn) at ($(semantic.east)+(0.6,0)$);
+\draw[consolidation] (episodic.east) to[out=0, in=90] (consol_turn) to[out=-90, in=0] ($(semantic.east)+(0,-0.25)$);
+\node[font=\tiny, text=mantisGreen!80!black, align=left, anchor=west] at ($(consol_turn)+(0.1,-0.6)$) {Background\\Consolidator};
 
-% Output
-\node (output) [process, above=1cm of aggregate, fill=white, double] {Generated Response};
-\draw[flow] (aggregate) -- (output);
+% Memory prompt
+\node (context) [process, right=2cm of mem_gate, scale=0.8, align=center] {Memory Prompt\\{\tiny (retrieved text + query)}};
+\draw[flow] (mem_gate) -- (context);
 
-% Critic (right side, moved further right for Early Exit clearance)
-\node (critic) [critic, right=4.5cm of output, align=center] {Critic Model\\(1B Param)};
-\draw[control] (meta.east) to[out=15, in=250] node[pos=0.7, right, font=\tiny, text=mantisRed] {Gate 5} (critic.south);
-\draw[control, dashed] (critic.west) -- node[midway, above, font=\tiny] {Block/Refine} (output.east);
+% --- Step 4: Generation with Expert Routing ---
 
-% Early Exit Path (vertical, far right, bypasses all computation)
-\coordinate (early_exit_start) at ($(meta.east) + (3.5, 0)$);
-\coordinate (early_exit_end) at ($(output.east) + (1.5, 0)$);
-\draw[control, very thick] (meta.east) -- (early_exit_start) |- node[near start, right, font=\tiny, text=mantisRed, align=left] {Gate 1:\\Early Exit} (early_exit_end) -- (output.east);
+\node (expert_gen) [moe_model, above=2.5cm of context, align=center] {
+    \textbf{Base MoE Model}\\
+    {\footnotesize Generation with}\\
+    {\footnotesize expert bias}
+};
+\draw[flow] (context) -- (expert_gen);
+
+% Expert bias from meta-controller
+\draw[control] ($(meta.north)+(0.6, 0)$) to[out=90, in=180] node[pos=0.5, left=5pt, font=\tiny, align=right] {Gate 4: Expert Bias\\(added to gate logits)} (expert_gen.west);
+
+% MoE layers (conceptual representation)
+\node (moe_layers) [process, above right=0.3cm and 0.8cm of expert_gen, scale=0.6, align=center] {Per-Layer\\MoE\\(8 experts,\\top-2)};
+
+% --- Step 5: Verification (Optional) ---
+
+\node (critic) [critic, right=3cm of expert_gen, align=center] {Critic Model\\{\footnotesize (155M params)}};
+\draw[control] ($(meta.south east)+(-0.3, 0)$) |- ++(0,-0.4) -| node[pos=0.75, right, font=\tiny] {Gate 5} (critic.south);
+\draw[control, dashed] (expert_gen.east) -- node[above, font=\tiny] {Verify} (critic.west);
+
+% --- Final Output ---
+
+\node (output) [process, above=1.5cm of expert_gen, fill=white, double] {Generated Response};
+\draw[flow] (expert_gen) -- (output);
+\draw[control, dashed] (critic.north) to[out=120, in=0] node[pos=0.6, above right, font=\tiny, align=left] {Abstain if\\score $<$ 0.6} (output.east);
+
+% Merge early exit path
+\draw[flow] (simple_out.north) |- (output.west);
+
+% Every returned response is written to episodic memory
+\draw[memory_link, dotted] ($(output.south west)+(0.3,0)$) to[out=-150, in=90] node[pos=0.45, left=3pt, font=\tiny, text=mantisGreen!80!black, align=right] {Store query\\+ response} (episodic.north);
 
 % --- Backgrounds/Grouping ---
 
 \begin{pgfonlayer}{background}
-    % Memory Group
-    \node [fit=(episodic) (semantic) (l1), fill=mantisGreen!5, rounded corners, draw=mantisGreen!20, label={[mantisGreen, font=\bfseries]above:Memory System}] {};
+    % Memory System
+    \node [fit=(episodic) (semantic) (mem_gate), fill=mantisGreen!5, rounded corners, draw=mantisGreen!20, thick, label={[mantisGreen, font=\bfseries]below:Memory Hierarchy}] {};
 
-    % MoE Group
-    \node [fit=(exp1) (exp8), fill=mantisBlue!5, rounded corners, draw=mantisBlue!20, label={[mantisBlue, font=\bfseries]above:Sparse MoE Layer}] {};
+    % Meta-Controller decision zone
+    \node [fit=(meta) (state) (early_check), fill=mantisRed!3, rounded corners, draw=none] {};
 \end{pgfonlayer}
+
+% Legend
+\node[font=\tiny, align=left, anchor=north west] at ($(simple_gen.west |- input.north)+(0,0.4)$) {
+    \textbf{5 Routing Gates:}\\
+    1. Early Exit (Bernoulli)\\
+    2. Episodic Access (Bernoulli)\\
+    3. Semantic Access (Bernoulli)\\
+    4. Expert Bias (Gaussian over raw logits)\\
+    5. Verification (Bernoulli)\\[2pt]
+    Inference thresholds gate probabilities\\
+    at 0.5 and uses the Gaussian mean.\\
+    A gate whose component is missing stays closed.
+};
 
 \end{tikzpicture}
 \end{document}
@@ -213,6 +235,8 @@ def main():
     print(f"✓ Successfully created '{output_file}' in {os.getcwd()}")
     print("\nTo compile to PDF:")
     print("  pdflatex mantis_architecture.tex")
+    print("\nTo render the README image (300 dpi):")
+    print("  pdftoppm -png -r 300 -singlefile mantis_architecture.pdf mantis_architecture")
     print("\nOr upload to Overleaf for easy compilation.")
 
 if __name__ == "__main__":

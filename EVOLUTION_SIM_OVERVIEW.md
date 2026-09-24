@@ -426,12 +426,12 @@ Perplexity alone is insufficient. Track:
 
 ### Model size guide
 
-| Size        | Params    | Strategy      | Use case              |
-| ----------- | --------- | ------------- | --------------------- |
-| Micro (10M) | Dense     | Single GPU    | Pipeline sanity check |
-| Tiny (100M) | 4 experts | Single GPU    | Development iteration |
-| Small (1B)  | 4 experts | DDP or ZeRO-1 | Experimentation       |
-| Base (12B)  | 8 experts | ZeRO-2/3      | Production target     |
+| Size          | Experts   | Strategy                  | Use case              |
+| ------------- | --------- | ------------------------- | --------------------- |
+| Micro (3M)    | Dense     | Single GPU                | Pipeline sanity check |
+| Tiny (57M)    | 4 experts | Single GPU                | Development iteration |
+| Small (454M)  | 4 experts | Single GPU or DDP         | Experimentation       |
+| Base (6.8B)   | 8 experts | DDP + ZeRO-2 (`--deepspeed`) | Production target  |
 
 ### What the trained model can do
 

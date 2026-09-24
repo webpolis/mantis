@@ -11,7 +11,7 @@ A novel LLM architecture exploring hallucination mitigation and long-context mem
 **Components**:
 - **Three-tier memory**: Attention (8K) → Episodic SSM → Semantic FAISS
 - **Meta-controller**: RL-trainable routing with 5 decision gates
-- **MoE base model**: ~12B total, ~2B active parameters (8 experts, top-2)
+- **MoE base model**: ~6.8B total, ~2B active parameters (8 experts, top-2)
 - **Critic model**: Integrated hallucination detection
 
 **Design Goals** (unvalidated): Reduced hallucinations via verification • Extended context via hierarchical memory • Efficiency via sparse experts • Lower latency via early-exit
@@ -169,12 +169,14 @@ python train.py --stage 1 data/train.txt --val-file data/val.txt
 
 ### Model Sizes
 
-| Size | Parameters | Use Case | VRAM (FP16) |
+| Size | Parameters (active) | Use Case | Training VRAM |
 |------|-----------|----------|-------------|
-| `micro` | ~10M | Ultra-fast testing | <2GB |
-| `tiny` | ~100M | Development/debugging | ~4GB |
-| `small` | ~1B | Experimentation | ~8GB |
-| `base` | ~12B | Production | ~32GB |
+| `micro` | ~3M (dense) | Ultra-fast testing | ~0.4GB |
+| `tiny` | ~57M (~32M) | Development/debugging | ~1.4GB |
+| `small` | ~454M (~252M) | Experimentation | ~8GB |
+| `base` | ~6.8B (~2B) | Production | ~106GB (~64GB with `--gradient-checkpointing --use-8bit-optimizer`) |
+
+VRAM comes from `mantis/training/vram_estimator.py` for FP16 mixed precision, batch size 1 and `--seq-len 512`.
 
 ```bash
 # Specify size with --model-size
@@ -582,7 +584,7 @@ web/                  # Simulation playground (Flask server, React client)
 **Current Status**: Research prototype with complete architecture but **no trained weights**.
 
 **Training Requirements** (for production results):
-- Compute: 2-5T tokens • 500K-1M A100 GPU-hours • ~$750K-$1.5M budget
+- Compute: 2-5T tokens • ~50K-130K A100 GPU-hours for the `base` preset (6 × 2B active parameters × tokens, at ~125 TFLOPS sustained)
 - Data: High-quality corpus (FineWeb-edu, C4, etc.)
 - Time: Weeks-months for full training
 
@@ -603,7 +605,7 @@ web/                  # Simulation playground (Flask server, React client)
 ### BaseMoEModel
 - Top-2 routing over 4 or 8 experts (dense for `micro`)
 - Load balancing loss
-- Scales from 10M to 12B parameters
+- Scales from 3M to 6.8B parameters across the CLI presets
 - Pre-norm transformer backbone with rotary positional embeddings
 
 ### MetaController
@@ -617,8 +619,8 @@ web/                  # Simulation playground (Flask server, React client)
 - **Consolidation**: Background transfer episodic → semantic using base model embeddings
 
 ### Critic Model
-- 1-2B parameter verification model
-- Hallucination detection via consistency checking
+- ~155M-parameter verification model: a 12-layer encoder over query, response and retrieved facts
+- Hallucination detection via consistency checking; the engine abstains when the score falls below 0.6
 
 ---
 
