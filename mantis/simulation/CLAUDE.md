@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Module Does
 
-`mantis/simulation` is an ecological evolution simulator (~3,250 lines) that generates synthetic training data for the MANTIS LLM. It models populations of species competing for energy through food webs, evolving traits across 5 tiers, transitioning body plans, and (in the INTELLIGENCE epoch) running individual-based agents with spatial behaviors and cultural memories.
+`mantis/simulation` is an ecological evolution simulator that generates synthetic training data for the MANTIS LLM. It models populations of species competing for energy through food webs, evolving traits across 5 tiers, transitioning body plans, and (in the INTELLIGENCE epoch) running individual-based agents with spatial behaviors and cultural memories.
 
 The output is protocol-formatted text consumed by `mantis/tokenizer.py` (283 domain tokens in a custom trie-based tokenizer, 512 total with reserved slots) for next-token prediction training.
 
@@ -59,7 +59,7 @@ Data flows in one direction: **constants → species/biome → agent/behavior/sp
 - **`agent_reconciliation.py`** — `PopulationReconciler`: dual-layer accounting. Discrete events (birth/death) map 1:1. Continuous energy scales by population/agent_count ratio.
 - **`engine.py`** — `World` orchestrator. Per-tick pipeline: energy flows → interactions → mutations → body plan transitions → speciation → extinction → epoch check → agent stepping → spotlights.
 - **`serializer.py`** — Converts `World` state to protocol text (`=EPOCH`, `@BIO`, `@SP`, `@INT`, `@EVT`, `@SPOT` blocks). Keyframe every 20 ticks, delta encoding between.
-- **`agent_serializer.py`** — `@AGENT` blocks using per-agent format: every agent listed individually with 10-unit quantized positions, energy, age, and behavioral state.
+- **`agent_serializer.py`** — `@AGENT` blocks for a representative sample of up to `MAX_REPRESENTATIVES` (20) agents per species, chosen by behavioral interest and tracked across ticks; each line carries 10-unit quantized position, energy, age, and behavioral state.
 
 ## Simulation Pipeline (per tick)
 
@@ -99,7 +99,7 @@ Output tokens processed by `mantis/tokenizer.py` with per-block loss weights:
 - **Symbiogenesis restricted**: Only occurs in PRIMORDIAL/CAMBRIAN epochs (real endosymbiosis is an ancient event). Requires 20 ticks of co-location, 0.3% per-tick probability.
 - **Hysteresis in behavior**: Agents commit to actions for multiple ticks (flee: 10, hunt: 8, forage: 3) to prevent oscillation. Emergency energy override breaks commitment.
 - **Agent metabolism matches population-level**: Agent basal cost uses `body_plan.base_metabolism × size^0.75`, plus brain tax from cognitive traits (same formula as `_compute_cost` in engine.py).
-- **Keyframe + delta serialization**: Full state every 20 ticks, only changes between. Agent blocks list every agent individually with 10-unit quantized positions. Delta encoding emits only agents whose position moved >5 units, energy changed >2, or age changed, plus dead agents marked with `†`.
+- **Keyframe + delta serialization**: Full state every 20 ticks, only changes between. Agent blocks cover only the tracked representatives (20/species) with 10-unit quantized positions. Delta encoding emits only tracked agents whose position moved >5 units, energy changed >2, or age changed, plus dead tracked agents marked with `†`.
 
 ## Gotchas
 
