@@ -21,14 +21,11 @@ A novel LLM architecture exploring hallucination mitigation and long-context mem
 ## Quick Start
 
 ```bash
-# Install (requires CUDA for mamba-ssm)
+# Install everything (mamba-ssm needs CUDA)
 pip install -r requirements.txt && pip install -e .
 
-# Run tests
-python -m pytest tests/ -v
-
-# Demo (untrained model, shows architecture only)
-python demo.py
+# Or install only the core: Stage 1, the tokenizer and basic inference
+pip install -e .
 
 # Start training (Stage 1)
 python train.py --stage 1 \
@@ -42,12 +39,12 @@ python train.py --stage 1 \
 
 ## Training Pipeline
 
-MANTIS uses a **3-stage training pipeline**. Each stage builds on the previous:
+MANTIS trains in four stages. Stage 1 is required; Stages 2 and 4 each need only Stage 1, and Stage 3 uses whatever Stages 2 and 4 produced:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  Stage 1: Base MoE Pre-training (REQUIRED)                     │
-│  ├─ Trains: Transformer backbone + 8 MoE experts               │
+│  ├─ Trains: Transformer backbone + MoE experts                 │
 │  ├─ Duration: Days-weeks                                        │
 │  └─ Output: Functional LLM ready for text generation            │
 └─────────────────────────────────────────────────────────────────┘
@@ -77,7 +74,7 @@ MANTIS uses a **3-stage training pipeline**. Each stage builds on the previous:
 - Basic LLM: Stage 1 only
 - + Long context: Stage 1 + 2
 - + Adaptive routing: Stage 1 + 3
-- Full MANTIS: All 3 stages
+- Full MANTIS: all 4 stages
 
 ---
 
@@ -85,7 +82,7 @@ MANTIS uses a **3-stage training pipeline**. Each stage builds on the previous:
 
 **What it trains**: Foundation transformer model with Mixture-of-Experts
 - Standard next-token prediction
-- 8 experts with top-2 routing
+- Top-2 routing over 4 experts (`tiny`, `small`) or 8 (`base`); `micro` is dense
 - Load balancing loss
 - No memory systems (added in Stage 2)
 - No meta-controller (added in Stage 3)
@@ -199,7 +196,7 @@ python train.py --stage 1 data/train.txt \
     --gradient-accumulation-steps 4 \
     --mixed-precision \
     --val-split 0.1
-# Effective batch: 2 × 4 × num_gpus = 8 per GPU
+# Effective batch: 2 × 4 = 8 per GPU, times the number of GPUs
 
 # DeepSpeed ZeRO-2 with optimizer offload (for very large models or mixed VRAM)
 python train.py --stage 1 data/train.txt \
@@ -260,20 +257,14 @@ python train.py --stage 1 data/train.txt \
     --val-split 0.1
 ```
 
-**Note**: `--tokenizer-path` is required when resuming. Restores model weights, optimizer state, scheduler, and training progress.
+**Note**: `--tokenizer-path` is required when resuming. Resuming restores model weights, optimizer state, scheduler, and training progress. Use the same data source as the original run: a local file if it trained on one, `--hf-dataset` if it streamed.
 
-### Expected Results (Stage 1)
+### Outputs (Stage 1)
 
-After successful training on FineWeb-edu (small model, 4 epochs):
-- **Validation PPL**: 20-50 (good), <20 (excellent)
-- **Output quality**: Coherent text generation
-- **Ready for**: Inference or Stage 2/3 training
-
-**Outputs**:
 - `checkpoints/stage1/best_model.pt` - Best validation checkpoint
 - `checkpoints/stage1/final_model.pt` - Final epoch checkpoint
-- `checkpoints/stage1/tokenizer/` - Trained tokenizer (reuse for later stages)
-- `checkpoints/stage1/epoch_N.pt` - Periodic checkpoints
+- `checkpoints/stage1/tokenizer/` - Tokenizer files (reuse for later stages)
+- `checkpoints/stage1/epoch_N.pt` - Periodic checkpoints (`--save-every`)
 
 ### Full Example: Production Training
 
@@ -445,6 +436,36 @@ python inference.py checkpoints/stage1/best_model.pt --prompt "Hello"
 
 ---
 
+## Evolution Simulation
+
+The 512-token tokenizer is built for the protocol of `mantis/simulation`, an ecological simulator that writes evolving ecosystems as text. A model trained on these traces continues a world tick by tick. [EVOLUTION_SIM_OVERVIEW.md](EVOLUTION_SIM_OVERVIEW.md) covers the simulator, the protocol and the training settings.
+
+```bash
+# 1. Generate three datasets, capped at increasing epochs
+python scripts/gen_evo_dataset.py --worlds 5000 --max-epoch CAMBRIAN  --output data/evo_bio.txt --compact --workers 8
+python scripts/gen_evo_dataset.py --worlds 5000 --max-epoch ECOSYSTEM --output data/evo_eco.txt --compact --workers 8 --enable-agents
+python scripts/gen_evo_dataset.py --worlds 5000                       --output data/evo_intel.txt --compact --workers 8 --enable-agents
+
+# 2. Train with a curriculum that shifts from the bio to the intel data
+python train_evo.py \
+    --bio data/evo_bio.txt --eco data/evo_eco.txt --intel data/evo_intel.txt \
+    --model-size tiny --seq-len 2048 --batch-size 8 \
+    --steps-per-epoch 1000 --epochs 20 --mixed-precision --val-split 0.1
+
+# 3. Generate a new world
+python inference_evo.py checkpoints/evo_train/best_model.pt --new-world --seed 42 --max-ticks 100
+```
+
+`web/` holds a browser playground that replays datasets from `data/`, runs the simulator live, or streams a model from `checkpoints/`:
+
+```bash
+cd web/client && npm install && npm run build && cd ../..
+pip install -r web/server/requirements.txt
+python web/server/app.py   # open http://localhost:5000
+```
+
+---
+
 ## Common Training Options
 
 ### Key Flags
@@ -493,12 +514,6 @@ python train.py --stage 1 data/train.txt --val-split 0.1
 python train.py --stage 1 data/new.txt \
     --tokenizer-path checkpoints/train/tokenizer \
     --val-split 0.1
-
-# Required when resuming
-python train.py --stage 1 data/train.txt \
-    --resume checkpoints/train/best_model.pt \
-    --tokenizer-path checkpoints/train/tokenizer \
-    --val-split 0.1
 ```
 
 ---
@@ -507,26 +522,15 @@ python train.py --stage 1 data/train.txt \
 
 ### Out of Memory (OOM)
 
-```bash
-# Try in this order:
-1. Add --mixed-precision
-2. Add --gradient-checkpointing
-3. Reduce --batch-size (e.g., to 2 or 1)
-4. Add --gradient-accumulation-steps 8 (or higher)
-5. Add --use-8bit-optimizer
-6. Add --deepspeed --cpu-offload (multi-GPU only)
-7. Use smaller --model-size
+Try these in order (the full commands are under [Memory Optimization](#memory-optimization)):
 
-# Example: Fit small model on 12GB GPU
-python train.py --stage 1 data/train.txt \
-    --model-size small \
-    --batch-size 1 \
-    --gradient-accumulation-steps 16 \
-    --mixed-precision \
-    --gradient-checkpointing \
-    --use-8bit-optimizer \
-    --val-split 0.1
-```
+1. Add `--mixed-precision`
+2. Add `--gradient-checkpointing`
+3. Reduce `--batch-size` (to 2 or 1)
+4. Add `--gradient-accumulation-steps 8` (or higher)
+5. Add `--use-8bit-optimizer`
+6. Add `--deepspeed --cpu-offload` (multi-GPU only)
+7. Use a smaller `--model-size`
 
 ### Slow Training
 
@@ -545,52 +549,6 @@ python train.py --stage 1 data/train.txt --mixed-precision --val-split 0.1
 python train.py --stage 1 data/train.txt --val-split 0.1  # Auto-detects
 ```
 
-### Resume Errors
-
-```bash
-# Must specify tokenizer path
-python train.py --stage 1 data/train.txt \
-    --resume checkpoints/best_model.pt \
-    --tokenizer-path checkpoints/tokenizer  # ← Required!
-    --val-split 0.1
-
-# Use same data source as original run
-# If original used --hf-dataset, use --hf-dataset
-# If original used local file, use local file
-```
-
-### Mixed VRAM GPUs
-
-```bash
-# Use gradient accumulation to balance load
-python train.py --stage 1 data/train.txt \
-    --batch-size 2 \
-    --gradient-accumulation-steps 4 \
-    --mixed-precision \
-    --val-split 0.1
-
-# Or use DeepSpeed ZeRO-2 (shards optimizer state across GPUs)
-python train.py --stage 1 data/train.txt \
-    --deepspeed \
-    --batch-size 2 \
-    --val-split 0.1
-```
-
----
-
-## Testing
-
-```bash
-# All tests
-python -m pytest tests/ -v
-
-# Specific test suite
-python -m pytest tests/test_models.py -v
-
-# With coverage
-python -m pytest tests/ --cov=mantis --cov-report=html
-```
-
 ---
 
 ## Project Structure
@@ -599,18 +557,22 @@ python -m pytest tests/ --cov=mantis --cov-report=html
 mantis/
 ├── models/           # base_moe, meta_controller, critic, ssm
 ├── memory/           # episodic, semantic, consolidation
-├── training/         # pretrain, memory_train, rl_train
-├── inference/        # engine
+├── training/         # common, pretrain, memory_train, rl_train, critic_train
+├── inference/        # generation (shared decode loop), engine
+├── simulation/       # Ecological simulator that generates evolution training data
 ├── configs/          # model_config (presets: micro/tiny/small/base)
-├── tokenizer.py      # MANTISTokenizer (GPT-2 BPE wrapper)
+├── utils/            # checkpoints (schema, model and tokenizer loading)
+├── data.py           # Documents, EOS, packing, leak-free splits
+├── tokenizer.py      # MANTISTokenizer (trie-based, 512 tokens, byte fallback)
 evaluation/           # benchmarks, metrics, evaluation harness
 ├── benchmarks.py     # MMLU, TruthfulQA, HumanEval, GSM8K
 ├── metrics.py        # Accuracy, F1, hallucination rate, calibration
-train.py              # Main training script (--stage 1/2/3)
+train.py              # Main training script (--stage 1/2/3/4)
 inference.py          # Text generation script
-demo.py               # Architecture demo (untrained)
-tests/                # Unit tests
-scripts/              # preprocess_data.py, split_dataset.py, run_eval.py
+train_evo.py          # Evolution curriculum training
+inference_evo.py      # Tick-by-tick evolution generation
+scripts/              # preprocess_data, split_dataset, run_eval, gen_evo_dataset, calc_seq_len
+web/                  # Simulation playground (Flask server, React client)
 ```
 
 ---
@@ -631,28 +593,27 @@ scripts/              # preprocess_data.py, split_dataset.py, run_eval.py
 
 **Current Limitations**:
 - No trained weights (architecture only)
-- Evaluation uses demo datasets (download real benchmarks for production)
 - True attention limited to 8K (not 1M)
-- Requires CUDA-capable GPU for mamba-ssm dependency
+- Episodic memory needs a CUDA-capable GPU (mamba-ssm), so Stage 2, Stage 3 and the full engine do too
 
 ---
 
 ## Component Details
 
 ### BaseMoEModel
-- 8 experts with top-2 routing
+- Top-2 routing over 4 or 8 experts (dense for `micro`)
 - Load balancing loss
-- Scales from 100M to 12B parameters
-- Standard transformer backbone
+- Scales from 10M to 12B parameters
+- Pre-norm transformer backbone with rotary positional embeddings
 
 ### MetaController
-- 6-layer lightweight transformer
+- 6 residual MLP blocks over the pooled query embedding and a state summary
 - 5 routing gates: early-exit, episodic/semantic memory, expert selection, verification
 - RL-trainable via PPO (Stage 3)
 
 ### Memory Systems
 - **Episodic**: Mamba SSM (mamba-ssm library), 8K token window, L2 cache
-- **Semantic**: FAISS vector DB with ID mapping for efficient deletion, 1M+ entries, L3 cache
+- **Semantic**: FAISS vector DB with stable IDs, 1M+ entries, L3 cache. Evicted IDs are tombstoned, and the index rebuilds when more than 20% are stale
 - **Consolidation**: Background transfer episodic → semantic using base model embeddings
 
 ### Critic Model

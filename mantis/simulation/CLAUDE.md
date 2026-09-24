@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `mantis/simulation` is an ecological evolution simulator that generates synthetic training data for the MANTIS LLM. It models populations of species competing for energy through food webs, evolving traits across 5 tiers, transitioning body plans, and (in the INTELLIGENCE epoch) running individual-based agents with spatial behaviors and cultural memories.
 
-The output is protocol-formatted text consumed by `mantis/tokenizer.py` (283 domain tokens in a custom trie-based tokenizer, 512 total with reserved slots) for next-token prediction training.
+The output is protocol-formatted text consumed by `mantis/tokenizer.py` (a custom trie-based tokenizer: 283 domain tokens, 18 extra ASCII, 161 UTF-8 byte-fallback tokens and 50 reserved slots, 512 in total) for next-token prediction training.
 
 ## Generating Data
 
@@ -29,7 +29,9 @@ python scripts/gen_evo_dataset.py --worlds 5000                       --output d
 
 `--max-epoch` caps worlds at the named epoch (uses `>` comparison: `--max-epoch ECOSYSTEM` allows entry into ECOSYSTEM but stops before INTELLIGENCE).
 
-`gen_evo_dataset.py` uses `importlib` to import this module directly, bypassing `mantis/__init__.py` to avoid pulling in CUDA dependencies. This module has **no CUDA deps** — only numpy and stdlib.
+Other flags: `--keyframe-interval` (ticks between keyframes, default 20) and `--agent-threshold` (with `--agent-epoch INTELLIGENCE`, the spotlight score a species needs before its agents activate; default 15.0). With `--agent-epoch ECOSYSTEM`, any species with at least 50 members gets agents.
+
+This module depends only on numpy and the standard library. `gen_evo_dataset.py` and `calc_seq_len.py` load it through `importlib`, registering `mantis` as a bare namespace package.
 
 ## Programmatic Usage
 
@@ -50,7 +52,7 @@ for _ in range(100):
 
 Data flows in one direction: **constants → species/biome → agent/behavior/spatial → engine → serializer**
 
-- **`constants.py`** — All rules: trait taxonomy (5 tiers, 35 traits), body plans (9 types), prerequisites, fusion rules, epoch configs (mutation_rate_mult is raw — engine divides by tick_scale), energy constants. This is the single source of truth for simulation parameters.
+- **`constants.py`** — All population-level rules: trait taxonomy (5 tiers, 35 traits), body plans (9 types), prerequisites, fusion rules, epoch configs (mutation_rate_mult is raw — engine divides by tick_scale), energy constants. Agent limits live in `agent.py`, behavior tuning in `behavior.py`.
 - **`species.py`** — `Species` (population + traits as `TraitDistribution` mean/variance + `DietVector` + `BodyPlan`). Population-level state.
 - **`biome.py`** — `Biome` (location with vegetation/detritus/solar/environmental axes).
 - **`spatial.py`** — `SpatialHash` (100-unit grid cells, O(k) neighbor queries) + `VegetationPatch` (Gaussian density falloff, logistic regrowth).
@@ -99,13 +101,13 @@ Output tokens processed by `mantis/tokenizer.py` with per-block loss weights:
 - **Symbiogenesis restricted**: Only occurs in PRIMORDIAL/CAMBRIAN epochs (real endosymbiosis is an ancient event). Requires 20 ticks of co-location, 0.3% per-tick probability.
 - **Hysteresis in behavior**: Agents commit to actions for multiple ticks (flee: 10, hunt: 8, forage: 3) to prevent oscillation. Emergency energy override breaks commitment.
 - **Agent metabolism matches population-level**: Agent basal cost uses `body_plan.base_metabolism × size^0.75`, plus brain tax from cognitive traits (same formula as `_compute_cost` in engine.py).
-- **Keyframe + delta serialization**: Full state every 20 ticks, only changes between. Agent blocks cover only the tracked representatives (20/species) with 10-unit quantized positions. Delta encoding emits only tracked agents whose position moved >5 units, energy changed >2, or age changed, plus dead tracked agents marked with `†`.
+- **Keyframe + delta serialization**: Full state every 20 ticks, only changes between. Agent blocks cover only the tracked representatives (20/species) with 10-unit quantized positions. Delta encoding emits only tracked agents that are newly tracked, moved >5 units, changed energy by >2, or changed behavioral state, plus dead tracked agents marked with `†`.
 
 ## Gotchas
 
-- **Import path**: Always import via `from mantis.simulation import ...` or use the `importlib` trick in `gen_evo_dataset.py`. Never import `mantis` top-level in contexts without CUDA (it pulls in `mamba_ssm`).
-- **All domain words are atomic tokens**: Trait names ("speed", "size", "armor"), body plans, biome names, and protocol markers are all single tokens in the trie-based tokenizer. Numbers are digit-by-digit.
-- **`constants.py` is the single source of truth**: All trait lists, body plan rules, epoch thresholds, and energy constants live here. Don't scatter magic numbers into other modules.
+- **Import path**: `from mantis.simulation import ...` works without CUDA, because `mantis/__init__.py` loads its exports lazily.
+- **All domain words are atomic tokens**: Trait names ("speed", "size", "armor"), body plans, biome names, and protocol markers are all single tokens in the trie-based tokenizer. Numbers are digit-by-digit. A new protocol word needs a tokenizer entry, or it falls back to single characters.
+- **`constants.py` holds the population rules**: trait lists, body plan rules, epoch thresholds, and energy constants live there. Keep new population-level numbers there rather than in other modules.
 - **Species cap**: Hard limit of 20 alive species per world (speciation returns early if cap reached).
 - **Agent max limits**: 250 agents/species (`AGENT_MAX_PER_SPECIES`), enforced in `AgentManager`. `SpatialHash` cell size (100 units) matches max sense range.
 - **RNG discipline**: `World` takes a seed and creates `self.rng = np.random.default_rng(seed)`. All randomness must flow through `self.rng` for reproducibility. Never use `np.random` module-level.

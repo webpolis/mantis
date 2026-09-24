@@ -219,6 +219,7 @@ mantis/
 ├── inference/           # Generation engine
 │   ├── generation.py    # Shared decode loop (cache, window, sampling)
 │   └── engine.py        # Dynamic routing and generation
+├── simulation/          # Ecological simulator for evolution training data (see its CLAUDE.md)
 ├── configs/             # Configuration management
 │   └── model_config.py  # Presets: micro/tiny/small/base
 ├── utils/checkpoints.py # Checkpoint schema, model/tokenizer loading
@@ -235,8 +236,11 @@ inference_evo.py         # Evolution tick-by-tick inference (importable for web 
 scripts/                 # Utility scripts
 ├── preprocess_data.py   # Pre-tokenize datasets (5-10x faster)
 ├── gen_evo_dataset.py   # Generate evolution simulation traces (supports --max-epoch partitioning)
+├── calc_seq_len.py      # Measure per-tick token counts and recommend --seq-len per partition
 ├── split_dataset.py     # Split train/val for reproducibility
 └── run_eval.py          # Run benchmark evaluations
+
+web/                     # Simulation playground: Flask + Socket.IO server, React/PixiJS client
 ```
 
 ### Key Components
@@ -246,7 +250,7 @@ scripts/                 # Utility scripts
 Sparse MoE transformer with:
 - 8 experts, top-2 routing (dense feedforward when `n_experts == 1`, e.g. micro)
 - Load balancing loss, weighted by `load_balance_weight`
-- Scales from 100M to 12B parameters
+- Scales from 10M (micro, dense) to 12B parameters
 - Pre-norm transformer backbone with rotary positional embeddings and `scaled_dot_product_attention`
 - `max_seq_len` is the attention window; new models set it to the training `--seq-len`
 
@@ -300,6 +304,8 @@ Model sizes are defined in `mantis/configs/model_config.py`:
 - **tiny**: ~100M parameters (4 experts) - development/debugging
 - **small**: ~1B parameters (4 experts) - experimentation
 - **base**: ~12B parameters (8 experts) - production target
+
+`get_large_config()` (~30B, 16 experts) and `get_extmem_config()` (32K windows) exist too, but `--model-size` does not offer them.
 
 **Vocabulary**: All models use 512 tokens (custom domain-specific trie tokenizer, synced at runtime via `len(tokenizer)`).
 

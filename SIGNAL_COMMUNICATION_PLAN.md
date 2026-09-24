@@ -4,7 +4,9 @@
 
 Extend the evolution simulator to allow species to develop communication, ranging from primitive alarm calls (T1) to coordinated pack tactics (T3+). Communication is modeled as **sparse, event-driven signals** folded into the existing `@INT` interaction protocol — no new top-level markers, no continuous fields, no free-text content.
 
-**Token cost**: 9 new vocabulary entries, ~3% token increase per world (~1,200 tokens on 42K median).
+**Status**: Not implemented. Updated 2026-09-24 for the 512-token trie tokenizer and representative agent sampling.
+
+**Token cost**: 9 of the tokenizer's 50 reserved slots, and about 2,800 extra tokens per agent-enabled world (~2% of the ~127K tokens in a measured eco-partition world).
 
 ---
 
@@ -24,9 +26,9 @@ Without signals, the model sees "telepathic" coordination — 50 agents suddenly
 
 Without communication:
 ```
-@AGENT Δ 100
-  N A1 130 350 48 hunt->A3
-  N A2 135 348 50 hunt->A3
+  @AGENT Δ
+   N A1 130 350 48 11 hunt->A3
+   N A2 140 350 50 9 hunt->A3
 ```
 The model must infer coordination from coincident motion. Ambiguous — planned or accidental?
 
@@ -39,7 +41,7 @@ Explicit causal link. The model learns that `SIG_HUNT` increases coordinated hun
 
 ### Entropy Reduction
 
-Signals cost ~3% more tokens but make subsequent motion predictions much easier. After `SIG_RALLY` at position (100,100), the model knows nearby agents will converge — their positions become low-entropy. The signal "pays for itself" in perplexity reduction on the ~50 subsequent coordinate tokens.
+Signals cost about 2% more tokens but make subsequent motion predictions much easier. After `SIG_RALLY` at position (100,100), the model knows nearby agents will converge — their positions become low-entropy. The signal "pays for itself" in perplexity reduction on the ~50 subsequent coordinate tokens.
 
 ### Deception Becomes Meaningful
 
@@ -54,9 +56,9 @@ Currently the `deception` trait is just a dodge roll modifier. With signals, dec
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Signal format | Folded into `@INT` with `SIG` verb | Reuses existing infrastructure, loss weight (1.5), and parsing |
-| Signal content | Fixed vocabulary of 8 content tokens | No BPE fragmentation, sufficient for all key behaviors |
+| Signal content | Fixed vocabulary of 8 content tokens | One token each instead of 8-9 characters, enough for all key behaviors |
 | Signal triggers | Event-driven with cooldowns | Prevents token flooding; signals fire on state transitions only |
-| Signal visibility | Notable agents only emit @INT SIG lines | Grid cells show behavioral effect (shift to flee), not individual signals |
+| Signal visibility | Only tracked representative agents emit @INT SIG lines | `@AGENT` blocks show only the representatives (up to 20 per species), so only their signals can be tied to visible reactions |
 | Deception marking | None — model infers reliability from context | More interesting training data than explicit true/false labels |
 | Loss weight | 1.5 (same as @INT) | Causal communication events deserve high attention |
 
@@ -74,19 +76,21 @@ Currently the `deception` trait is just a dodge roll modifier. With signals, dec
 
 ## Token Definitions
 
-9 new atomic tokens added to `MANTISTokenizer` (50,345 → 50,354 total vocabulary):
+9 new atomic tokens take reserved slots 462–470 of `MANTISTokenizer`, so the vocabulary stays at 512 and every existing ID keeps its value. Today the trie spells each word out one character at a time:
 
-| Token | Type | BPE Savings | Description |
-|-------|------|-------------|-------------|
-| `SIG` | Verb | 1 BPE → 1 | Universal action verb for communication |
-| `SIG_ALERT` | Content | 4 BPE → 1 | Danger/predator nearby — high urgency |
-| `SIG_FOOD` | Content | 4 BPE → 1 | Resource location found |
-| `SIG_MATE` | Content | 4 BPE → 1 | Mating call / fitness display |
-| `SIG_HUNT` | Content | 4 BPE → 1 | Coordinate pack attack |
-| `SIG_HELP` | Content | 4 BPE → 1 | Distress call |
-| `SIG_RALLY` | Content | 4 BPE → 1 | Follow me / regroup / migrate |
-| `SIG_CLAIM` | Content | 4 BPE → 1 | Territory marking / resource ownership |
-| `SIG_WARN` | Content | 4 BPE → 1 | Stay away / threat display to rivals |
+| Token | Type | Tokens today | Description |
+|-------|------|--------------|-------------|
+| `SIG` | Verb | 3 → 1 | Universal action verb for communication |
+| `SIG_ALERT` | Content | 9 → 1 | Danger/predator nearby — high urgency |
+| `SIG_FOOD` | Content | 8 → 1 | Resource location found |
+| `SIG_MATE` | Content | 8 → 1 | Mating call / fitness display |
+| `SIG_HUNT` | Content | 8 → 1 | Coordinate pack attack |
+| `SIG_HELP` | Content | 8 → 1 | Distress call |
+| `SIG_RALLY` | Content | 9 → 1 | Follow me / regroup / migrate |
+| `SIG_CLAIM` | Content | 9 → 1 | Territory marking / resource ownership |
+| `SIG_WARN` | Content | 8 → 1 | Stay away / threat display to rivals |
+
+Adding them changes the vocabulary fingerprint. Existing checkpoints then reject the new tokenizer (`check_tokenizer` in `mantis/utils/checkpoints.py`), so training on signal data needs a fresh run or a checkpoint migration.
 
 ---
 
@@ -109,7 +113,7 @@ Signals are `@INT` interactions with the `SIG` verb. Supports both v1 and v2 not
 ```
 
 **Fields:**
-- Source: Agent ID (e.g., `A10`) — always a notable agent
+- Source: Agent ID (e.g., `A10`) — always a tracked representative agent
 - Target: Agent ID (e.g., `A8`) for directed, or `*` for broadcast
 - Verb: `SIG`
 - Content: One of the 8 `SIG_*` content tokens
@@ -117,17 +121,16 @@ Signals are `@INT` interactions with the `SIG` verb. Supports both v1 and v2 not
 
 ### Integration With @AGENT Blocks
 
-Signals only appear as explicit `@INT` lines for individually-tracked notable agents (top 5 by energy). Grid cells show the **effect** of signals through aggregate behavioral shifts:
+Signals appear as explicit `@INT` lines only for tracked representative agents (up to 20 per species). A tracked receiver shows the **effect** in the next `@AGENT` delta, because a change of behavioral state always emits a delta line. Representative selection already favors agents that hunt, flee or mate, so receivers that react tend to be tracked:
 
 ```
 @INT A10 * SIG SIG_ALERT rx=4
-@AGENT Δ 100
-  G 1,3 15 42 f:3 h:0 fl:12      ← cell shifted from forage to flee
-  N A10 130 350 45 forage          ← sender (may be deceptive)
-  N A3 140 360 38 flee             ← receiver reacted
+  @AGENT Δ
+   N A10 130 350 45 12 forage     ← sender (may be deceptive)
+   N A3 140 360 38 9 flee         ← tracked receiver switched to flee
 ```
 
-The model learns: "SIG_ALERT causes grid cells to shift toward flee behavior" — a causal pattern linking micro-level signals to macro-level population dynamics.
+The model learns that `SIG_ALERT` precedes a switch to flee among nearby agents, a causal pattern that links one agent's signal to the behavior of its group.
 
 ### Signal-to-Spotlight Bridge
 
@@ -170,7 +173,7 @@ Signals are gated by existing traits. Higher-complexity signals require more evo
 
 ### Trait Interactions
 
-- **`sense`**: Determines reception range = `sense × 10` grid units
+- **`sense`**: Determines reception range = `sense × 10` units
 - **`deception ≥ 3`**: Allows emitting signals that don't match environmental state (false `SIG_ALERT` to scare rivals from food)
 - **`intel`**: Reduces signal cooldown by `intel × 10%` (smarter agents communicate more efficiently)
 - **`language ≥ 4`**: Enables directed signals (specific target agent ID instead of broadcast `*`)
@@ -204,7 +207,7 @@ Signals fire on **state transitions** (rising edge), not continuously:
 | `SIG_HUNT` | Agent selects hunt state AND has valid prey target AND nearby pack member |
 | `SIG_HELP` | Agent energy < 15 AND was recently attacked |
 | `SIG_RALLY` | Agent changes biome or moves > 50 units in one tick (migration) |
-| `SIG_CLAIM` | Agent enters contested territory (2+ species present in grid cell) |
+| `SIG_CLAIM` | Agent enters contested territory (2+ species present in its spatial-hash cell) |
 | `SIG_WARN` | Non-conspecific agent enters within `aggression × 5` units |
 
 ### Cooldowns
@@ -223,8 +226,8 @@ Signals fire on **state transitions** (rising edge), not continuously:
 For a typical ECOSYSTEM world (5 species, 1 with social ≥ 2, ~50 signaling agents, 200 ticks):
 - An agent signals once every ~50 ticks on average (cooldown + trigger rarity)
 - 50 agents × (200 / 50) = **~200 signal events per world**
-- Token cost: 200 signals × 6 tokens/signal = **~1,200 tokens**
-- Impact on 42K median world: **+2.8%**
+- Token cost: 200 signals × ~14 tokens/signal = **~2,800 tokens** (`@INT A10 * SIG SIG_ALERT rx=4` is 17 tokens, `@INT A5 A8 SIG SIG_HUNT` is 12; IDs and counts are digit-by-digit)
+- Impact on a ~127K-token eco world: **+2.2%**
 
 ---
 
@@ -232,8 +235,8 @@ For a typical ECOSYSTEM world (5 species, 1 with social ≥ 2, ~50 signaling age
 
 ### Range
 
-- Reception radius = `sense × 10` grid units
-- Example: `sense = 5` → 50 unit range (covers 3×3 grid cells at cell_size=100)
+- Reception radius = `sense × 10` units
+- Example: `sense = 5` → 50 unit range, inside the 3×3 spatial-hash neighborhood (cell size 100)
 
 ### Distance Decay (Broadcast Only)
 
@@ -321,7 +324,7 @@ Signal interactions inherit the standard `@INT` weight of **1.5**.
 | `SIG` verb | 1.5 | Causal event — model must learn signal → reaction chains |
 | `SIG_*` content | 1.5 | Discriminative feature for predicting population outcomes |
 | `rx=N` outcome | 1.5 | Signal reach affects magnitude of behavioral shift |
-| Grid behavioral shift caused by signal | 0.8 | Inherited from `@AGENT` weight — spatial effect |
+| Receiver state change in `@AGENT` | 0.8 | Inherited from `@AGENT` weight — spatial effect |
 
 ---
 
@@ -329,18 +332,19 @@ Signal interactions inherit the standard `@INT` weight of **1.5**.
 
 ### Per-World Estimates (v2 compact, agent-enabled)
 
+The baseline is the mean eco-partition world from `scripts/calc_seq_len.py --worlds 60` (10 eco worlds, 2026-09-24):
+
 | Metric | Without Signals | With Signals | Delta |
 |--------|----------------|--------------|-------|
-| Median tokens/world | 42,000 | 43,200 | +2.8% |
-| p95 tokens/world | 180,000 | 185,400 | +3.0% |
+| Mean tokens/world | ~127,000 | ~129,800 | +2.2% |
 | Signal events/world | 0 | ~200 | — |
-| New vocab entries | 0 | 9 | 50,345 → 50,354 |
+| Reserved vocab slots | 50 | 41 | 9 used; vocabulary stays at 512 |
 
 ### Dataset-Level Impact (10K worlds)
 
-- Additional tokens: ~12M (200 signals × 6 tokens × 10K worlds)
-- Additional storage (v2 compact): ~48MB uncompressed, ~20MB gzipped
-- Negligible impact on training time (< 3% more tokens to process)
+- Additional tokens: ~28M (200 signals × ~14 tokens × 10K worlds)
+- Additional storage (v2 compact): ~60MB uncompressed (~30 bytes per signal line)
+- Small impact on training time (~2% more tokens to process)
 
 ### Signal Distribution Across Epochs
 
@@ -366,17 +370,18 @@ Prediction: species with `social ≥ 5 + planning` achieve 30-50% higher hunt su
 ### 2. Alarm Cascades
 ```
 @INT A10 * SIG SIG_ALERT rx=4    ← scout spots predator
-@AGENT Δ 100
-  G 1,3 15 42 f:3 h:0 fl:12     ← entire grid cell shifts to flee
+  @AGENT Δ
+   N A3 150 360 38 9 flee        ← tracked receivers switch to flee
+   N A8 170 340 41 14 flee
 ```
 Prediction: species with alarm calling suffer 40-60% fewer predation losses.
 
 ### 3. Deceptive Exploitation
 ```
 @INT A12 * SIG SIG_ALERT rx=3    ← deceptive alarm (no real predator)
-@AGENT Δ 100
-  G 2,4 8 38 f:1 h:0 fl:7       ← rivals flee food source
-  N A12 210 440 52 forage         ← decepter takes the food
+  @AGENT Δ
+   N A4 230 470 30 8 flee        ← rivals flee the food source
+   N A12 210 440 52 15 forage    ← deceiver takes the food
 ```
 Prediction: high-deception species gain energy advantage but lose group trust over time.
 
@@ -391,9 +396,9 @@ Prediction: territorial signaling reduces physical combat frequency by 20-30%, s
 ### 5. Migration Leadership
 ```
 @INT A1 * SIG SIG_RALLY rx=12    ← elder leads migration
-@AGENT Δ 100
-  G 3,3 0 0                       ← origin cell empties
-  G 7,7 14 55 fk:14               ← destination cell fills with flocking
+  @AGENT Δ
+   N A1 700 700 60 40 flock      ← leader moves
+   N A6 690 710 44 22 flock      ← followers converge on the leader
 ```
 Prediction: species with rally capability migrate cohesively instead of fragmenting.
 
@@ -412,11 +417,11 @@ Prediction: `SIG_MATE` energy cost acts as honest signal of fitness — higher e
 ### Files to Modify
 
 ```
-mantis/tokenizer.py                  # Add 9 new tokens + update PROTOCOL_TOKENS
+mantis/tokenizer.py                  # Add SIGNAL_TOKENS in reserved slots 462–470
 mantis/simulation/behavior.py        # Add signal emission logic to utility system
-mantis/simulation/agent.py           # Add signal_cooldown field to Agent
-mantis/simulation/engine.py          # Add _resolve_signals() step in tick loop
-mantis/simulation/serializer.py      # Serialize @INT SIG lines for notable agents
+mantis/simulation/agent.py           # Add signal fields to Agent; signal steps in AgentManager.step()
+mantis/simulation/serializer.py      # Serialize @INT SIG lines for tracked representatives
+web/server/stream_simulation.py      # Parse @INT SIG lines for the playground
 mantis/simulation/constants.py       # Add SIGNAL_CONFIG (cooldowns, costs, gating)
 scripts/gen_evo_dataset.py           # No changes needed (signals auto-generate when agents active)
 ```
@@ -446,40 +451,38 @@ SIGNAL_CONFIG = {
 
 ### Simulation Loop Integration
 
-The signal resolution step fits between behavior selection and movement:
+The signal steps fit between behavior selection and movement in `AgentManager.step()` (`mantis/simulation/agent.py`):
 
 ```
 AgentManager.step():
-  1. _update_behaviors()       # Utility scoring + action selection
+  1. update_behaviors()        # behavior.py: utility scoring + action selection
   2. _resolve_signals()        # NEW — emit signals, propagate to receivers
-  3. _apply_signal_effects()   # NEW — modify receiver utilities based on heard signals
-  4. _move_agents()            # Steering + position update
-  5. _resolve_interactions()   # Hunt, flee, forage outcomes
-  6. _prune_dead()             # Remove energy ≤ 0 agents
+  3. _apply_signal_effects()   # NEW — modify receiver utilities for the next tick
+  4. move agents               # Position update from velocity, clamped to the world
+  5. _resolve_interactions()   # Forage, hunt, mate outcomes
+  6. metabolism                # Basal + brain + movement cost, aging
+  7. _prune_dead()             # Remove energy ≤ 0 agents
 ```
 
 ### Tokenizer Changes
 
 ```python
-# In tokenizer.py — add to existing token lists
+# In tokenizer.py — new list, appended after every existing token
 SIGNAL_TOKENS = [
-    "SIG",          # Verb (1 BPE → 1)
-    "SIG_ALERT",    # (4 BPE → 1)
-    "SIG_FOOD",     # (4 BPE → 1)
-    "SIG_MATE",     # (4 BPE → 1)
-    "SIG_HUNT",     # (4 BPE → 1)
-    "SIG_HELP",     # (4 BPE → 1)
-    "SIG_RALLY",    # (4 BPE → 1)
-    "SIG_CLAIM",    # (4 BPE → 1)
-    "SIG_WARN",     # (4 BPE → 1)
+    "SIG",          # Verb
+    "SIG_ALERT", "SIG_FOOD", "SIG_MATE", "SIG_HUNT",
+    "SIG_HELP", "SIG_RALLY", "SIG_CLAIM", "SIG_WARN",
 ]
 
 PROTOCOL_TOKENS = (
-    LAYER_MARKERS + SPOTLIGHT_TOKENS + MUTATION_TOKENS +
-    BODY_PLAN_TOKENS + TRAIT_TOKENS + MEME_TOKENS +
-    ROLE_TOKENS + INTERACTION_TOKENS + SYMBOL_TOKENS +
-    GLUE_TOKENS + SIGNAL_TOKENS  # NEW
+    ...  # existing lists
+    + SIGNAL_TOKENS  # NEW
 )
+
+# In _build_vocab(), after the byte-fallback tokens and before the
+# <reserved_N> padding, so that they take IDs 462–470:
+for t in SIGNAL_TOKENS:
+    add(t)
 ```
 
 ---
@@ -494,7 +497,7 @@ PROTOCOL_TOKENS = (
 - [ ] Acoustic signals blocked across biome boundaries
 - [ ] Deceptive signals only emitted by agents with `deception ≥ 3`
 - [ ] Receivers modify behavior utilities based on signal content
-- [ ] Grid cells show behavioral shifts caused by signals
+- [ ] Tracked receivers show behavioral shifts caused by signals
 - [ ] Signal events appear as @INT lines in serialized output
 
 ### Token Efficiency
@@ -509,14 +512,14 @@ PROTOCOL_TOKENS = (
 - [ ] Pack hunting species show higher hunt success than solo hunters
 - [ ] Deceptive species gain short-term energy advantage
 - [ ] Territorial signaling reduces physical combat frequency
-- [ ] Rally signals produce cohesive group movement (grid cell convergence)
+- [ ] Rally signals produce cohesive group movement (tracked agents converge)
 
 ### Model Training
 
-- [ ] Signal tokens correctly tokenized as single atoms (not BPE-fractured)
+- [ ] Signal tokens tokenized as single atoms (not spelled out character by character)
 - [ ] Loss weights propagate correctly (SIG lines inherit @INT weight 1.5)
 - [ ] Trained model can generate valid @INT SIG lines in correct contexts
-- [ ] Model predicts behavioral shifts in grid cells following signal events
+- [ ] Model predicts behavioral shifts in tracked agents following signal events
 
 ---
 

@@ -95,7 +95,7 @@ Mutation rates are normalized **per generation** (raw `mutation_rate_mult / tick
 
 ## Output Protocol
 
-The simulator outputs structured text consumed by `TextDataset` in `train.py`. Two formats are supported:
+The simulator outputs structured text for `train_evo.py` (or `train.py`). It supports two formats:
 
 ### v1 format (pipe-delimited, default)
 
@@ -150,11 +150,13 @@ For intelligent species (v1 shown; v2 compresses headers but keeps narrative lin
 ---
 ```
 
-Keyframes dump full state every ~20 generations; intermediate ticks use delta encoding (`Δspeed=+0.3` in v1, `Δspeed +3` in v2).
+Keyframes dump full state every 20 ticks (`--keyframe-interval`); intermediate ticks use delta encoding (`Δspeed=+0.3` in v1, `Δspeed +3` in v2).
 
 ### Agent blocks
 
-When agent-based simulation is active, species blocks include `@AGENT` sub-blocks listing every agent with 10-unit quantized positions. Each agent gets an individual line with position, energy, age, and behavioral state.
+When agent-based simulation is active, each species block includes an `@AGENT` sub-block. The header gives the species' total agent count, and one line follows for each of up to 20 representative agents with its 10-unit quantized position, energy, age, and behavioral state.
+
+The serializer picks representatives by behavioral interest and keeps them across ticks, so trajectories stay continuous. Priority goes to agents it already tracks, then agents hunting, fleeing or mating, then the two lowest- and two highest-energy agents, and finally agents spread across the map.
 
 v1 keyframe:
 ```
@@ -172,7 +174,7 @@ v2 keyframe:
    N A12 220 510 35 5 flee
 ```
 
-Delta ticks encode only changed agents (position moved >5 units, energy changed >2, or age changed) and dead agents:
+Delta ticks list only tracked agents that are newly tracked, moved more than 5 units, changed energy by more than 2, or changed behavioral state, plus tracked agents that died (`†`):
 
 v1 delta:
 ```
@@ -192,7 +194,7 @@ v2 delta:
 
 ## Tokenization
 
-`MANTISTokenizer` is a custom trie-based longest-match tokenizer with 283 domain tokens padded to 512 for tensor core alignment. No GPT-2 / BPE / `transformers` dependency.
+`MANTISTokenizer` is a custom trie-based longest-match tokenizer with 512 tokens, a size that suits tensor cores. It has no GPT-2, BPE or `transformers` dependency, and a UTF-8 byte fallback lets any text round-trip losslessly.
 
 **Why custom over GPT-2 BPE**: The simulation format is ~98% structured protocol — not English. GPT-2's 50,257-token vocabulary wastes 1.5+ GB VRAM on dead embedding weights (at d=2048), runs softmax over 50K logits when only ~300 matter, and splits numbers inconsistently (`"2429"` → `["24","29"]` but `"2430"` differently). The custom tokenizer fixes all three:
 
@@ -206,7 +208,7 @@ v2 delta:
 | `"@SPOT"` encoding  | 3 tokens          | 1 token           |
 | Vocab utilization   | ~2-5%            | ~60-90%           |
 
-**Vocabulary (283 real + 229 reserved = 512)**:
+**Vocabulary (283 domain + 18 extra ASCII + 161 byte fallback + 50 reserved = 512)**:
 
 - Special (4): `<pad>` `<eos>` `<bos>` `<unk>`
 - Digits (10): `0`–`9` (numbers always digit-by-digit)
@@ -226,6 +228,11 @@ v2 delta:
 - Symbols (18): `±` `Δ` `+` `-` `=` `|` `:` `(` `)` `{` `}` `*` `.` `,` `/` `->` `†` `_`
 - ID prefixes (12): `S` `L` `H` `W` `G` `A` `N` `T` `E` `K` `D` `P`
 - Letters (52): `a`–`z` `A`–`Z` (character fallback for rare/unknown text)
+- Extra ASCII (18): the printable characters the lists above miss (`!` `"` `#` `$` `%` `&` `'` `;` `<` `>` `?` `@` `[` `\` `]` `^` `` ` `` `~`)
+- Byte fallback (161): `<0x00>`–`<0x1F>` and `<0x7F>`–`<0xFF>`; any other character encodes as its UTF-8 bytes
+- Reserved (50): IDs 462–511, free for new protocol tokens
+
+`grid+`, `fl` and `fk` belong to the retired grid-cell agent format. They stay in the vocabulary so that token IDs remain stable.
 
 **Trie-based longest-match**: Multi-character tokens (`@SP`, `sessile_autotroph`, `inf+=`) are matched greedily before falling through to single characters. Handles `@SP` vs `@SPOT` and `inf` vs `inf+=` disambiguation automatically — the trie always matches the longest candidate.
 
@@ -302,7 +309,7 @@ Note: `train.py` uses plain cross-entropy (no per-token weighting) and `TextData
 
 ### Agent-enabled training
 
-Agent blocks use a per-agent format where every agent gets an individual line with quantized position, energy, age, and behavioral state. Use `--enable-agents` on the eco and intel partitions (agents only activate at `--agent-epoch`, default ECOSYSTEM — the bio partition never reaches that epoch).
+Agent blocks carry one line per representative agent (up to 20 per species) with quantized position, energy, age, and behavioral state. Use `--enable-agents` on the eco and intel partitions (agents only activate at `--agent-epoch`, default ECOSYSTEM — the bio partition never reaches that epoch).
 
 ```bash
 # Agent-enabled with longer sequences (24GB GPU)
@@ -325,24 +332,24 @@ The 512-token vocabulary saves ~1.6 GB VRAM on embedding/projection weights comp
 
 | Parameter     | Value                          | Why                                                                              |
 | ------------- | ------------------------------ | -------------------------------------------------------------------------------- |
-| `--seq-len`   | 2048                           | INTELLIGENCE delta p95 = 1,604 fits within 2048. Keyframes (median 3K–21K) are too large for any single window — learned via overlapping views. |
-| `--stride`    | 1024                           | 50% overlap ensures every token appears in ~2 windows. Keyframes span ~3–21 windows each, giving full coverage.                                  |
+| `--seq-len`   | 2048                           | Measured keyframe p95 is about 1,050 tokens and delta p95 about 330, so a whole keyframe fits in one window. |
+| `--stride`    | 1024 (`train.py` only)         | 50% overlap puts every token in about 2 windows. `train_evo.py` cuts each world into back-to-back windows and pads the last one. |
 | Warmup        | 2000 steps                     | MoE router needs stabilization time.                                             |
 | Peak LR       | 5e-4 (tiny/small), 1e-4 (base) | Standard for MoE.                                                                |
 | Min LR        | 1e-5                           | Never decay to zero — late data is the most complex.                             |
 | Gradient clip | 1.0                            | MoE can produce gradient spikes.                                                 |
 
-**With agent simulation (grid+notable format):**
+**With agent simulation:**
 
 | Parameter     | Value                          | Why                                                                              |
 | ------------- | ------------------------------ | -------------------------------------------------------------------------------- |
-| `--seq-len`   | 4096 (24GB), 8192 (48GB+)     | ECOSYSTEM agent keyframe p95 = 6,139. INTELLIGENCE p95 = 4,813.                 |
-| `--stride`    | 2048 (24GB), 4096 (48GB+)     | 50% overlap. Grid cells have weak inter-tick causality.                          |
+| `--seq-len`   | 4096 (24GB), 8192 (48GB+)     | Measured agent keyframe p95 is about 4,950 tokens (max 5,331). 8192 fits every keyframe; 4096 splits about a quarter of them. |
+| `--stride`    | 2048 (24GB), 4096 (48GB+), `train.py` only | 50% overlap.                                                          |
 | Warmup        | 3000 steps                     | Agent tokens increase vocabulary diversity; router needs more time.               |
 | Peak LR       | 5e-4 (tiny/small), 1e-4 (base) | Same as population-only.                                                         |
 | Min LR        | 1e-5                           | Same as population-only.                                                         |
 | Gradient clip | 1.0                            | Same as population-only.                                                         |
-| Keyframe interval | 40                         | Halves agent keyframe frequency — reduces token spikes by 2x.                    |
+| Keyframe interval | 40                         | `--keyframe-interval 40` halves how often agent keyframes, the largest ticks, appear. |
 
 **Batch size scaling (24GB GPU):**
 
@@ -357,32 +364,23 @@ The 512-token vocab frees ~1.6 GB VRAM vs GPT-2, allowing +1-2 batch size headro
 
 Use `--gradient-checkpointing` unconditionally with agent-enabled data.
 
-### Token volume comparison
+### Token volume
 
-Empirically measured tokens per tick with the **512-token trie tokenizer** (v2 compact format, kf=20, n=10 worlds, ~28.5M total tokens):
+Tokens per tick, measured on 2026-09-24 with `python scripts/calc_seq_len.py --worlds 60` (v2 compact format, a keyframe every 20 ticks, up to 200 generations per world):
 
-**Population-only (no agents):**
+| Partition                        | Worlds | Keyframe median | Keyframe p95 | Delta median | Delta p95 |
+| -------------------------------- | ------ | --------------- | ------------ | ------------ | --------- |
+| bio (no agents)                  | 60     | 500             | 1,056        | 82           | 332       |
+| eco (agents from ECOSYSTEM)      | 10     | 874             | 4,949        | 262          | 2,142     |
+| intel (agents from INTELLIGENCE) | 10     | 567             | 1,034        | 68           | 264       |
 
-| Epoch        | Delta (median) | Delta (p95) | Keyframe (median) | Keyframe (p95) | Notes                                              |
-| ------------ | -------------- | ----------- | ------------------ | -------------- | -------------------------------------------------- |
-| PRIMORDIAL   | 42             | 252         | 1,114              | 2,095          | Compact; few species, fast ticks.                  |
-| CAMBRIAN     | 911            | 1,160       | 913                | 1,162          | Brief transitional epoch (n=5 in sample).          |
-| ECOSYSTEM    | 162            | 1,302       | 2,981              | 23,288         | Many species; keyframes grow with species count.   |
-| INTELLIGENCE | 773            | 1,604       | 21,029             | 23,044         | Spotlight blocks dominate keyframes.               |
-
-Delta blocks (between `---` markers) across all epochs: median=164, P90=429, P95=559, P99=1,609.
-
-Keyframes in ECOSYSTEM/INTELLIGENCE are 3K–23K tokens — far too large for any single training window. The model learns keyframe structure across multiple overlapping windows via stride-based sliding. Delta blocks (the vast majority of training data) fit comfortably within seq-len=2048.
-
-**With agent simulation (per-agent format):**
-
-Agent `@AGENT` sub-blocks list every agent individually (~1 line per agent, up to 250/species). Keyframe token counts scale linearly with agent count. Use `--seq-len 4096` minimum with `--gradient-checkpointing`.
+Agent lines make up 73% of the eco partition's tokens, about 1,130 per tick while agents are active. None of the 10 intel worlds activated agents within 200 generations, so that row shows population-level ticks only. The samples are small: rerun the script with your own generation settings before you settle on `--seq-len`.
 
 ### World boundary handling
 
 Worlds are independent simulations. **Never pack tokens from different worlds into the same sequence.** Pad to `seq_len` at each world boundary (EOS).
 
-Note: `TextDataset` currently concatenates all worlds into a single flat token stream and applies a sliding window — it does **not** enforce world boundaries. Cross-world sequences are rare (one per world boundary, ~10 in a 10-world dataset vs ~27K total sequences), so the impact is negligible for training. A future improvement could mask cross-world positions in the loss.
+`train_evo.py` does this: `EvoWorldDataset` ends each world with EOS, cuts it into its own windows, and pads the last one. `train.py` does not. Its data pipeline also ends each world with EOS, but then packs all worlds into one stream, so the windows that straddle a boundary (about two per boundary at 50% stride) mix two worlds.
 
 ### Training curriculum
 
@@ -399,7 +397,7 @@ Don't train sequentially (biology → ecosystems → intelligence) — causes ca
 | 40-60%   | 25%        | 35%              | 40%                 |
 | 60-100%  | 20%        | 30%              | 50%                 |
 
-Progress is computed globally across all epochs (`global_tokens / total_budget`), not per-epoch. Use `--schedule linear` for uniform mixing or `--schedule bio-only` for single-partition training.
+Progress is the fraction of planned micro-steps completed (`--epochs` × `--steps-per-epoch`), counted across the whole run rather than per epoch. `--schedule linear` shifts in three steps: bio only, then equal thirds from 33%, then 20/30/50 from 66%. `--schedule bio-only` trains on the bio partition alone.
 
 ### Evaluation metrics
 
@@ -472,4 +470,4 @@ for tick in engine.continue_trace(existing_trace, max_ticks=10):
     send_to_client(tick)
 ```
 
-`EvoInferenceEngine` maintains a rolling context window, left-truncating at `---` boundaries when the context exceeds the model's max sequence length.
+`EvoInferenceEngine` decodes through the shared loop in `mantis/inference/generation.py`. The KV cache carries across ticks, and when it fills, the loop re-encodes the latest half-window.

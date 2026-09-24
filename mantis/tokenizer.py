@@ -26,14 +26,14 @@ Vocabulary (~300 tokens, padded to 512):
     Reactions (6):      endorse reject debate defer counter accept
     Resolutions (6):    council vote elder_decree trial_by_combat consensus ritual
     Outcomes (12):      migrate build_shelter form_alliance ...
-    Events/diseases (8+5+3+10): speciation extinction body_plan disease ...
+    Events/diseases (9+5+3+8): speciation extinction body_plan disease ...
     Meme types (4):     taboo legend tradition sacred
     Cultural events (8): great_hunt reef_collapse drought ...
-    Glue prefixes (16): pop= plan= diet= inf+= outcome= ...
-    Symbols (20):       ± Δ + - = | : ( ) { } * . , / -> † ...
+    Glue prefixes (16): pop plan= D inf+= outcome= ...
+    Symbols (18):       ± Δ + - = | : ( ) { } * . , / -> † _
     Whitespace (3):     space newline 2-space-indent
     Letters (52):       a-z A-Z (character fallback)
-    Agent tokens (12):  grid+ forage rest flock flee mate fl fk ...
+    Agent behaviors (7): forage rest flock flee mate fl fk
     Extra ASCII (18):   ! " # $ % & ' ; < > ? @ [ \\ ] ^ ` ~
     Byte fallback (161): <0x00>-<0x1F>, <0x7F>-<0xFF> for any other character
 """
@@ -153,7 +153,8 @@ GLUE_TOKENS = [
 # Agent behavior tokens
 AGENT_BEHAVIOR_TOKENS = ["forage", "rest", "flock", "flee", "mate", "fl", "fk"]
 # NOTE: "hunt" already in INTERACTION_TOKENS — shared token
-# NOTE: "fl"/"fk" are abbreviations for flee/flock used in agent grid behavior counts
+# NOTE: "fl"/"fk" (and "grid+" above) come from the retired grid-cell agent format;
+# they stay so that token IDs remain stable
 
 SYMBOLS = [
     "±", "Δ", "+", "-", "=", "|", ":", "(", ")", "{", "}", "*",
@@ -191,7 +192,7 @@ PROTOCOL_TOKENS = (
     AGENT_BEHAVIOR_TOKENS + SYMBOLS + ID_PREFIXES
 )
 
-# Per-layer loss weights (from EVOLUTION_SIM_PLAN.md §Training Configuration)
+# Per-layer loss weights (rationale in EVOLUTION_SIM_OVERVIEW.md)
 LAYER_LOSS_WEIGHTS = {
     "---":    0.1,      # Trivial separators
     "=EPOCH": 0.5,      # Metadata headers
