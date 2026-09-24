@@ -86,14 +86,17 @@ class EpisodicMemorySSM(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        return_state: bool = True
+        return_state: bool = True,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Process sequence and optionally return compressed state.
 
         Args:
-            x: (batch, seq_len, d_model)
+            x: (batch, seq_len, d_model), right-padded if batched
             return_state: Return compressed state vector
+            attention_mask: Optional (batch, seq_len), 1 = real token. The SSM is
+                causal, so only the pooling needs to skip padding.
 
         Returns:
             output: (batch, seq_len, d_model)
@@ -111,22 +114,27 @@ class EpisodicMemorySSM(nn.Module):
 
         # Compress to state vector
         if return_state:
-            # Mean pooling + projection
-            state = h.mean(dim=1)  # (batch, d_model)
+            # Mean pooling over real tokens + projection
+            if attention_mask is None:
+                state = h.mean(dim=1)  # (batch, d_model)
+            else:
+                mask = attention_mask.unsqueeze(-1).to(h.dtype)
+                state = (h * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
             state = self.state_proj(state)  # (batch, d_state)
             return h, state
         else:
             return h, None
 
-    def encode_sequence(self, x: torch.Tensor) -> torch.Tensor:
+    def encode_sequence(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Encode sequence into state vector only.
 
         Args:
             x: (batch, seq_len, d_model)
+            attention_mask: Optional (batch, seq_len), 1 = real token
 
         Returns:
             state: (batch, d_state)
         """
-        _, state = self.forward(x, return_state=True)
+        _, state = self.forward(x, return_state=True, attention_mask=attention_mask)
         return state

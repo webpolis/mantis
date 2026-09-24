@@ -4,28 +4,55 @@ Meta-Controller for MANTIS Architecture
 Lightweight transformer that outputs routing decisions for dynamic query processing.
 """
 
+import math
+
 import torch
 import torch.nn as nn
+from torch.distributions import Bernoulli, Normal
 from typing import Dict, Tuple
+
+GATES = ('early_exit', 'episodic', 'semantic', 'verification')
+
+
+class ResidualMLPBlock(nn.Module):
+    """Pre-norm residual feedforward block."""
+
+    def __init__(self, d_model: int, d_ff: int, dropout: float):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.ff(self.norm(x))
 
 
 class MetaController(nn.Module):
     """
-    Lightweight transformer that outputs routing decisions.
+    Routing policy over a pooled query embedding plus a state summary.
 
     The meta-controller analyzes query complexity and outputs 5 routing gates:
     - Early Exit: Skip deep processing for simple queries
     - Episodic Access: Query recent interaction history
     - Semantic Retrieval: Access long-term knowledge base
-    - Expert Selection: Route to specialized MoE experts
+    - Expert Selection: Additive bias on the MoE gate logits
     - Verification: Trigger critic model for fact-checking
+
+    The input is one vector per query, so the network is a stack of residual
+    MLP blocks. As a policy, gates are Bernoulli and the expert bias is a
+    diagonal Gaussian around `expert_weights`; deterministic routing uses the
+    gate probabilities against a threshold and the Gaussian mean.
     """
 
     def __init__(
         self,
         d_model: int = 1024,
         n_layers: int = 6,
-        n_heads: int = 16,
         d_ff: int = 4096,
         dropout: float = 0.1,
         n_experts: int = 8,
@@ -37,29 +64,14 @@ class MetaController(nn.Module):
         self.n_experts = n_experts
         self.state_dim = state_dim
 
-        # Input embedding: combines query + state summary
         self.embedding = nn.Linear(d_model + state_dim, d_model)
         self.dropout = nn.Dropout(dropout)
+        self.blocks = nn.ModuleList([ResidualMLPBlock(d_model, d_ff, dropout) for _ in range(n_layers)])
+        self.final_norm = nn.LayerNorm(d_model)
 
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=d_ff,
-            dropout=dropout,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, n_layers)
-
-        # Output heads for routing decisions
-        self.early_exit_gate = nn.Linear(d_model, 1)
-        self.episodic_gate = nn.Linear(d_model, 1)
-        self.semantic_gate = nn.Linear(d_model, 1)
-        self.verification_gate = nn.Linear(d_model, 1)
+        self.gate_head = nn.Linear(d_model, len(GATES))
         self.expert_selector = nn.Linear(d_model, n_experts)
-        self.uncertainty_head = nn.Linear(d_model, 1)
+        self.expert_log_std = nn.Parameter(torch.full((n_experts,), math.log(0.5)))
 
         self._init_weights()
 
@@ -77,112 +89,77 @@ class MetaController(nn.Module):
         state_summary: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass to compute routing decisions.
+        Compute routing distributions.
 
         Args:
             query_embedding: (batch, d_model) - Encoded query
             state_summary: (batch, state_dim) - Confidence scores, context indicators
 
         Returns:
-            Dict with continuous routing decisions (pre-threshold):
-                - early_exit: (batch, 1) in [0,1]
-                - episodic: (batch, 1) in [0,1]
-                - semantic: (batch, 1) in [0,1]
-                - verification: (batch, 1) in [0,1]
-                - expert_weights: (batch, n_experts) probability distribution
-                - uncertainty: (batch, 1) in [0,1]
+            Dict with:
+                - early_exit / episodic / semantic / verification: (batch, 1) probabilities
+                - gate_logits: (batch, 4) logits of those gates, in GATES order
+                - expert_weights: (batch, n_experts) raw logits used as additive gate bias
         """
-        batch_size = query_embedding.size(0)
-
-        # Combine inputs
-        x = torch.cat([query_embedding, state_summary], dim=-1)  # (batch, d_model + state_dim)
-        x = self.embedding(x)  # (batch, d_model)
+        x = self.embedding(torch.cat([query_embedding, state_summary], dim=-1))
         x = self.dropout(x)
-        x = x.unsqueeze(1)  # (batch, 1, d_model)
+        for block in self.blocks:
+            x = block(x)
+        h = self.final_norm(x)
 
-        # Process through transformer
-        h = self.transformer(x)  # (batch, 1, d_model)
-        h = h.squeeze(1)  # (batch, d_model)
-
-        # Compute routing decisions
-        decisions = {
-            'early_exit': torch.sigmoid(self.early_exit_gate(h)),  # (batch, 1)
-            'episodic': torch.sigmoid(self.episodic_gate(h)),
-            'semantic': torch.sigmoid(self.semantic_gate(h)),
-            'verification': torch.sigmoid(self.verification_gate(h)),
-            'expert_weights': self.expert_selector(h),  # (batch, n_experts) raw logits as additive bias
-            'uncertainty': torch.sigmoid(self.uncertainty_head(h))  # (batch, 1)
-        }
-
+        gate_logits = self.gate_head(h)
+        decisions = {gate: torch.sigmoid(gate_logits[:, i:i + 1]) for i, gate in enumerate(GATES)}
+        decisions['gate_logits'] = gate_logits
+        decisions['expert_weights'] = self.expert_selector(h)
         return decisions
 
-    def decide(
+    def act(
         self,
         decisions: Dict[str, torch.Tensor],
-        threshold: float = 0.5
-    ) -> Dict:
+        gate_mask: torch.Tensor,
+        sample: bool,
+        threshold: float = 0.5,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Convert continuous outputs to binary decisions.
+        Choose routing actions.
 
         Args:
-            decisions: Output from forward()
-            threshold: Binary decision threshold for gates
+            decisions: Output of forward()
+            gate_mask: (batch, 4) 1 where a gate's component exists; masked gates stay 0
+            sample: Sample from the policy (RL rollouts) instead of acting deterministically
+            threshold: Gate probability threshold for deterministic routing
 
         Returns:
-            Dict with binary decisions and probabilities
+            gate_actions: (batch, 4) float {0, 1}
+            expert_bias: (batch, n_experts) bias applied to the MoE gate logits
         """
-        batch_size = decisions['early_exit'].size(0)
-
-        # For single-item batch, return scalars; otherwise return lists
-        if batch_size == 1:
-            return {
-                'early_exit': (decisions['early_exit'].item() > threshold),
-                'episodic': (decisions['episodic'].item() > threshold),
-                'semantic': (decisions['semantic'].item() > threshold),
-                'verification': (decisions['verification'].item() > threshold),
-                'expert_weights': decisions['expert_weights'],  # Keep 2D shape (1, n_experts)
-                'uncertainty': decisions['uncertainty'].item()
-            }
+        probs = torch.sigmoid(decisions['gate_logits'])
+        mean = decisions['expert_weights']
+        if sample:
+            gate_actions = torch.bernoulli(probs)
+            expert_bias = Normal(mean, self.expert_log_std.exp()).sample()
         else:
-            return {
-                'early_exit': (decisions['early_exit'] > threshold).squeeze(-1).tolist(),
-                'episodic': (decisions['episodic'] > threshold).squeeze(-1).tolist(),
-                'semantic': (decisions['semantic'] > threshold).squeeze(-1).tolist(),
-                'verification': (decisions['verification'] > threshold).squeeze(-1).tolist(),
-                'expert_weights': decisions['expert_weights'],
-                'uncertainty': decisions['uncertainty'].squeeze(-1).tolist()
-            }
+            gate_actions = (probs > threshold).float()
+            expert_bias = mean
+        return gate_actions * gate_mask, expert_bias
 
-    def compute_gumbel_softmax(
+    def log_prob(
         self,
-        logits: torch.Tensor,
-        temperature: float = 1.0,
-        hard: bool = False
+        decisions: Dict[str, torch.Tensor],
+        gate_actions: torch.Tensor,
+        expert_bias: torch.Tensor,
+        gate_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Differentiable approximation to discrete sampling for training.
-
-        Args:
-            logits: Raw scores
-            temperature: Softmax temperature (lower = more discrete)
-            hard: If True, use straight-through estimator
-
-        Returns:
-            Soft or hard gate values
+        Log-probability (batch,) of taken actions. Masked gates contribute
+        nothing; the expert bias only counts when the base model has experts.
         """
-        # Sample Gumbel noise
-        gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-10) + 1e-10)
-        y = logits + gumbel_noise
-        soft_gate = torch.softmax(y / temperature, dim=-1)
-
-        if hard:
-            # Straight-through estimator
-            indices = soft_gate.argmax(dim=-1, keepdim=True)
-            hard_gate = torch.zeros_like(soft_gate).scatter_(-1, indices, 1.0)
-            # Keep soft gradients
-            return hard_gate - soft_gate.detach() + soft_gate
-
-        return soft_gate
+        gate_lp = Bernoulli(logits=decisions['gate_logits']).log_prob(gate_actions)
+        log_prob = (gate_lp * gate_mask).sum(dim=-1)
+        if self.n_experts > 1:
+            dist = Normal(decisions['expert_weights'], self.expert_log_std.exp())
+            log_prob = log_prob + dist.log_prob(expert_bias).sum(dim=-1)
+        return log_prob
 
 
 class StateSummaryEncoder(nn.Module):

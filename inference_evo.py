@@ -40,7 +40,6 @@ except Exception:
     pass
 
 import torch
-import torch.nn.functional as F
 import argparse
 import sys
 import time
@@ -49,9 +48,8 @@ from typing import Optional, Generator
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
-from mantis.models import BaseMoEModel
-from mantis.tokenizer import MANTISTokenizer
-from mantis.utils.checkpoints import compat_load
+from mantis.inference.generation import generate_tokens
+from mantis.utils.checkpoints import load_base_model
 
 
 class EvoInferenceEngine:
@@ -65,31 +63,15 @@ class EvoInferenceEngine:
     ):
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         self.quantize = quantize
+        if quantize == 'int8' and self.device != 'cpu':
+            print("INT8 dynamic quantization only has CPU kernels; running on CPU")
+            self.device = 'cpu'
 
         print(f"Loading model from: {checkpoint_path}")
         print(f"Device: {self.device}")
 
-        checkpoint = compat_load(checkpoint_path, map_location=self.device)
-
-        if 'config' not in checkpoint:
-            raise ValueError("Checkpoint missing 'config' field")
-        config = checkpoint['config']
-
-        self.model = BaseMoEModel(
-            vocab_size=config.base_moe.vocab_size,
-            d_model=config.base_moe.d_model,
-            n_layers=config.base_moe.n_layers,
-            n_heads=config.base_moe.n_heads,
-            d_ff=config.base_moe.d_ff,
-            n_experts=config.base_moe.n_experts,
-            top_k=config.base_moe.top_k,
-            max_seq_len=config.base_moe.max_seq_len,
-            dropout=config.base_moe.dropout,
-        ).to(self.device)
-
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.model.eval()
-        self.max_seq_len = config.base_moe.max_seq_len
+        self.model, self.tokenizer, checkpoint = load_base_model(checkpoint_path, self.device)
+        self.max_seq_len = self.model.max_seq_len
 
         if self.quantize == 'int8':
             self.model = torch.quantization.quantize_dynamic(
@@ -100,49 +82,55 @@ class EvoInferenceEngine:
             self.model = self.model.half()
             print("✓ Model converted to FP16")
 
-        # Load tokenizer
-        checkpoint_dir = os.path.dirname(checkpoint_path)
-        tokenizer_path = os.path.join(checkpoint_dir, 'tokenizer')
-        if os.path.exists(tokenizer_path):
-            self.tokenizer = MANTISTokenizer.load(tokenizer_path)
-        else:
-            self.tokenizer = MANTISTokenizer()
-
-        # Cache the separator token id
-        self.separator_id = self.tokenizer.vocab.get('---')
+        self.separator_id = self.tokenizer.vocab['---']
         self.eos_id = self.tokenizer.eos_token_id
+        self.banned_ids = self.tokenizer.non_generable_ids
 
         param_counts = self.model.count_parameters()
         print(f"Model: {param_counts['total'] / 1e6:.2f}M parameters")
         print(f"Vocabulary: {len(self.tokenizer):,} tokens")
+        print(f"Context window: {self.max_seq_len} tokens")
         if 'val_loss' in checkpoint:
             print(f"Validation loss: {checkpoint['val_loss']:.4f}")
 
-    def _apply_sampling_filters(self, logits, top_k=50, top_p=0.9):
-        """Apply top-k and top-p filtering to logits."""
-        if top_k > 0:
-            top_k = min(top_k, logits.size(-1))
-            top_k_values, _ = torch.topk(logits, top_k)
-            min_top_k = top_k_values[-1]
-            logits = torch.where(
-                logits < min_top_k,
-                torch.full_like(logits, float('-inf')),
-                logits,
-            )
+    def _stream_ticks(
+        self,
+        context: str,
+        max_ticks: int,
+        max_tokens_per_tick: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+    ) -> Generator[str, None, None]:
+        """
+        Decode one continuous stream and cut it into ticks at each `---`.
 
-        if top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-            sorted_indices_to_remove = cumulative_probs > top_p
-            if sorted_indices_to_remove.numel() > 1:
-                sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
-            sorted_indices_to_remove[0] = False
-            indices_to_remove = sorted_indices[sorted_indices_to_remove]
-            logits[indices_to_remove] = float('-inf')
+        A tick also ends after `max_tokens_per_tick` tokens. EOS ends the world.
+        The KV cache carries across ticks; the shared decoder keeps the context
+        inside the model's window.
+        """
+        prompt_ids = self.tokenizer.encode(context)
+        stream = generate_tokens(
+            self.model, prompt_ids, max_ticks * max_tokens_per_tick,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            banned_ids=self.banned_ids, stop_ids=[self.eos_id],
+        )
 
-        return logits
+        tick = []
+        emitted = 0
+        for token, _ in stream:
+            if token == self.eos_id:
+                break
+            tick.append(token)
+            if token == self.separator_id or len(tick) >= max_tokens_per_tick:
+                yield self.tokenizer.decode(tick)
+                emitted += 1
+                tick = []
+                if emitted >= max_ticks:
+                    return
+        if tick:
+            yield self.tokenizer.decode(tick)
 
-    @torch.no_grad()
     def generate_tick(
         self,
         context: str,
@@ -151,69 +139,8 @@ class EvoInferenceEngine:
         top_p: float = 0.9,
         top_k: int = 50,
     ) -> str:
-        """Generate a single tick from context.
-
-        Generates tokens until `---` separator or EOS is produced.
-        Returns the generated tick text including the `---` separator.
-        """
-        self.model.eval()
-
-        input_ids = self.tokenizer.encode(context, add_special_tokens=False)
-
-        # Truncate context from the left if too long
-        max_context = self.max_seq_len - max_tokens
-        if len(input_ids) > max_context:
-            input_ids = input_ids[-max_context:]
-
-        input_tensor = torch.tensor([input_ids], dtype=torch.long).to(self.device)
-
-        is_greedy = (temperature == 0.0)
-        if is_greedy:
-            temperature = 1.0
-
-        generated_tokens = []
-        past_key_values = None
-
-        for _ in range(max_tokens):
-            if past_key_values is None:
-                model_input = input_tensor[:, -self.max_seq_len:]
-            else:
-                model_input = input_tensor[:, -1:]
-
-            output = self.model(model_input, past_key_values=past_key_values, use_cache=True)
-            logits = output['logits']
-            past_key_values = output['past_key_values']
-
-            # Truncate KV cache if needed
-            if past_key_values[0][0].size(1) >= self.max_seq_len:
-                past_key_values = [
-                    (k[:, -self.max_seq_len + 1:], v[:, -self.max_seq_len + 1:])
-                    for k, v in past_key_values
-                ]
-
-            next_token_logits = logits[0, -1, :] / temperature
-
-            if is_greedy:
-                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-            else:
-                next_token_logits = self._apply_sampling_filters(
-                    next_token_logits, top_k=top_k, top_p=top_p,
-                )
-                probs = F.softmax(next_token_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-
-            input_tensor = torch.cat([input_tensor, next_token.unsqueeze(0)], dim=1)
-            token_id = next_token.item()
-            generated_tokens.append(token_id)
-
-            if token_id == self.eos_id:
-                break
-
-            # Stop on --- separator
-            if token_id == self.separator_id:
-                break
-
-        return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        """Generate a single tick from context, up to and including its `---` separator."""
+        return next(self._stream_ticks(context, 1, max_tokens, temperature, top_p, top_k), "")
 
     def generate_world(
         self,
@@ -227,33 +154,10 @@ class EvoInferenceEngine:
         """Generate a new world from scratch, yielding tick-by-tick.
 
         Starts with `=EPOCH 1 1000 W{seed}` prompt (v2 compact format).
-        Yields each generated tick as a string.
         """
-        context = f"=EPOCH 1 1000 W{seed}\n"
-
-        for _ in range(max_ticks):
-            tick = self.generate_tick(
-                context,
-                max_tokens=max_tokens_per_tick,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-            )
-
-            if not tick.strip():
-                break
-
-            yield tick
-
-            # Append to context, left-truncate if needed
-            context += tick
-            # Keep context within model's capacity (leave room for generation)
-            max_context_chars = self.max_seq_len * 4  # rough char estimate
-            if len(context) > max_context_chars:
-                # Find a tick separator to cut at
-                cut_point = context.find('---', len(context) - max_context_chars)
-                if cut_point > 0:
-                    context = context[cut_point:]
+        yield from self._stream_ticks(
+            f"=EPOCH 1 1000 W{seed}\n", max_ticks, max_tokens_per_tick, temperature, top_p, top_k,
+        )
 
     def continue_trace(
         self,
@@ -265,28 +169,9 @@ class EvoInferenceEngine:
         top_k: int = 50,
     ) -> Generator[str, None, None]:
         """Continue from an existing simulation trace, yielding new ticks."""
-        context = partial_trace
-
-        for _ in range(max_ticks):
-            tick = self.generate_tick(
-                context,
-                max_tokens=max_tokens_per_tick,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-            )
-
-            if not tick.strip():
-                break
-
-            yield tick
-
-            context += tick
-            max_context_chars = self.max_seq_len * 4
-            if len(context) > max_context_chars:
-                cut_point = context.find('---', len(context) - max_context_chars)
-                if cut_point > 0:
-                    context = context[cut_point:]
+        yield from self._stream_ticks(
+            partial_trace, max_ticks, max_tokens_per_tick, temperature, top_p, top_k,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -1,29 +1,41 @@
 """
 Stage 3: Meta-Controller RL Fine-Tuning
 
-Train the routing policy with PPO to optimize multi-objective reward.
+Train the routing policy with PPO to optimize a multi-objective reward.
+
+Each episode is one query (a contextual bandit): the engine samples routing
+actions from the policy, executes them, and the trainer scores the response.
+Updates use fresh on-policy batches of `batch_size` episodes.
 """
+
+import json
+import os
+import random
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Categorical, Bernoulli
-from typing import Dict, List, Tuple
-from collections import deque
-import random
-import os
-from mantis.utils.checkpoints import compat_load
 
-from mantis.models.base_moe import BaseMoEModel
-from mantis.models.meta_controller import MetaController, StateSummaryEncoder
-from mantis.models.critic import CriticModel, CriticValueNetwork
 from mantis.inference.engine import MANTISInferenceEngine
-from mantis.tokenizer import MANTISTokenizer
+from mantis.models.critic import CriticValueNetwork
+
+DEMO_QA = [
+    ("What is the capital of France?", "Paris"),
+    ("Summarize the plot of the movie Inception.", "A thief who enters people's dreams to steal information."),
+    ("Who wrote the book 'Pride and Prejudice'?", "Jane Austen"),
+    ("Explain the theory of relativity in simple terms.", "Space and time are connected, and massive objects bend spacetime."),
+    ("What are the main causes of climate change?", "Greenhouse gas emissions from human activities."),
+    ("How does photosynthesis work?", "Plants convert sunlight into energy using chlorophyll."),
+    ("What is the Pythagorean theorem?", "In a right triangle, the square of the hypotenuse equals the sum of squares of the other sides."),
+    ("Describe the water cycle.", "Water evaporates, condenses into clouds, and falls as precipitation."),
+    ("What is DNA?", "DNA is the molecule that carries genetic information."),
+    ("How do computers store information?", "Computers use binary code to store data as 0s and 1s."),
+]
 
 
 class PPOTrainer:
     """
-    PPO trainer for meta-controller.
+    PPO trainer for the meta-controller and its state encoder.
 
     Optimizes routing policy to balance:
     - Accuracy
@@ -34,9 +46,8 @@ class PPOTrainer:
 
     def __init__(
         self,
-        meta_controller: nn.Module,
+        engine: MANTISInferenceEngine,
         value_network: nn.Module,
-        inference_engine,
         alpha: float = 1.0,  # Accuracy weight
         beta: float = 0.3,   # Latency weight
         gamma: float = 0.2,  # Compute weight
@@ -45,553 +56,258 @@ class PPOTrainer:
         ppo_epsilon: float = 0.2,
         batch_size: int = 256,
         n_epochs: int = 4,
-        device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+        minibatch_size: int = 64,
     ):
-        self.meta = meta_controller.to(device)
-        self.value_net = value_network.to(device)
-        self.engine = inference_engine
-        self.device = device
+        self.engine = engine
+        self.device = engine.device
+        self.value_net = value_network.to(self.device).eval()
 
-        # Reward weights
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-        self.delta = delta
-
-        # PPO hyperparameters
+        self.alpha, self.beta, self.gamma, self.delta = alpha, beta, gamma, delta
         self.epsilon = ppo_epsilon
         self.batch_size = batch_size
         self.n_epochs = n_epochs
+        self.minibatch_size = minibatch_size
 
-        # Optimizers
-        self.policy_optimizer = torch.optim.Adam(meta_controller.parameters(), lr=lr)
-        self.value_optimizer = torch.optim.Adam(value_network.parameters(), lr=lr)
+        # Dropout stays off (modules in eval mode) so old and new log-probs agree
+        policy_params = list(engine.meta.parameters()) + list(engine.state_encoder.parameters())
+        self.policy_optimizer = torch.optim.Adam(policy_params, lr=lr)
+        self.value_optimizer = torch.optim.Adam(self.value_net.parameters(), lr=lr)
+        self.policy_params = policy_params
 
-        # Experience buffer
-        self.buffer = deque(maxlen=10000)
+        # Latency is scored relative to a running mean of observed latency
+        self.latency_baseline = None
 
-        # Training statistics
-        self.stats = {
-            'episodes': 0,
-            'total_reward': 0.0,
-            'policy_loss': 0.0,
-            'value_loss': 0.0
-        }
+        self.stats = {'episodes': 0, 'total_reward': 0.0, 'policy_loss': 0.0, 'value_loss': 0.0}
 
-    def train(
-        self,
-        queries: List[str],
-        ground_truths: List[str],
-        num_episodes: int = 50000
-    ):
+    def train(self, train_pairs: List[Tuple[str, str]], val_pairs: List[Tuple[str, str]], num_episodes: int = 50000):
         """
         Main RL training loop.
 
         Args:
-            queries: List of training queries
-            ground_truths: Corresponding ground truth responses
+            train_pairs: (query, ground_truth) pairs for rollouts
+            val_pairs: held-out pairs scored with the deterministic policy
             num_episodes: Number of episodes to train
         """
         print(f"Starting PPO training for {num_episodes} episodes")
+        batch = []
 
-        for episode in range(num_episodes):
-            # Sample random query
-            idx = random.randint(0, len(queries) - 1)
-            query = queries[idx]
-            ground_truth = ground_truths[idx]
+        for episode in range(1, num_episodes + 1):
+            query, ground_truth = random.choice(train_pairs)
+            transition = self.collect_episode(query, ground_truth)
+            batch.append(transition)
 
-            # Collect episode
-            reward = self.collect_episode(query, ground_truth)
-
-            # Update statistics
             self.stats['episodes'] += 1
-            self.stats['total_reward'] += reward
+            self.stats['total_reward'] += transition['reward']
 
-            # PPO update
-            if len(self.buffer) >= self.batch_size:
-                policy_loss, value_loss = self.update()
+            if len(batch) == self.batch_size:
+                self.stats['policy_loss'], self.stats['value_loss'] = self.update(batch)
+                batch = []
 
-                self.stats['policy_loss'] = policy_loss
-                self.stats['value_loss'] = value_loss
-
-            # Logging
             if episode % 100 == 0:
-                avg_reward = self.stats['total_reward'] / max(self.stats['episodes'], 1)
+                avg_reward = self.stats['total_reward'] / self.stats['episodes']
                 print(f"Episode {episode} | Avg Reward: {avg_reward:.4f} | "
                       f"Policy Loss: {self.stats['policy_loss']:.4f} | "
                       f"Value Loss: {self.stats['value_loss']:.4f}")
 
-            # Validation
             if episode % 1000 == 0:
-                val_reward = self.validate(queries[:100], ground_truths[:100])
-                print(f"Validation Reward: {val_reward:.4f}")
+                print(f"Validation Reward: {self.validate(val_pairs):.4f}")
 
+        if len(batch) > 1:
+            self.update(batch)
         print("PPO training complete!")
 
-    def collect_episode(self, query: str, ground_truth: str) -> float:
-        """
-        Collect one episode of experience.
+    def collect_episode(self, query: str, ground_truth: str) -> Dict:
+        """Run one exploratory episode and return its transition."""
+        result = self.engine.generate(query, explore=True, return_details=True)
+        transition = dict(result['rollout'])
+        transition['reward'] = self.compute_reward(result, ground_truth)
+        return transition
 
-        Returns:
-            Episode reward
-        """
-        # Generate with current policy
-        result = self.engine.generate(query, return_details=True)
-
-        # Extract routing decisions
-        routing = result['routing_decisions']
-
-        # Compute reward
-        metrics = {
-            'latency': result['latency'],
-            'baseline_latency': 0.15,  # Baseline comparison
-            'active_params': 2e9,
-            'total_params': 12e9,
-            'episodic_accessed': routing['episodic'],
-            'semantic_accessed': routing['semantic'],
-            'uncertainty': result['uncertainty']
-        }
-
-        reward = self.compute_reward(
-            query,
-            result['response'],
-            metrics,
-            ground_truth
-        )
-
-        # Store transition
-        state = self._get_state(query, result)
-        action = self._encode_action(routing)
-        log_prob = self._compute_log_prob(result['routing_continuous'], action)
-        value = self.value_net(state).item()
-
-        transition = {
-            'state': state,
-            'action': action,
-            'reward': reward,
-            'log_prob': log_prob,
-            'value': value
-        }
-
-        self.buffer.append(transition)
-
-        return reward
-
-    def compute_reward(
-        self,
-        query: str,
-        response: str,
-        metrics: Dict,
-        ground_truth: str
-    ) -> float:
+    def compute_reward(self, result: Dict, ground_truth: str, update_baseline: bool = True) -> float:
         """
         Multi-objective reward function.
 
         R = α·R_acc - β·R_lat - γ·R_comp + δ·R_calib
         """
-        # Accuracy (simplified - could use BLEU, ROUGE, or critic)
-        correct = self._check_correctness(response, ground_truth)
+        correct = self._check_correctness(result['response'], ground_truth)
         r_acc = 1.0 if correct else -1.0
 
-        # Latency (normalized)
-        r_lat = metrics['latency'] / metrics['baseline_latency']
+        latency = result['latency']
+        if self.latency_baseline is None:
+            self.latency_baseline = latency
+        r_lat = latency / max(self.latency_baseline, 1e-6)
+        if update_baseline:
+            self.latency_baseline = 0.95 * self.latency_baseline + 0.05 * latency
 
-        # Compute cost
+        # Memory gates only execute on the full path
+        full = result['path'] == 'full'
+        gates = result['routing_decisions']
         r_comp = (
-            0.5 * (metrics['active_params'] / metrics['total_params']) +
-            0.3 * float(metrics['episodic_accessed']) +
-            0.2 * float(metrics['semantic_accessed'])
+            0.5 * self.engine.active_param_ratio +
+            0.3 * float(full and gates['episodic']) +
+            0.2 * float(full and gates['semantic'])
         )
 
-        # Calibration (uncertainty should match correctness)
-        u = metrics['uncertainty']
-        y_true = 1 if correct else 0
-        r_calib = -((u - (1 - y_true)) ** 2)
+        # Calibration: uncertainty should be low when correct, high when wrong
+        u = result['uncertainty']
+        r_calib = -((u - (0.0 if correct else 1.0)) ** 2)
 
-        # Total reward
-        reward = (
-            self.alpha * r_acc -
-            self.beta * r_lat -
-            self.gamma * r_comp +
-            self.delta * r_calib
-        )
+        return self.alpha * r_acc - self.beta * r_lat - self.gamma * r_comp + self.delta * r_calib
 
-        return reward
-
-    def update(self) -> Tuple[float, float]:
+    def update(self, batch: List[Dict]) -> Tuple[float, float]:
         """
-        PPO update step.
+        PPO update on one on-policy batch.
 
         Returns:
-            (policy_loss, value_loss)
+            (mean policy loss, mean value loss)
         """
-        if len(self.buffer) < self.batch_size:
-            return 0.0, 0.0
-
-        # Sample batch
-        batch = random.sample(self.buffer, self.batch_size)
-
-        states = torch.stack([t['state'] for t in batch])
-        actions = torch.stack([t['action'] for t in batch])
-        old_log_probs = torch.stack([t['log_prob'] for t in batch])
+        stack = lambda key: torch.stack([t[key] for t in batch]).to(self.device)
+        query_emb = stack('query_emb')
+        features = stack('features')
+        gate_actions = stack('gate_actions')
+        expert_bias = stack('expert_bias')
+        gate_mask = stack('gate_mask')
+        old_log_probs = stack('log_prob')
         rewards = torch.tensor([t['reward'] for t in batch], device=self.device)
-        old_values = torch.tensor([t['value'] for t in batch], device=self.device)
 
-        # Compute advantages (single-step: reward - baseline value)
-        values = self.value_net(states).squeeze(-1)
-        advantages = rewards - values.detach()
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        with torch.no_grad():
+            summary = self.engine.encode_state(features)
+            old_values = self.value_net(torch.cat([query_emb, summary], dim=-1)).squeeze(-1)
+        advantages = rewards - old_values
+        if len(batch) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # PPO policy update (multiple epochs)
-        total_policy_loss = 0.0
-
+        policy_losses, value_losses = [], []
+        n = len(batch)
         for _ in range(self.n_epochs):
-            # Forward pass
-            routing = self.meta(
-                states[:, :self.meta.d_model],
-                states[:, self.meta.d_model:]
-            )
+            for idx in torch.randperm(n, device=self.device).split(self.minibatch_size):
+                summary = self.engine.encode_state(features[idx])
+                decisions = self.engine.meta(query_emb[idx], summary)
+                log_probs = self.engine.meta.log_prob(decisions, gate_actions[idx], expert_bias[idx], gate_mask[idx])
+                assert log_probs.shape == old_log_probs[idx].shape
 
-            # Compute action log probabilities
-            log_probs = self._compute_log_prob_batch(routing, actions)
+                ratio = torch.exp(log_probs - old_log_probs[idx])
+                surr1 = ratio * advantages[idx]
+                surr2 = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantages[idx]
+                policy_loss = -torch.min(surr1, surr2).mean()
 
-            # Compute ratio
-            ratio = torch.exp(log_probs - old_log_probs)
+                self.policy_optimizer.zero_grad()
+                policy_loss.backward()
+                nn.utils.clip_grad_norm_(self.policy_params, 1.0)
+                self.policy_optimizer.step()
+                policy_losses.append(policy_loss.item())
 
-            # Clipped surrogate objective
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantages
-            policy_loss = -torch.min(surr1, surr2).mean()
+                # Value function update with clipping
+                values = self.value_net(torch.cat([query_emb[idx], summary.detach()], dim=-1)).squeeze(-1)
+                values_clipped = old_values[idx] + torch.clamp(values - old_values[idx], -self.epsilon, self.epsilon)
+                value_loss = torch.max(
+                    (values - rewards[idx]) ** 2,
+                    (values_clipped - rewards[idx]) ** 2,
+                ).mean()
 
-            # Update policy
-            self.policy_optimizer.zero_grad()
-            policy_loss.backward()
-            nn.utils.clip_grad_norm_(self.meta.parameters(), 1.0)
-            self.policy_optimizer.step()
+                self.value_optimizer.zero_grad()
+                value_loss.backward()
+                nn.utils.clip_grad_norm_(self.value_net.parameters(), 1.0)
+                self.value_optimizer.step()
+                value_losses.append(value_loss.item())
 
-            total_policy_loss += policy_loss.item()
+        return sum(policy_losses) / len(policy_losses), sum(value_losses) / len(value_losses)
 
-        # Value function update with clipping
-        values = self.value_net(states).squeeze(-1)
-        values_clipped = old_values + torch.clamp(
-            values - old_values, -self.epsilon, self.epsilon
-        )
-        value_loss_unclipped = (values - rewards) ** 2
-        value_loss_clipped = (values_clipped - rewards) ** 2
-        value_loss = torch.max(value_loss_unclipped, value_loss_clipped).mean()
-
-        self.value_optimizer.zero_grad()
-        value_loss.backward()
-        nn.utils.clip_grad_norm_(self.value_net.parameters(), 1.0)
-        self.value_optimizer.step()
-
-        return total_policy_loss / self.n_epochs, value_loss.item()
-
-    def validate(self, queries: List[str], ground_truths: List[str]) -> float:
-        """
-        Validate on held-out set.
-
-        Returns:
-            Average reward
-        """
+    def validate(self, pairs: List[Tuple[str, str]]) -> float:
+        """Average reward of the deterministic policy on held-out pairs."""
         total_reward = 0.0
-
-        for query, gt in zip(queries, ground_truths):
+        for query, ground_truth in pairs:
             result = self.engine.generate(query, return_details=True)
-
-            metrics = {
-                'latency': result['latency'],
-                'baseline_latency': 0.15,
-                'active_params': 2e9,
-                'total_params': 12e9,
-                'episodic_accessed': result['routing_decisions']['episodic'],
-                'semantic_accessed': result['routing_decisions']['semantic'],
-                'uncertainty': result['uncertainty']
-            }
-
-            reward = self.compute_reward(query, result['response'], metrics, gt)
-            total_reward += reward
-
-        return total_reward / len(queries)
-
-    def _get_state(self, query: str, result: Dict) -> torch.Tensor:
-        """
-        Encode state for value network.
-
-        Returns:
-            (d_model + state_dim,) state vector
-        """
-        # Get query embedding from inference engine
-        query_tokens = self.engine._tokenize(query)
-        query_emb = self.engine.base.encode(query_tokens).squeeze(0)  # (d_model,)
-
-        # Create state summary
-        state_summary = self.engine._create_state_summary(
-            uncertainty=result['uncertainty'],
-            context_length=query_tokens.size(1),
-            confidence=result.get('confidence', 0.5)
-        ).squeeze(0)  # (state_dim,)
-
-        # Combine
-        state = torch.cat([query_emb, state_summary], dim=0)
-        return state
-
-    def _encode_action(self, routing: Dict) -> torch.Tensor:
-        """
-        Encode routing decisions as action vector.
-
-        Returns:
-            (5,) action tensor [early_exit, episodic, semantic, verification, expert_id]
-        """
-        expert_id = routing['expert_weights'].argmax().item() if torch.is_tensor(routing['expert_weights']) else 0
-
-        action = torch.tensor([
-            float(routing['early_exit']),
-            float(routing['episodic']),
-            float(routing['semantic']),
-            float(routing['verification']),
-            float(expert_id)
-        ], device=self.device)
-
-        return action
-
-    def _compute_log_prob(self, routing_continuous: Dict, action: torch.Tensor) -> torch.Tensor:
-        """
-        Compute log probability of action under current policy.
-        """
-        log_prob = torch.tensor(0.0, device=self.device)
-
-        # Binary gates (Bernoulli)
-        for i, gate in enumerate(['early_exit', 'episodic', 'semantic', 'verification']):
-            prob = routing_continuous[gate].squeeze()
-            if prob.dim() == 0:
-                prob = prob.unsqueeze(0)
-
-            # Create Bernoulli distribution
-            dist = Bernoulli(probs=prob)
-            action_val = action[i]
-
-            # Add log probability
-            log_prob = log_prob + dist.log_prob(action_val)
-
-        # Expert selection (Categorical)
-        expert_probs = routing_continuous['expert_weights']
-        if expert_probs.dim() == 1:
-            expert_probs = expert_probs.unsqueeze(0)
-
-        dist = Categorical(probs=expert_probs)
-        expert_id = action[4].long()
-        log_prob = log_prob + dist.log_prob(expert_id)
-
-        return log_prob
-
-    def _compute_log_prob_batch(
-        self,
-        routing: Dict[str, torch.Tensor],
-        actions: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute log probabilities for batch of actions using torch.distributions.
-        """
-        batch_size = actions.size(0)
-        log_probs = torch.zeros(batch_size, device=self.device)
-
-        # Binary gates using Bernoulli distribution
-        for i, gate in enumerate(['early_exit', 'episodic', 'semantic', 'verification']):
-            probs = routing[gate].squeeze(-1)
-            action_vals = actions[:, i]
-
-            # Create Bernoulli distribution
-            dist = Bernoulli(probs=probs)
-
-            # Add log probabilities
-            log_probs += dist.log_prob(action_vals)
-
-        # Expert selection using Categorical distribution
-        expert_probs = routing['expert_weights']
-        expert_ids = actions[:, 4].long()
-
-        # Create Categorical distribution
-        dist = Categorical(probs=expert_probs)
-
-        # Add log probabilities
-        log_probs += dist.log_prob(expert_ids)
-
-        return log_probs
+            total_reward += self.compute_reward(result, ground_truth, update_baseline=False)
+        return total_reward / len(pairs)
 
     def _check_correctness(self, response: str, ground_truth: str) -> bool:
-        """
-        Simple correctness check (could be more sophisticated).
-        """
-        # Exact match or substring
+        """Ground truth appears in the generated completion."""
         return ground_truth.lower() in response.lower()
+
+
+def load_qa_pairs(path: str) -> List[Tuple[str, str]]:
+    """JSONL with {"query": ..., "answer": ...} per line."""
+    pairs = []
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            if line.strip():
+                record = json.loads(line)
+                pairs.append((record['query'], record['answer']))
+    return pairs
 
 
 def train_rl_stage(args):
     """
     Entry point for Stage 3: RL training of meta-controller.
 
-    Called from train.py with --stage 3.
-
-    Args:
-        args: Argument namespace from train.py argparse
+    Called from train.py with --stage 3. Optional components:
+    --memory-checkpoint (Stage 2) enables episodic memory,
+    --semantic-store (Stage 2) enables semantic memory,
+    --critic-checkpoint (Stage 4) enables verification.
     """
-    print("\n" + "="*80)
-    print("Stage 3: RL Training - Meta-Controller Optimization")
-    print("="*80)
-
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # 1. Load pre-trained base model from checkpoint
-    print(f"\nLoading base model from: {args.resume}")
-    if not os.path.exists(args.resume):
-        raise FileNotFoundError(f"Checkpoint not found: {args.resume}")
-
-    checkpoint = compat_load(args.resume)
-    if 'config' not in checkpoint:
-        raise ValueError(f"Checkpoint missing 'config' key: {args.resume}")
-    config = checkpoint['config']
-
-    # Load tokenizer
-    print(f"Loading tokenizer from: {args.tokenizer_path}")
-    if not os.path.exists(args.tokenizer_path):
-        raise FileNotFoundError(f"Tokenizer not found: {args.tokenizer_path}")
-    tokenizer = MANTISTokenizer.load(args.tokenizer_path)
-    config.base_moe.vocab_size = len(tokenizer)
-    config.critic.vocab_size = len(tokenizer)
-
-    # Load base model
-    base_model = BaseMoEModel(
-        vocab_size=config.base_moe.vocab_size,
-        d_model=config.base_moe.d_model,
-        n_layers=config.base_moe.n_layers,
-        n_heads=config.base_moe.n_heads,
-        d_ff=config.base_moe.d_ff,
-        n_experts=config.base_moe.n_experts,
-        top_k=config.base_moe.top_k,
-        max_seq_len=config.base_moe.max_seq_len,
-        dropout=config.base_moe.dropout,
-        load_balance_weight=config.base_moe.load_balance_weight
+    engine = MANTISInferenceEngine.from_checkpoints(
+        base_checkpoint=args.resume,
+        memory_checkpoint=args.memory_checkpoint,
+        semantic_store=args.semantic_store,
+        critic_checkpoint=args.critic_checkpoint,
+        tokenizer_path=args.tokenizer_path,
+        device=device,
     )
-    base_model.load_state_dict(checkpoint['model_state_dict'])
-    base_model.to(device)
-    base_model.eval()
-    print("✓ Base model loaded successfully.")
+    config = engine.mantis_config
+    available = [g for g, on in zip(('episodic', 'semantic', 'verification'), engine.gate_mask[0, 1:].tolist()) if on]
+    print(f"✓ Engine ready. Optional gates available: {available or 'none'}")
 
-    # 2. Initialize meta-controller and value network
-    print("Initializing Meta-Controller and Value Network...")
-    meta_controller = MetaController(
-        d_model=config.base_moe.d_model,
-        n_layers=config.meta_controller.n_layers,
-        n_heads=config.meta_controller.n_heads,
-        d_ff=config.meta_controller.d_ff,
-        dropout=config.meta_controller.dropout,
-        n_experts=config.base_moe.n_experts,
-        state_dim=config.meta_controller.state_dim
-    )
+    if args.train_file:
+        pairs = load_qa_pairs(args.train_file)
+        print(f"✓ Loaded {len(pairs)} query-answer pairs from {args.train_file}")
+    else:
+        pairs = list(DEMO_QA)
+        print("⚠️  No data file given: using the 10-pair demo dataset.")
+        print("   Pass a JSONL file of {\"query\": ..., \"answer\": ...} records for real training.")
+    if len(pairs) < 2:
+        raise ValueError("Stage 3 needs at least 2 query-answer pairs")
 
-    value_network = CriticValueNetwork(
-        d_model=config.base_moe.d_model,
-        state_dim=config.meta_controller.state_dim
-    )
-    print("✓ Meta-Controller and Value Network initialized.")
+    random.Random(42).shuffle(pairs)
+    n_val = max(1, len(pairs) // 10)
+    train_pairs, val_pairs = pairs[n_val:], pairs[:n_val]
 
-    # 3. Create MANTISInferenceEngine
-    print("Creating MANTIS Inference Engine...")
-    state_encoder = StateSummaryEncoder(state_dim=config.meta_controller.state_dim)
-    critic_model = CriticModel(
-        vocab_size=config.critic.vocab_size,
-        d_model=config.critic.d_model,
-        n_layers=config.critic.n_layers,
-        n_heads=config.critic.n_heads,
-        d_ff=config.critic.d_ff,
-        max_seq_len=config.critic.max_seq_len,
-        dropout=config.critic.dropout
-    )
-
-    inference_engine = MANTISInferenceEngine(
-        base_model=base_model,
-        meta_controller=meta_controller,
-        episodic_memory=None,
-        semantic_memory=None,
-        critic_model=critic_model,
-        state_encoder=state_encoder,
-        tokenizer=tokenizer,
-        device=device
-    )
-    print("✓ Inference Engine created.")
-
-    # 4. Prepare RL training dataset
-    print("\n⚠️  Note: Using demo dataset for RL training.")
-    print("   For production, provide a proper training dataset with queries and ground truths.")
-    print("   Dataset should be loaded from file with 1000+ query-answer pairs.\n")
-
-    queries = [
-        "What is the capital of France?",
-        "Summarize the plot of the movie Inception.",
-        "Who wrote the book 'Pride and Prejudice'?",
-        "Explain the theory of relativity in simple terms.",
-        "What are the main causes of climate change?",
-        "How does photosynthesis work?",
-        "What is the Pythagorean theorem?",
-        "Describe the water cycle.",
-        "What is DNA?",
-        "How do computers store information?"
-    ]
-    ground_truths = [
-        "Paris",
-        "A thief who enters people's dreams to steal information.",
-        "Jane Austen",
-        "Space and time are connected, and massive objects bend spacetime.",
-        "Greenhouse gas emissions from human activities.",
-        "Plants convert sunlight into energy using chlorophyll.",
-        "In a right triangle, the square of the hypotenuse equals the sum of squares of the other sides.",
-        "Water evaporates, condenses into clouds, and falls as precipitation.",
-        "DNA is the molecule that carries genetic information.",
-        "Computers use binary code to store data as 0s and 1s."
-    ]
-    print(f"✓ Using demo dataset with {len(queries)} queries.")
-
-    # 5. Run PPOTrainer.train()
-    print("\nInitializing PPO Trainer...")
+    value_network = CriticValueNetwork(d_model=config.base_moe.d_model, state_dim=config.meta_controller.state_dim)
     ppo_trainer = PPOTrainer(
-        meta_controller=meta_controller,
+        engine=engine,
         value_network=value_network,
-        inference_engine=inference_engine,
         alpha=config.training.alpha_accuracy,
         beta=config.training.beta_latency,
         gamma=config.training.gamma_compute,
         delta=config.training.delta_calibration,
-        lr=config.training.rl_lr,
+        lr=args.learning_rate or config.training.rl_lr,
         ppo_epsilon=config.training.rl_ppo_epsilon,
         batch_size=args.rl_batch_size,
-        device=device
     )
 
-    print(f"\nStarting PPO training: {args.rl_episodes} episodes")
-    print(f"Batch size: {args.rl_batch_size}")
-    print("="*80 + "\n")
+    print(f"\nStarting PPO training: {args.rl_episodes} episodes, "
+          f"{len(train_pairs)} train / {len(val_pairs)} val pairs, batch {args.rl_batch_size}")
+    print("=" * 80 + "\n")
+    ppo_trainer.train(train_pairs, val_pairs, num_episodes=args.rl_episodes)
 
-    ppo_trainer.train(
-        queries=queries,
-        ground_truths=ground_truths,
-        num_episodes=args.rl_episodes
-    )
-
-    # 6. Save optimized meta-controller
-    output_dir = args.output_dir if hasattr(args, 'output_dir') else os.path.dirname(args.resume)
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
-    save_path = os.path.join(output_dir, "meta_controller_rl.pt")
+    os.makedirs(args.output_dir, exist_ok=True)
+    save_path = os.path.join(args.output_dir, "meta_controller_rl.pt")
+    absolute = lambda p: os.path.abspath(p) if p else None
     torch.save({
-        'meta_controller_state_dict': meta_controller.state_dict(),
+        'meta_controller_state_dict': engine.meta.state_dict(),
+        'state_encoder_state_dict': engine.state_encoder.state_dict(),
         'value_network_state_dict': value_network.state_dict(),
-        'config': config
+        'config': config,
+        'tokenizer_fingerprint': engine.tokenizer.fingerprint(),
+        'base_checkpoint': absolute(args.resume),
+        'memory_checkpoint': absolute(args.memory_checkpoint),
+        'semantic_store': absolute(args.semantic_store),
+        'critic_checkpoint': absolute(args.critic_checkpoint),
     }, save_path)
 
-    print(f"\n" + "="*80)
-    print(f"✓ Optimized meta-controller saved to: {save_path}")
-    print("="*80)
-    print("\nStage 3: RL Training Complete!")
-    print("="*80 + "\n")
+    print(f"\n{'='*80}")
+    print(f"✓ Policy saved to: {save_path}")
+    print("  Rebuild the full engine with MANTISInferenceEngine.from_checkpoints(policy_checkpoint=...)")
+    print("=" * 80 + "\n")

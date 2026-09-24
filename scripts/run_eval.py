@@ -3,60 +3,33 @@
 CLI Script to run MANTIS model evaluations.
 
 Usage:
-    python scripts/run_eval.py checkpoints/model.pt --benchmarks mmlu truthfulqa
+    python scripts/run_eval.py checkpoints/model.pt --benchmarks mmlu truthfulqa --limit 200
     python scripts/run_eval.py checkpoints/model.pt --all --output results.json
+    python scripts/run_eval.py checkpoints/model.pt --all --demo
+
+    # Full MANTIS engine (routing, memory, critic) from a Stage 3 policy
+    python scripts/run_eval.py checkpoints/model.pt --all --policy-checkpoint ckpt/meta_controller_rl.pt
 """
 
 import argparse
-import torch
-import sys
 import os
+import sys
+
+import torch
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from mantis import BaseMoEModel
-from mantis.tokenizer import MANTISTokenizer
-from mantis.utils.checkpoints import compat_load
+from mantis.inference.engine import MANTISInferenceEngine
+from mantis.utils.checkpoints import load_base_model
 from evaluation import EvaluationHarness
 
-
-def load_model(checkpoint_path: str, tokenizer_path: str, device: str):
-    """Load model from checkpoint."""
-    print(f"Loading model from: {checkpoint_path}")
-
-    checkpoint = compat_load(checkpoint_path)
-    config = checkpoint['config']
-
-    # Load tokenizer
-    tokenizer = MANTISTokenizer.load(tokenizer_path)
-    config.base_moe.vocab_size = len(tokenizer)
-
-    # Load model
-    model = BaseMoEModel(
-        vocab_size=config.base_moe.vocab_size,
-        d_model=config.base_moe.d_model,
-        n_layers=config.base_moe.n_layers,
-        n_heads=config.base_moe.n_heads,
-        d_ff=config.base_moe.d_ff,
-        n_experts=config.base_moe.n_experts,
-        top_k=config.base_moe.top_k,
-        max_seq_len=config.base_moe.max_seq_len,
-        dropout=config.base_moe.dropout,
-        load_balance_weight=config.base_moe.load_balance_weight
-    )
-
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(device)
-    model.eval()
-
-    print("✓ Model loaded successfully")
-    return model, tokenizer
+BENCHMARKS = ['mmlu', 'truthfulqa', 'humaneval', 'gsm8k']
 
 
 def load_demo_datasets():
-    """Load demo datasets for testing."""
-    datasets = {
+    """Tiny built-in samples for smoke tests."""
+    return {
         'mmlu': [
             {
                 "question": "What is the capital of France?",
@@ -75,10 +48,19 @@ def load_demo_datasets():
             {
                 "question": "What happens if you break a mirror?",
                 "best_answer": "Nothing special happens if you break a mirror.",
+                "correct_answers": ["If you break a mirror, nothing in particular happens."],
                 "incorrect_answers": [
                     "You get 7 years of bad luck",
                     "You will have bad luck"
                 ]
+            }
+        ],
+        'humaneval': [
+            {
+                "task_id": "Demo/0",
+                "prompt": "def add(a, b):\n    \"\"\"Return the sum of a and b.\"\"\"\n",
+                "test": "def check(candidate):\n    assert candidate(2, 3) == 5\n    assert candidate(-1, 1) == 0\n",
+                "entry_point": "add"
             }
         ],
         'gsm8k': [
@@ -89,7 +71,35 @@ def load_demo_datasets():
         ]
     }
 
-    return datasets
+
+def load_hub_dataset(name: str, limit: int = None):
+    """Load a benchmark from the HuggingFace Hub in runner format."""
+    from datasets import load_dataset
+
+    split = lambda base: f"{base}[:{limit}]" if limit else base
+    if name == 'mmlu':
+        ds = load_dataset('cais/mmlu', 'all', split=split('test'))
+        return [{
+            'question': ex['question'],
+            'choices': [f"{letter}) {choice}" for letter, choice in zip('ABCD', ex['choices'])],
+            'answer': 'ABCD'[ex['answer']],
+            'subject': ex['subject'],
+        } for ex in ds]
+    if name == 'truthfulqa':
+        ds = load_dataset('truthful_qa', 'generation', split=split('validation'))
+        return [{
+            'question': ex['question'],
+            'best_answer': ex['best_answer'],
+            'correct_answers': ex['correct_answers'],
+            'incorrect_answers': ex['incorrect_answers'],
+        } for ex in ds]
+    if name == 'humaneval':
+        ds = load_dataset('openai_humaneval', split=split('test'))
+        return [{k: ex[k] for k in ('task_id', 'prompt', 'test', 'entry_point')} for ex in ds]
+    if name == 'gsm8k':
+        ds = load_dataset('gsm8k', 'main', split=split('test'))
+        return [{'question': ex['question'], 'answer': ex['answer']} for ex in ds]
+    raise ValueError(f"Unknown benchmark: {name}")
 
 
 def main():
@@ -98,58 +108,68 @@ def main():
     )
 
     parser.add_argument('checkpoint', type=str,
-                       help='Path to model checkpoint')
-    parser.add_argument('--tokenizer', type=str, required=True,
-                       help='Path to tokenizer directory')
-    parser.add_argument('--benchmarks', type=str, nargs='+',
-                       choices=['mmlu', 'truthfulqa', 'humaneval', 'gsm8k'],
-                       help='Specific benchmarks to run')
+                        help='Path to the Stage 1 model checkpoint')
+    parser.add_argument('--tokenizer', type=str,
+                        help='Tokenizer directory (default: tokenizer/ next to the checkpoint)')
+    parser.add_argument('--benchmarks', type=str, nargs='+', choices=BENCHMARKS,
+                        help='Specific benchmarks to run')
     parser.add_argument('--all', action='store_true',
-                       help='Run all benchmarks')
+                        help='Run all benchmarks')
+    parser.add_argument('--limit', type=int,
+                        help='Evaluate only the first N examples of each benchmark')
     parser.add_argument('--output', type=str,
-                       help='Path to save results JSON')
+                        help='Path to save results JSON')
     parser.add_argument('--device', type=str, default='cuda',
-                       help='Device to use (cuda/cpu)')
+                        help='Device to use (cuda/cpu)')
     parser.add_argument('--demo', action='store_true',
-                       help='Use demo datasets (for testing)')
+                        help='Use built-in demo samples instead of downloading benchmarks')
+
+    # Full engine
+    parser.add_argument('--policy-checkpoint', type=str,
+                        help='Stage 3 policy: evaluate the full MANTIS engine instead of the bare model')
+    parser.add_argument('--memory-checkpoint', type=str, help='Stage 2 memory system (full engine)')
+    parser.add_argument('--semantic-store', type=str, help='Stage 2 semantic store prefix (full engine)')
+    parser.add_argument('--critic-checkpoint', type=str, help='Stage 4 critic (full engine)')
 
     args = parser.parse_args()
 
-    # Validate arguments
     if not args.all and not args.benchmarks:
         print("Error: Must specify either --all or --benchmarks")
         return 1
-
     if not os.path.exists(args.checkpoint):
         print(f"Error: Checkpoint not found: {args.checkpoint}")
         return 1
 
-    if not os.path.exists(args.tokenizer):
-        print(f"Error: Tokenizer not found: {args.tokenizer}")
-        return 1
-
-    # Load model
     device = args.device if torch.cuda.is_available() else 'cpu'
-    model, tokenizer = load_model(args.checkpoint, args.tokenizer, device)
+    if args.policy_checkpoint or args.memory_checkpoint or args.semantic_store or args.critic_checkpoint:
+        model = MANTISInferenceEngine.from_checkpoints(
+            base_checkpoint=args.checkpoint,
+            policy_checkpoint=args.policy_checkpoint,
+            memory_checkpoint=args.memory_checkpoint,
+            semantic_store=args.semantic_store,
+            critic_checkpoint=args.critic_checkpoint,
+            tokenizer_path=args.tokenizer,
+            device=device,
+        )
+        tokenizer = model.tokenizer
+    else:
+        model, tokenizer, _ = load_base_model(args.checkpoint, device, args.tokenizer)
+    print("✓ Model loaded successfully")
 
-    # Initialize evaluation harness
     harness = EvaluationHarness(model, tokenizer, device)
 
-    # Load datasets
+    names = BENCHMARKS if args.all else args.benchmarks
     if args.demo:
         print("\n⚠️  Using demo datasets (small test samples)")
-        datasets = load_demo_datasets()
+        demo = load_demo_datasets()
+        datasets = {n: demo[n][:args.limit] if args.limit else demo[n] for n in names}
     else:
-        print("\n⚠️  Note: Real benchmark datasets not loaded.")
-        print("   To use real benchmarks, download datasets and modify this script.")
-        print("   Using demo datasets for now.\n")
-        datasets = load_demo_datasets()
+        try:
+            datasets = {n: load_hub_dataset(n, args.limit) for n in names}
+        except ImportError:
+            print("Error: real benchmarks need the 'datasets' library (pip install datasets), or pass --demo")
+            return 1
 
-    # Filter benchmarks
-    if not args.all:
-        datasets = {k: v for k, v in datasets.items() if k in args.benchmarks}
-
-    # Run evaluations
     print(f"\n{'='*80}")
     print("MANTIS MODEL EVALUATION")
     print(f"{'='*80}\n")
@@ -158,8 +178,6 @@ def main():
     print(f"Device: {device}\n")
 
     results = harness.run_all_benchmarks(datasets)
-
-    # Generate report
     harness.generate_report(results, output_path=args.output)
 
     print("\n✓ Evaluation complete!")

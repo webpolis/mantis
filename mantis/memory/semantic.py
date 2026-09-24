@@ -1,472 +1,279 @@
 """
 Semantic Memory System
 
-Long-term knowledge storage using FAISS vector database.
+Long-term knowledge storage using a FAISS vector index.
 """
 
-import torch
-import numpy as np
-from typing import List, Dict, Optional, Tuple
-import faiss
-import pickle
+import math
 import os
+import pickle
+import threading
+from collections import OrderedDict
+from typing import Dict, List, Optional, Tuple
+
+import faiss
+import numpy as np
+import torch
+import torch.nn as nn
 
 
 class SemanticMemory:
     """
-    Long-term knowledge storage using FAISS vector database.
+    Long-term knowledge storage using a FAISS vector index.
 
-    Stores facts with:
-    - Dense vector embeddings
-    - Metadata (source, confidence, timestamp)
-    - Efficient approximate nearest neighbor search
+    - Every vector has a stable ID; metadata lives in an ordered dict keyed by it.
+    - Eviction (FIFO) tombstones IDs instead of shifting positions. Searches
+      over-fetch by the tombstone count and skip evicted IDs; the index is
+      rebuilt once more than 20% of its vectors are tombstones.
+    - IVF indexes serve exact flat search until MIN_IVF_TRAIN entries exist,
+      then train with a cluster count sized to the data.
+    - An optional `projection` (trained in Stage 2) maps base-model embeddings
+      into retrieval space. Vectors are L2-normalized before indexing.
+    - All operations hold a re-entrant lock, so background consolidation and
+      inference can share one instance.
     """
+
+    MIN_IVF_TRAIN = 10_000
 
     def __init__(
         self,
-        dimension: int = 1536,
+        dimension: int = 2048,
         max_entries: int = 1_000_000,
         index_type: str = 'IVF',
-        use_gpu: bool = True
+        use_gpu: bool = True,
+        projection: Optional[nn.Module] = None,
     ):
+        if index_type not in ('Flat', 'IVF', 'HNSW'):
+            raise ValueError(f"Unknown index type: {index_type}")
         self.dimension = dimension
         self.max_entries = max_entries
         self.index_type = index_type
         self.use_gpu = use_gpu and faiss.get_num_gpus() > 0
+        self.projection = projection
 
-        # Initialize FAISS index
-        self._init_index()
-
-        # Metadata storage (parallel to FAISS index)
-        # Each entry: {'text': str, 'embedding': np.ndarray, 'embedding_id': int, 'metadata': dict}
-        self.metadata = []
-
-        # Store embeddings for index training (IVF only)
-        # Cleared after training to save memory, but embeddings are kept in self.metadata
-        self.embeddings_cache = []
-
-        # Temporary flat index for exact search before IVF is trained
-        if self.index_type == 'IVF':
-            self.pre_train_index = faiss.IndexFlatL2(self.dimension)
-        else:
-            self.pre_train_index = None
-
-        # Sequential ID counter for IndexIDMap
+        self._lock = threading.RLock()
+        self.entries: 'OrderedDict[int, Dict]' = OrderedDict()
         self._next_id = 0
-        # Track stale (removed) entries for IVF deferred rebuild
-        self._stale_count = 0
+        self._stale = 0
+        self.index_trained = index_type != 'IVF'
+        self._quantizer = None
+        self._gpu_resources = None
+        self.index = self._to_device(self._empty_index())
 
-    def _init_index(self):
-        """Initialize FAISS index based on type."""
-        if self.index_type == 'Flat':
-            # Exact search with ID map for efficient deletion
-            base_index = faiss.IndexFlatL2(self.dimension)
-            self.index = faiss.IndexIDMap(base_index)
+    # ------------------------------------------------------------------ index
 
-        elif self.index_type == 'IVF':
-            # IVF with PQ compression (fast approximate search)
-            n_clusters = min(16384, self.max_entries // 100)
-            quantizer = faiss.IndexFlatL2(self.dimension)
-
-            # PQ code size must divide dimension evenly
-            code_size = min(128, self.dimension)
-            while self.dimension % code_size != 0:
-                code_size -= 1
-
-            self.index = faiss.IndexIVFPQ(
-                quantizer,
-                self.dimension,
-                n_clusters,
-                code_size,
-                8     # bits per sub-quantizer
-            )
-
-            # Need training before use
-            self.index_trained = False
-
-        elif self.index_type == 'HNSW':
-            # Hierarchical NSW graph with ID map for deletion support
-            base_index = faiss.IndexHNSWFlat(self.dimension, 32)
-            base_index.hnsw.efConstruction = 40
-            base_index.hnsw.efSearch = 16
-            self.index = faiss.IndexIDMap(base_index)
-
+    def _empty_index(self):
+        if self.index_type == 'HNSW':
+            base = faiss.IndexHNSWFlat(self.dimension, 32)
+            base.hnsw.efConstruction = 40
+            base.hnsw.efSearch = 16
         else:
-            raise ValueError(f"Unknown index type: {self.index_type}")
+            base = faiss.IndexFlatL2(self.dimension)
+        return faiss.IndexIDMap(base)
 
-        # Move to GPU if available
-        if self.use_gpu:
-            try:
-                res = faiss.StandardGpuResources()
-                self.index = faiss.index_cpu_to_gpu(res, 0, self.index)
-            except Exception as e:
-                print(f"Failed to move to GPU: {e}. Using CPU.")
-                self.use_gpu = False
+    def _ivf_index(self, vectors: np.ndarray, ids: np.ndarray):
+        """Train an IVF-PQ index sized to `vectors` (≥39 points per cluster)."""
+        n = len(vectors)
+        nlist = max(1, min(int(4 * math.sqrt(n)), n // 39))
+        n_subquantizers = max(m for m in range(1, min(64, self.dimension) + 1) if self.dimension % m == 0)
+        self._quantizer = faiss.IndexFlatL2(self.dimension)
+        index = faiss.IndexIVFPQ(self._quantizer, self.dimension, nlist, n_subquantizers, 8)
+        index.train(vectors)
+        index.nprobe = min(nlist, 16)
+        index.add_with_ids(vectors, ids)
+        return index
 
-    def add(
-        self,
-        embedding: np.ndarray,
-        text: str,
-        metadata: Optional[Dict] = None
-    ) -> None:
+    def _to_device(self, index):
+        if not self.use_gpu:
+            return index
+        try:
+            self._gpu_resources = self._gpu_resources or faiss.StandardGpuResources()
+            return faiss.index_cpu_to_gpu(self._gpu_resources, 0, index)
+        except Exception as e:
+            print(f"Keeping FAISS index on CPU: {e}")
+            return index
+
+    def _rebuild(self):
+        """Rebuild the index from live entries, dropping tombstones."""
+        ids = np.fromiter(self.entries.keys(), dtype=np.int64, count=len(self.entries))
+        vectors = (np.vstack([e['vector'] for e in self.entries.values()])
+                   if self.entries else np.zeros((0, self.dimension), dtype='float32'))
+
+        if self.index_type == 'IVF' and len(ids) >= self.MIN_IVF_TRAIN:
+            print(f"Training FAISS IVF index on {len(ids)} entries...")
+            index = self._ivf_index(vectors, ids)
+            self.index_trained = True
+        else:
+            index = self._empty_index()
+            if len(ids):
+                index.add_with_ids(vectors, ids)
+            self.index_trained = self.index_type != 'IVF'
+        self.index = self._to_device(index)
+        self._stale = 0
+
+    # ------------------------------------------------------------ vectorizing
+
+    def _vectors(self, embeddings) -> np.ndarray:
+        """(n, dimension) float32, projected and L2-normalized."""
+        x = torch.as_tensor(embeddings).detach().float()
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        if self.projection is not None:
+            with torch.no_grad():
+                device = next(self.projection.parameters()).device
+                x = self.projection(x.to(device)).float()
+        x = x / x.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        return np.ascontiguousarray(x.cpu().numpy(), dtype='float32')
+
+    # ------------------------------------------------------------------ write
+
+    def add(self, embedding, text: str, metadata: Optional[Dict] = None) -> int:
         """
         Add a new entry to semantic memory.
 
         Args:
-            embedding: (dimension,) vector embedding
+            embedding: (dimension,) base-model embedding (tensor or array)
             text: Original text of the fact
             metadata: Optional dict with source, confidence, timestamp, etc.
+
+        Returns:
+            The entry id
         """
-        # Handle capacity
-        if len(self.metadata) >= self.max_entries:
-            self._remove_oldest(int(0.1 * self.max_entries))
+        return self.add_batch(embedding, [text], [metadata or {}])[0]
 
-        # Ensure correct shape and type
-        if isinstance(embedding, torch.Tensor):
-            embedding = embedding.cpu().numpy()
-
-        embedding = embedding.astype('float32').reshape(1, -1)
-
-        # Train index if needed (IVF requires training)
-        if self.index_type == 'IVF' and not self.index_trained:
-            if len(self.metadata) >= 10000:  # Minimum training size
-                self._train_index()
-
-        # Assign a unique ID to this entry
-        entry_id = self._next_id
-        self._next_id += 1
-
-        # Add to index
-        if self.index_type == 'IVF' and not self.index_trained:
-            # IVF not trained yet: add to temporary flat index for exact search
-            self.pre_train_index.add(embedding)
-        elif self.index_type == 'IVF':
-            self.index.add(embedding)
-        else:
-            # Flat/HNSW use IndexIDMap, require add_with_ids
-            ids = np.array([entry_id], dtype=np.int64)
-            self.index.add_with_ids(embedding, ids)
-
-        # Store metadata with embedding for rebuilding
-        entry = {
-            'text': text,
-            'embedding': embedding.copy(),
-            'embedding_id': entry_id,
-            'metadata': metadata or {}
-        }
-        self.metadata.append(entry)
-
-        # Cache embedding for index training (IVF only, cleared after training)
-        if self.index_type == 'IVF' and not self.index_trained:
-            self.embeddings_cache.append(embedding.copy())
-
-    def add_batch(
-        self,
-        embeddings: np.ndarray,
-        texts: List[str],
-        metadata_list: Optional[List[Dict]] = None
-    ) -> None:
+    def add_batch(self, embeddings, texts: List[str], metadata_list: Optional[List[Dict]] = None) -> List[int]:
         """
-        Add multiple entries at once (more efficient).
+        Add multiple entries at once.
 
         Args:
             embeddings: (n, dimension) batch of embeddings
             texts: List of text strings
             metadata_list: Optional list of metadata dicts
+
+        Returns:
+            List of entry ids
         """
-        if isinstance(embeddings, torch.Tensor):
-            embeddings = embeddings.cpu().numpy()
+        vectors = self._vectors(embeddings)
+        n = len(vectors)
+        if len(texts) != n:
+            raise ValueError(f"{n} embeddings but {len(texts)} texts")
+        metadata_list = metadata_list or [{} for _ in range(n)]
 
-        embeddings = embeddings.astype('float32')
-        n = embeddings.shape[0]
+        with self._lock:
+            overflow = len(self.entries) + n - self.max_entries
+            if overflow > 0:
+                self._evict(max(overflow, int(0.1 * self.max_entries)))
 
-        if metadata_list is None:
-            metadata_list = [{}] * n
+            ids = np.arange(self._next_id, self._next_id + n, dtype=np.int64)
+            self._next_id += n
+            self.index.add_with_ids(vectors, ids)
+            for i, entry_id in enumerate(ids.tolist()):
+                self.entries[entry_id] = {
+                    'text': texts[i],
+                    'vector': vectors[i:i + 1],
+                    'metadata': metadata_list[i],
+                }
 
-        # Add to index
-        if self.index_type == 'IVF' and not self.index_trained:
-            # Collect training data
-            if len(self.metadata) + n >= 10000:
-                self._train_index()
+            if (not self.index_trained and len(self.entries) >= self.MIN_IVF_TRAIN) \
+                    or self._stale > 0.2 * max(1, self.index.ntotal):
+                self._rebuild()
+            return ids.tolist()
 
-        # Assign IDs for this batch
-        batch_ids = np.arange(self._next_id, self._next_id + n, dtype=np.int64)
-        self._next_id += n
+    def _evict(self, n: int):
+        """Tombstone the n oldest entries (FIFO)."""
+        for _ in range(min(n, len(self.entries))):
+            self.entries.popitem(last=False)
+            self._stale += 1
 
-        if self.index_type == 'IVF' and self.index_trained:
-            self.index.add(embeddings)
-        elif self.index_type == 'IVF' and not self.index_trained:
-            if self.pre_train_index is not None:
-                self.pre_train_index.add(embeddings)
-        else:
-            # Flat/HNSW use IndexIDMap
-            self.index.add_with_ids(embeddings, batch_ids)
+    # ------------------------------------------------------------------- read
 
-        # Store metadata with embeddings for rebuilding
-        for i in range(n):
-            entry = {
-                'text': texts[i],
-                'embedding': embeddings[i:i+1].copy(),
-                'embedding_id': int(batch_ids[i]),
-                'metadata': metadata_list[i]
-            }
-            self.metadata.append(entry)
+    def _search(self, query_embedding, top_k: int) -> List[Tuple[Dict, float]]:
+        vector = self._vectors(query_embedding)
+        with self._lock:
+            if not self.entries:
+                return []
+            k = min(top_k + self._stale, self.index.ntotal)
+            distances, ids = self.index.search(vector, k)
+            hits = []
+            for entry_id, dist in zip(ids[0].tolist(), distances[0].tolist()):
+                entry = self.entries.get(entry_id)
+                if entry is not None:
+                    hits.append((entry, dist))
+                if len(hits) == top_k:
+                    break
+            return hits
 
-        # Cache embeddings for index training (IVF only, cleared after training)
-        if self.index_type == 'IVF' and not self.index_trained:
-            for i in range(n):
-                self.embeddings_cache.append(embeddings[i:i+1].copy())
-
-    def retrieve(
-        self,
-        query_embedding: torch.Tensor,
-        top_k: int = 5,
-        return_distances: bool = False
-    ) -> List[str]:
+    def retrieve(self, query_embedding, top_k: int = 5, return_distances: bool = False):
         """
         Retrieve most relevant facts.
 
         Args:
-            query_embedding: (dimension,) query vector
+            query_embedding: (dimension,) base-model query embedding
             top_k: Number of results to return
-            return_distances: Also return similarity scores
+            return_distances: Also return L2 distances
 
         Returns:
-            List of text strings (facts), optionally with distances
+            List of fact texts, or (texts, distances)
         """
-        if len(self.metadata) == 0:
-            return [] if not return_distances else ([], [])
-
-        # Prepare query
-        if isinstance(query_embedding, torch.Tensor):
-            query_embedding = query_embedding.cpu().numpy()
-
-        query_embedding = query_embedding.astype('float32').reshape(1, -1)
-
-        # Search (use pre-train index if IVF not yet trained)
-        search_index = self.index
-        if self.index_type == 'IVF' and not self.index_trained and self.pre_train_index is not None:
-            search_index = self.pre_train_index
-
-        try:
-            distances, indices = search_index.search(query_embedding, min(top_k, len(self.metadata)))
-        except Exception as e:
-            print(f"Search failed: {e}")
-            return [] if not return_distances else ([], [])
-
-        # Retrieve corresponding text
-        # For IndexIDMap (Flat/HNSW), search returns custom IDs, not positional indices
-        # For IVF and pre_train_index, search returns positional indices
-        uses_id_map = self.index_type in ('Flat', 'HNSW') and search_index is self.index
-
-        results = []
-        result_distances = []
-
-        if uses_id_map:
-            # Build ID -> metadata lookup
-            id_to_entry = {entry['embedding_id']: entry for entry in self.metadata}
-            for idx, dist in zip(indices[0], distances[0]):
-                if idx != -1 and idx in id_to_entry:
-                    results.append(id_to_entry[idx]['text'])
-                    result_distances.append(float(dist))
-        else:
-            for idx, dist in zip(indices[0], distances[0]):
-                if idx != -1 and 0 <= idx < len(self.metadata):
-                    results.append(self.metadata[idx]['text'])
-                    result_distances.append(float(dist))
-
+        hits = self._search(query_embedding, top_k)
+        texts = [entry['text'] for entry, _ in hits]
         if return_distances:
-            return results, result_distances
-        else:
-            return results
+            return texts, [dist for _, dist in hits]
+        return texts
 
-    def retrieve_with_metadata(
-        self,
-        query_embedding: torch.Tensor,
-        top_k: int = 5
-    ) -> List[Dict]:
+    def retrieve_with_metadata(self, query_embedding, top_k: int = 5) -> List[Dict]:
         """
-        Retrieve facts with full metadata using FAISS index positions directly.
-
         Returns:
             List of dicts with 'text', 'distance', 'metadata'
         """
-        if len(self.metadata) == 0:
-            return []
-
-        if isinstance(query_embedding, torch.Tensor):
-            query_embedding = query_embedding.cpu().numpy()
-
-        query_embedding = query_embedding.astype('float32').reshape(1, -1)
-
-        search_index = self.index
-        if self.index_type == 'IVF' and not self.index_trained and self.pre_train_index is not None:
-            search_index = self.pre_train_index
-
-        try:
-            distances, indices = search_index.search(query_embedding, min(top_k, len(self.metadata)))
-        except Exception as e:
-            print(f"Search failed: {e}")
-            return []
-
-        uses_id_map = self.index_type in ('Flat', 'HNSW') and search_index is self.index
-
-        results = []
-        if uses_id_map:
-            id_to_entry = {entry['embedding_id']: entry for entry in self.metadata}
-            for idx, dist in zip(indices[0], distances[0]):
-                if idx != -1 and idx in id_to_entry:
-                    entry = id_to_entry[idx]
-                    results.append({
-                        'text': entry['text'],
-                        'distance': float(dist),
-                        'metadata': entry['metadata']
-                    })
-        else:
-            for idx, dist in zip(indices[0], distances[0]):
-                if idx != -1 and 0 <= idx < len(self.metadata):
-                    entry = self.metadata[idx]
-                    results.append({
-                        'text': entry['text'],
-                        'distance': float(dist),
-                        'metadata': entry['metadata']
-                    })
-
-        return results
-
-    def _train_index(self):
-        """Train IVF index with current data."""
-        if self.index_type != 'IVF' or self.index_trained:
-            return
-
-        print(f"Training FAISS index with {len(self.metadata)} samples...")
-
-        # Use cached embeddings for training
-        if len(self.embeddings_cache) > 0:
-            training_data = np.vstack(self.embeddings_cache).astype('float32')
-        else:
-            print("Warning: No cached embeddings, cannot train index")
-            return
-
-        self.index.train(training_data)
-
-        # Re-add all embeddings to the trained index
-        self.index.add(training_data)
-
-        self.index_trained = True
-
-        # Clear training cache and pre-train index to save memory
-        self.embeddings_cache = []
-        self.pre_train_index = None
-
-        print("Index training complete.")
-
-    def _remove_oldest(self, n: int):
-        """Remove n oldest entries (FIFO)."""
-        removed_entries = self.metadata[:n]
-        self.metadata = self.metadata[n:]
-
-        if self.index_type == 'IVF':
-            # IVF doesn't support efficient deletion via remove_ids
-            # Track stale entries and only rebuild when >20% are stale
-            self._stale_count += n
-            total_indexed = self.index.ntotal if self.index_trained else 0
-            if total_indexed > 0 and self._stale_count / total_indexed > 0.2:
-                self._rebuild_index()
-                self._stale_count = 0
-        else:
-            # Flat/HNSW use IndexIDMap which supports remove_ids
-            ids_to_remove = np.array(
-                [entry['embedding_id'] for entry in removed_entries],
-                dtype=np.int64
-            )
-            self.index.remove_ids(ids_to_remove)
-
-    def _rebuild_index(self):
-        """Rebuild index from scratch (expensive operation)."""
-        print(f"Rebuilding FAISS index with {len(self.metadata)} entries...")
-
-        # Reinitialize index
-        self._init_index()
-        self.pre_train_index = faiss.IndexFlatL2(self.dimension) if self.index_type == 'IVF' else None
-        self._stale_count = 0
-
-        if len(self.metadata) == 0:
-            print("Index rebuild complete (no entries to add).")
-            return
-
-        # Extract embeddings from metadata
-        embeddings = np.vstack([entry['embedding'] for entry in self.metadata]).astype('float32')
-
-        # Train index if needed (IVF)
-        if self.index_type == 'IVF':
-            if len(embeddings) >= 10000:
-                print(f"  Training IVF index with {len(embeddings)} samples...")
-                self.index.train(embeddings)
-                self.index_trained = True
-            else:
-                print(f"  Warning: Only {len(embeddings)} samples, need >=10000 for training. Index remains untrained.")
-                self.index_trained = False
-
-        # Re-add all embeddings to the rebuilt index
-        if self.index_type == 'IVF' and self.index_trained:
-            self.index.add(embeddings)
-            self.pre_train_index = None
-            print(f"  Re-added {len(embeddings)} embeddings to index.")
-        elif self.index_type == 'IVF':
-            # Add to pre-train flat index for exact search until IVF is trained
-            self.pre_train_index.add(embeddings)
-            self.embeddings_cache = [embeddings[i:i+1].copy() for i in range(len(embeddings))]
-            print(f"  Added {len(embeddings)} embeddings to pre-train index.")
-        else:
-            # Flat/HNSW use IndexIDMap with add_with_ids
-            ids = np.array([entry['embedding_id'] for entry in self.metadata], dtype=np.int64)
-            self.index.add_with_ids(embeddings, ids)
-            print(f"  Re-added {len(embeddings)} embeddings to index.")
-
-        print("Index rebuild complete.")
+        return [
+            {'text': entry['text'], 'distance': dist, 'metadata': entry['metadata']}
+            for entry, dist in self._search(query_embedding, top_k)
+        ]
 
     def size(self) -> int:
-        """Return number of entries."""
-        return len(self.metadata)
+        """Return number of live entries."""
+        with self._lock:
+            return len(self.entries)
+
+    # ------------------------------------------------------------ persistence
 
     def save(self, path: str):
-        """Save semantic memory to disk."""
-        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
+        """Save to `{path}.index` (FAISS) and `{path}.meta` (entries and counters)."""
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with self._lock:
+            index = faiss.index_gpu_to_cpu(self.index) if self.use_gpu else self.index
+            faiss.write_index(index, f"{path}.index")
+            with open(f"{path}.meta", 'wb') as f:
+                pickle.dump({
+                    'dimension': self.dimension,
+                    'max_entries': self.max_entries,
+                    'index_type': self.index_type,
+                    'index_trained': self.index_trained,
+                    'entries': self.entries,
+                    'next_id': self._next_id,
+                    'stale': self._stale,
+                    'projection': self.projection.cpu() if self.projection is not None else None,
+                }, f)
+        print(f"Saved semantic memory to {path} ({len(self.entries)} entries)")
 
-        # Save FAISS index
-        faiss_index = faiss.index_gpu_to_cpu(self.index) if self.use_gpu else self.index
-        faiss.write_index(faiss_index, f"{path}.index")
-
-        # Save metadata
-        with open(f"{path}.meta", 'wb') as f:
-            pickle.dump({
-                'metadata': self.metadata,
-                'dimension': self.dimension,
-                'index_type': self.index_type,
-                'index_trained': getattr(self, 'index_trained', True)
-            }, f)
-
-        print(f"Saved semantic memory to {path}")
-
-    def load(self, path: str):
-        """Load semantic memory from disk."""
-        # Load FAISS index
-        self.index = faiss.read_index(f"{path}.index")
-
-        if self.use_gpu:
-            try:
-                res = faiss.StandardGpuResources()
-                self.index = faiss.index_cpu_to_gpu(res, 0, self.index)
-            except:
-                self.use_gpu = False
-
-        # Load metadata
+    @classmethod
+    def load(cls, path: str, use_gpu: bool = True) -> 'SemanticMemory':
+        """Load a memory saved with save()."""
         with open(f"{path}.meta", 'rb') as f:
             data = pickle.load(f)
-            self.metadata = data['metadata']
-            self.dimension = data['dimension']
-            self.index_type = data['index_type']
-            self.index_trained = data.get('index_trained', True)
 
-        print(f"Loaded semantic memory from {path} ({len(self.metadata)} entries)")
+        memory = cls(
+            dimension=data['dimension'],
+            max_entries=data['max_entries'],
+            index_type=data['index_type'],
+            use_gpu=use_gpu,
+            projection=data['projection'],
+        )
+        memory.entries = data['entries']
+        memory._next_id = data['next_id']
+        memory._stale = data['stale']
+        memory.index_trained = data['index_trained']
+        memory.index = memory._to_device(faiss.read_index(f"{path}.index"))
+        print(f"Loaded semantic memory from {path} ({len(memory.entries)} entries)")
+        return memory

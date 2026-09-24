@@ -21,7 +21,7 @@ class CriticModel(nn.Module):
 
     def __init__(
         self,
-        vocab_size: int = 128000,
+        vocab_size: int = 512,
         d_model: int = 1024,
         n_layers: int = 12,
         n_heads: int = 16,
@@ -106,17 +106,16 @@ class CriticModel(nn.Module):
         )
         x = self.dropout(x)
 
-        # Attention mask - TransformerEncoder expects boolean (True for padded positions)
-        if attention_mask is not None:
-            attention_mask = attention_mask.bool()
-            # Invert if necessary: True should indicate positions to IGNORE
-            attention_mask = ~attention_mask
+        # TransformerEncoder expects True for padded positions to IGNORE
+        padding_mask = ~attention_mask.bool() if attention_mask is not None else None
+        encoded = self.encoder(x, src_key_padding_mask=padding_mask)
 
-        # Encode
-        encoded = self.encoder(x, src_key_padding_mask=attention_mask)
-
-        # Mean pooling (no dedicated CLS token in this architecture)
-        pooled = encoded.mean(dim=1)  # (batch, d_model)
+        # Mean pooling over real tokens (no dedicated CLS token in this architecture)
+        if attention_mask is None:
+            pooled = encoded.mean(dim=1)
+        else:
+            mask = attention_mask.unsqueeze(-1).to(encoded.dtype)
+            pooled = (encoded * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
 
         # Predictions
         correctness = self.correctness_head(pooled)
@@ -124,35 +123,48 @@ class CriticModel(nn.Module):
 
         return correctness, confidence
 
+    def build_input(
+        self,
+        query_ids: list,
+        response_ids: list,
+        facts_ids: Optional[list] = None,
+    ) -> Tuple[list, list]:
+        """
+        Concatenate [query, response, facts] within max_seq_len.
+
+        Query keeps its last max_seq_len/4 tokens, facts their first
+        max_seq_len/4, and the response gets the rest (truncated at the end).
+
+        Returns:
+            (input_ids, segment_ids) as lists
+        """
+        quarter = self.max_seq_len // 4
+        query = list(query_ids)[-quarter:]
+        facts = list(facts_ids or [])[:quarter]
+        response = list(response_ids)[:self.max_seq_len - len(query) - len(facts)]
+        input_ids = query + response + facts
+        segment_ids = [0] * len(query) + [1] * len(response) + [2] * len(facts)
+        return input_ids, segment_ids
+
+    @torch.no_grad()
     def verify(
         self,
-        query_ids: torch.Tensor,
-        response_ids: torch.Tensor,
-        facts_ids: Optional[torch.Tensor] = None
+        query_ids: list,
+        response_ids: list,
+        facts_ids: Optional[list] = None
     ) -> float:
         """
-        Convenience method for verification.
+        Score one (query, response, facts) triple given as token ID lists.
 
         Returns:
             Scalar correctness probability
         """
-        # Concatenate inputs
-        if facts_ids is not None:
-            input_ids = torch.cat([query_ids, response_ids, facts_ids], dim=1)
-            segment_ids = torch.cat([
-                torch.zeros_like(query_ids),
-                torch.ones_like(response_ids),
-                torch.ones_like(facts_ids) * 2
-            ], dim=1)
-        else:
-            input_ids = torch.cat([query_ids, response_ids], dim=1)
-            segment_ids = torch.cat([
-                torch.zeros_like(query_ids),
-                torch.ones_like(response_ids)
-            ], dim=1)
-
-        correctness, confidence = self.forward(input_ids, segment_ids)
-
+        input_ids, segment_ids = self.build_input(query_ids, response_ids, facts_ids)
+        device = self.token_embedding.weight.device
+        correctness, _ = self.forward(
+            torch.tensor([input_ids], device=device),
+            torch.tensor([segment_ids], device=device),
+        )
         return correctness.item()
 
     def compute_loss(

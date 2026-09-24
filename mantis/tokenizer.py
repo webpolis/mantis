@@ -2,8 +2,9 @@
 MANTIS Tokenizer — Trie-Based Domain-Specific Tokenizer
 
 Custom tokenizer for the MANTIS ecological evolution simulation format.
-Uses trie-based longest-match tokenization with ~300 domain tokens padded
-to 512 for tensor core alignment. No GPT-2 / BPE dependency.
+Uses trie-based longest-match tokenization with ~300 domain tokens plus a
+UTF-8 byte fallback, padded to 512 for tensor core alignment. No GPT-2 / BPE
+dependency. Every string round-trips losslessly through encode/decode.
 
 Numbers are always tokenized digit-by-digit for consistent encoding.
 All protocol markers, body plans, traits, and domain keywords are
@@ -33,9 +34,13 @@ Vocabulary (~300 tokens, padded to 512):
     Whitespace (3):     space newline 2-space-indent
     Letters (52):       a-z A-Z (character fallback)
     Agent tokens (12):  grid+ forage rest flock flee mate fl fk ...
+    Extra ASCII (18):   ! " # $ % & ' ; < > ? @ [ \\ ] ^ ` ~
+    Byte fallback (161): <0x00>-<0x1F>, <0x7F>-<0xFF> for any other character
 """
 
 from typing import List, Union, Optional, Dict, Set
+import codecs
+import hashlib
 import json
 import os
 import torch
@@ -165,6 +170,14 @@ WHITESPACE = [" ", "\n", "  "]  # space, newline, 2-space indent
 # We include all 26+26 letters for rare/unknown text fallback
 LETTERS = [chr(c) for c in range(ord('a'), ord('z') + 1)] + \
           [chr(c) for c in range(ord('A'), ord('Z') + 1)]
+
+# Printable ASCII characters not covered by any list above
+EXTRA_ASCII = ["!", '"', "#", "$", "%", "&", "'", ";", "<", ">", "?", "@",
+               "[", "\\", "]", "^", "`", "~"]
+
+# UTF-8 byte fallback for control characters and non-ASCII text
+BYTE_VALUES = list(range(0x00, 0x20)) + list(range(0x7F, 0x100))
+BYTE_TOKENS = [f"<0x{b:02X}>" for b in BYTE_VALUES]
 
 # Combined protocol tokens list (for analysis, excluding specials/digits/letters/whitespace)
 PROTOCOL_TOKENS = (
@@ -368,6 +381,14 @@ def _build_vocab() -> Dict[str, int]:
     for t in LETTERS:
         add(t)
 
+    # Remaining printable ASCII
+    for t in EXTRA_ASCII:
+        add(t)
+
+    # UTF-8 byte fallback
+    for t in BYTE_TOKENS:
+        add(t)
+
     # Pad to TARGET_VOCAB_SIZE with placeholder tokens
     while idx < TARGET_VOCAB_SIZE:
         placeholder = f"<reserved_{idx}>"
@@ -380,6 +401,11 @@ def _build_vocab() -> Dict[str, int]:
 # Canonical vocabulary — built once at module load
 VOCAB = _build_vocab()
 ID_TO_TOKEN = {v: k for k, v in VOCAB.items()}
+
+
+def _is_text_token(token: str) -> bool:
+    """Special, reserved and byte tokens (<...>) are never matched against text."""
+    return not (len(token) > 1 and token.startswith("<") and token.endswith(">"))
 
 
 # ---------------------------------------------------------------------------
@@ -399,15 +425,23 @@ class MANTISTokenizer:
         self.id_to_token = dict(ID_TO_TOKEN)
         self.vocab_size = len(self.vocab)
 
-        self._trie = _Trie()
-        for token, tid in self.vocab.items():
-            if not token.startswith("<"):  # skip special tokens in trie
-                self._trie.insert(token, tid)
-
         self._build_caches()
 
     def _build_caches(self):
-        """Build fast lookup structures for protocol token IDs and loss weights."""
+        """Build the trie and fast lookup structures for special, byte and protocol tokens."""
+        self._trie = _Trie()
+        for token, tid in self.vocab.items():
+            if _is_text_token(token):
+                self._trie.insert(token, tid)
+
+        self._byte_to_id: Dict[int, int] = {}
+        self._id_to_byte: Dict[int, int] = {}
+        for b in range(256):
+            tid = self.vocab.get(f"<0x{b:02X}>")
+            if tid is not None:
+                self._byte_to_id[b] = tid
+                self._id_to_byte[tid] = b
+
         self.pad_token_id = self.vocab["<pad>"]
         self.eos_token_id = self.vocab["<eos>"]
         self.bos_token_id = self.vocab["<bos>"]
@@ -419,11 +453,11 @@ class MANTISTokenizer:
             if marker in self.vocab:
                 self._marker_to_id[marker] = self.vocab[marker]
 
-        # Token ID → loss weight
-        self._id_to_weight: Dict[int, float] = {}
+        # Token ID → loss weight (-1 marks "not a layer marker")
+        self._marker_weights = torch.full((len(self.vocab),), -1.0)
         for marker, weight in LAYER_LOSS_WEIGHTS.items():
             if marker in self._marker_to_id:
-                self._id_to_weight[self._marker_to_id[marker]] = weight
+                self._marker_weights[self._marker_to_id[marker]] = weight
 
         # Reverse lookup: token ID → marker string
         self._id_to_marker: Dict[int, str] = {
@@ -448,14 +482,15 @@ class MANTISTokenizer:
                 ids.append(token_id)
                 i += length
             else:
-                ids.append(unk_id)
+                for b in text[i].encode("utf-8"):
+                    ids.append(self._byte_to_id.get(b, unk_id))
                 i += 1
         return ids
 
     def encode(
         self,
         text: Union[str, List[str]],
-        add_special_tokens: bool = True,
+        add_special_tokens: bool = False,
         max_length: int = None,
         truncation: bool = True,
         padding: bool = False,
@@ -491,12 +526,37 @@ class MANTISTokenizer:
             token_ids = token_ids.tolist()
 
         special_ids = {self.pad_token_id, self.eos_token_id, self.bos_token_id}
-        tokens = []
+        parts = []
+        pending = bytearray()
         for tid in token_ids:
+            if tid in self._id_to_byte:
+                pending.append(self._id_to_byte[tid])
+                continue
+            if pending:
+                parts.append(pending.decode("utf-8", errors="replace"))
+                pending = bytearray()
             if skip_special_tokens and tid in special_ids:
                 continue
-            tokens.append(self.id_to_token.get(tid, "<unk>"))
-        return "".join(tokens)
+            parts.append(self.id_to_token.get(tid, "<unk>"))
+        if pending:
+            parts.append(pending.decode("utf-8", errors="replace"))
+        return "".join(parts)
+
+    def stream_decoder(self, skip_special_tokens: bool = True) -> "StreamDecoder":
+        """Incremental decoder that holds back incomplete UTF-8 byte sequences."""
+        return StreamDecoder(self, skip_special_tokens)
+
+    @property
+    def non_generable_ids(self) -> List[int]:
+        """Token IDs that sampling must never emit: pad, bos, unk and reserved slots."""
+        ids = [self.pad_token_id, self.bos_token_id, self.unk_token_id]
+        ids += [tid for tok, tid in self.vocab.items() if tok.startswith("<reserved_")]
+        return ids
+
+    def fingerprint(self) -> str:
+        """Stable hash of the vocabulary, stored in checkpoints and datasets."""
+        payload = json.dumps(self.vocab, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
     def batch_decode(
         self,
@@ -528,27 +588,23 @@ class MANTISTokenizer:
 
         Pad tokens always get weight 0.0.
         """
-        squeeze = False
-        if input_ids.dim() == 1:
+        squeeze = input_ids.dim() == 1
+        if squeeze:
             input_ids = input_ids.unsqueeze(0)
-            squeeze = True
 
-        batch_size, seq_len = input_ids.shape
-        weights = torch.full(
-            (batch_size, seq_len), DEFAULT_LOSS_WEIGHT, dtype=torch.float32
+        table = self._marker_weights.to(input_ids.device)
+        marker_w = table[input_ids]                              # (B, S), -1 off-marker
+        is_marker = marker_w >= 0
+        positions = torch.arange(input_ids.size(1), device=input_ids.device).expand_as(input_ids)
+        last_marker = torch.where(is_marker, positions, torch.zeros_like(positions)).cummax(dim=1).values
+        seen = is_marker.long().cummax(dim=1).values.bool()
+
+        weights = torch.where(
+            seen,
+            marker_w.gather(1, last_marker),
+            torch.full_like(marker_w, DEFAULT_LOSS_WEIGHT),
         )
-
-        ids = input_ids.tolist()
-        pad = self.pad_token_id
-        for b in range(batch_size):
-            w = DEFAULT_LOSS_WEIGHT
-            for i, tid in enumerate(ids[b]):
-                if tid == pad:
-                    weights[b, i] = 0.0
-                    continue
-                if tid in self._id_to_weight:
-                    w = self._id_to_weight[tid]
-                weights[b, i] = w
+        weights = weights.masked_fill(input_ids == self.pad_token_id, 0.0)
 
         if squeeze:
             weights = weights.squeeze(0)
@@ -606,11 +662,22 @@ class MANTISTokenizer:
 
         instance.id_to_token = {v: k for k, v in instance.vocab.items()}
         instance.vocab_size = len(instance.vocab)
-
-        instance._trie = _Trie()
-        for token, tid in instance.vocab.items():
-            if not token.startswith("<"):
-                instance._trie.insert(token, tid)
-
         instance._build_caches()
         return instance
+
+
+class StreamDecoder:
+    """Decodes one token at a time, emitting text only once UTF-8 bytes complete."""
+
+    def __init__(self, tokenizer: MANTISTokenizer, skip_special_tokens: bool = True):
+        self._tok = tokenizer
+        self._skip = skip_special_tokens
+        self._bytes = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def push(self, token_id: int) -> str:
+        byte = self._tok._id_to_byte.get(token_id)
+        if byte is not None:
+            return self._bytes.decode(bytes([byte]))
+        flushed = self._bytes.decode(b"", final=True)
+        self._bytes.reset()
+        return flushed + self._tok.decode([token_id], skip_special_tokens=self._skip)

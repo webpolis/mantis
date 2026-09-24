@@ -3,7 +3,7 @@ Unified Training Script for MANTIS
 
 Supports:
 - Single-GPU and multi-GPU training (via HuggingFace Accelerate)
-- Proper tokenization (HuggingFace BPE or custom)
+- MANTIS trie tokenizer (blank-line separated documents, one EOS per document)
 - Pre-tokenized datasets (recommended for large-scale training)
 - HuggingFace datasets (direct from Hub with streaming support)
 - Auto-split validation (convenience mode) or pre-split validation (production mode)
@@ -22,6 +22,9 @@ Local files (production mode):
    python scripts/preprocess_data.py --input data/train.txt --output data/tokenized/train
    python scripts/split_dataset.py  # creates train_split and val
    python train.py data/tokenized/train_split --pretokenized --val-file data/tokenized/val
+
+Stages 2-4 take an optional JSONL file instead of text (see mantis/training/*):
+   python train.py --stage 2 data/memory.jsonl --resume ckpt.pt --tokenizer-path tok/
 
 HuggingFace datasets (no download):
    python train.py --hf-dataset roneneldan/TinyStories --hf-val-split validation --streaming --steps-per-epoch 1000
@@ -65,16 +68,14 @@ except Exception:
     pass
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from accelerate import Accelerator
+from torch.utils.data import Dataset, IterableDataset, DataLoader
+import json
 import math
 import argparse
-from pathlib import Path
 from tqdm import tqdm
 import warnings
-import mmap
+import numpy as np
 
 # Disable TF32 for cross-architecture compatibility
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -90,7 +91,11 @@ warnings.filterwarnings('ignore', message='.*lr_scheduler.step.*optimizer.step.*
 from mantis.models import BaseMoEModel
 from mantis.configs.model_config import get_micro_config, get_tiny_config, get_small_config, get_base_config
 from mantis.tokenizer import MANTISTokenizer
-from mantis.utils.checkpoints import compat_load
+from mantis.data import encode_documents, pack_windows, tokenize_file, num_windows, split_at_document, split_packed
+from mantis.utils.checkpoints import compat_load, check_tokenizer, save_training_checkpoint, restore_training_state
+from mantis.training.common import (
+    build_accelerator, build_optimizer, warmup_cosine_schedule, report_schedule, round_steps_to_accumulation,
+)
 from mantis.training.vram_estimator import (
     estimate_training_vram, compute_optimal_batch_sizes, format_vram_summary,
 )
@@ -104,120 +109,40 @@ except ImportError:
 
 class TextDataset(Dataset):
     """
-    Memory-efficient dataset for language modeling using streaming tokenization.
+    Windows of seq_len + 1 tokens over a flat token array (see mantis.data).
 
-    Tokenizes file in chunks without loading entire file into RAM.
-    Suitable for files up to ~100GB on systems with 16GB+ RAM.
-
-    For larger files, use:
-    - PreTokenizedDataset (scripts/preprocess_data.py)
-    - HuggingFace streaming datasets (--hf-dataset with --streaming)
+    Build the array with mantis.data.tokenize_file (text files) or
+    texts_to_tokens (HuggingFace examples).
     """
 
-    def __init__(self, file_path, tokenizer, seq_len=512, stride=None):
-        """
-        Args:
-            file_path: Path to text file
-            tokenizer: Tokenizer instance
-            seq_len: Sequence length
-            stride: Stride for overlapping sequences (default: seq_len for non-overlapping)
-        """
-        self.tokenizer = tokenizer
+    def __init__(self, tokens: np.ndarray, seq_len: int, stride: int, name: str = 'dataset'):
+        self.tokens = tokens
         self.seq_len = seq_len
-        self.stride = stride or seq_len
-
-        print(f"Tokenizing {file_path} (streaming mode)...")
-
-        # Get file size for progress bar
-        file_size = os.path.getsize(file_path)
-
-        # Tokenize in chunks without loading full file
-        # Uses line-aware reading to avoid splitting words at chunk boundaries
-        chunk_size = 1_000_000  # 1MB text chunks
-        all_tokens = []
-
-        eos_id = tokenizer.eos_token_id
-
-        with open(file_path, 'r', encoding='utf-8') as f:
-            pbar = tqdm(total=file_size, desc="Tokenizing", unit='B', unit_scale=True)
-
-            remainder = ""
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    if remainder:
-                        tokens = tokenizer.encode(remainder, add_special_tokens=False)
-                        all_tokens.extend(tokens)
-                        all_tokens.append(eos_id)
-                        pbar.update(len(remainder.encode('utf-8')))
-                    break
-
-                chunk = remainder + chunk
-                last_nl = chunk.rfind('\n')
-                if last_nl == -1:
-                    remainder = chunk
-                    continue
-                remainder = chunk[last_nl + 1:]
-                text_to_encode = chunk[:last_nl + 1]
-                tokens = tokenizer.encode(text_to_encode, add_special_tokens=False)
-                all_tokens.extend(tokens)
-                all_tokens.append(eos_id)
-                pbar.update(len(text_to_encode.encode('utf-8')))
-
-            pbar.close()
-
-        self.tokens = all_tokens
-        print(f"Total tokens: {len(self.tokens):,}")
-
-        # Create sequences
-        self.sequences = []
-        for i in range(0, len(self.tokens) - seq_len, self.stride):
-            self.sequences.append((i, i + seq_len))
-
-        if len(self.sequences) == 0:
+        self.stride = stride
+        self.n_windows = num_windows(len(tokens), seq_len, stride)
+        if self.n_windows == 0:
             raise ValueError(
-                f"Text file too small: {len(self.tokens)} tokens < {seq_len} sequence length. "
-                f"File must have at least {seq_len + 1} tokens."
+                f"{name} has {len(tokens)} tokens; at least {seq_len + 1} are needed for one sequence"
             )
 
-        print(f"Created {len(self.sequences):,} sequences")
-
     def __len__(self):
-        return len(self.sequences)
+        return self.n_windows
 
     def __getitem__(self, idx):
-        start, end = self.sequences[idx]
-        sequence = self.tokens[start:end]
-
-        # Next-token prediction
-        input_ids = torch.tensor(sequence[:-1], dtype=torch.long)
-        labels = torch.tensor(sequence[1:], dtype=torch.long)
-
-        return {'input_ids': input_ids, 'labels': labels}
+        start = idx * self.stride
+        window = torch.from_numpy(self.tokens[start:start + self.seq_len + 1].astype(np.int64))
+        return {'input_ids': window[:-1], 'labels': window[1:]}
 
 
 class PreTokenizedDataset(Dataset):
     """
-    Dataset that loads pre-tokenized data from HuggingFace datasets cache.
+    Pre-tokenized windows saved by scripts/preprocess_data.py.
 
-    MUCH faster than TextDataset - recommended for production training.
-    Use scripts/preprocess_data.py to create pre-tokenized datasets.
+    MUCH faster than tokenizing on the fly - recommended for production training.
     """
 
-    def __init__(self, dataset_path):
-        """
-        Args:
-            dataset_path: Path to pre-tokenized dataset directory
-        """
-        if not DATASETS_AVAILABLE:
-            raise ImportError(
-                "datasets library required for pre-tokenized datasets. "
-                "Install with: pip install datasets"
-            )
-
-        print(f"Loading pre-tokenized dataset from {dataset_path}...")
-        self.dataset = load_from_disk(dataset_path)
-        print(f"Loaded {len(self.dataset):,} sequences")
+    def __init__(self, dataset):
+        self.dataset = dataset
 
     def __len__(self):
         return len(self.dataset)
@@ -230,140 +155,51 @@ class PreTokenizedDataset(Dataset):
         }
 
 
-class HuggingFaceDataset(Dataset):
+class StreamingTextDataset(IterableDataset):
     """
-    Dataset that loads directly from HuggingFace Hub.
+    HuggingFace streaming dataset, packed into windows on the fly.
 
-    Supports:
-    - Streaming (no download required)
-    - Dataset slicing (e.g., "train[:10%]" to use only 10% of data)
-    - On-the-fly tokenization
-    - Multiple dataset configurations
-
-    Note: Streaming mode uses sequential iteration, not random access.
-    DataLoader will automatically handle this correctly.
+    Each example is one document. Training streams are reshuffled per epoch
+    with a seeded buffer. Under multiple processes Accelerate dispatches
+    batches from the main process, so ranks never see duplicate data.
     """
 
-    def __init__(self, dataset_name, split, tokenizer, seq_len=512,
-                 streaming=False, config_name=None, text_column='text'):
-        """
-        Args:
-            dataset_name: HuggingFace dataset name (e.g., "roneneldan/TinyStories")
-            split: Dataset split with optional slice (e.g., "train[:10%]", "validation")
-            tokenizer: Tokenizer instance
-            seq_len: Sequence length
-            streaming: If True, streams data without downloading (default: False)
-            config_name: Optional configuration name for datasets with multiple configs
-            text_column: Name of the text column (default: 'text')
-        """
-        if not DATASETS_AVAILABLE:
-            raise ImportError(
-                "datasets library required for HuggingFace datasets. "
-                "Install with: pip install datasets"
-            )
-
+    def __init__(self, hf_stream, tokenizer, seq_len, stride, text_column, shuffle):
+        self.stream = hf_stream
         self.tokenizer = tokenizer
         self.seq_len = seq_len
-        self.streaming = streaming
+        self.stride = stride
         self.text_column = text_column
+        self.shuffle = shuffle
+        self.epoch = 0
 
-        print(f"Loading HuggingFace dataset: {dataset_name}")
-        print(f"  Split: {split}")
-        print(f"  Streaming: {streaming}")
-        if config_name:
-            print(f"  Config: {config_name}")
+    def set_epoch(self, epoch):
+        self.epoch = epoch
 
-        # Load dataset
-        self.dataset = load_dataset(
-            dataset_name,
-            name=config_name,
-            split=split,
-            streaming=streaming
-        )
-
-        if not streaming:
-            dataset_len = len(self.dataset)
-            if dataset_len == 0:
+    def _texts(self):
+        stream = self.stream
+        if self.shuffle:
+            stream = stream.shuffle(seed=42, buffer_size=10_000)
+            stream.set_epoch(self.epoch)
+        for example in stream:
+            if self.text_column not in example:
                 raise ValueError(
-                    f"Dataset '{dataset_name}' split '{split}' is empty. "
-                    f"Check split name and slice syntax."
+                    f"Text column '{self.text_column}' not found. Available columns: {list(example)}"
                 )
+            yield example[self.text_column]
 
-            print(f"Loaded {dataset_len:,} examples")
-            # Pre-tokenize all examples for faster training
-            print("Pre-tokenizing dataset (this may take a moment)...")
-            self._tokenized_data = []
-            for idx in tqdm(range(dataset_len), desc="Tokenizing"):
-                self._tokenized_data.append(self._tokenize_example(self.dataset[idx]))
-            print(f"Created {len(self._tokenized_data):,} sequences")
-        else:
-            print("Streaming mode: data will be tokenized on-the-fly")
-            # For streaming, create an iterator that will be consumed sequentially
-            # PyTorch DataLoader will call __iter__ to get batches
-            self._tokenized_data = None
-            self._stream_iterator = None
+    def __iter__(self):
+        for window in pack_windows(encode_documents(self._texts(), self.tokenizer), self.seq_len, self.stride):
+            window = torch.tensor(window, dtype=torch.long)
+            yield {'input_ids': window[:-1], 'labels': window[1:]}
 
-    def _tokenize_example(self, example):
-        """Tokenize a single example and create input/label pair."""
-        # Validate text column exists
-        if self.text_column not in example:
-            available = list(example.keys())
-            raise ValueError(
-                f"Text column '{self.text_column}' not found in dataset. "
-                f"Available columns: {available}"
-            )
 
-        text = example[self.text_column]
-        tokens = self.tokenizer.encode(text, add_special_tokens=False)
-        tokens.append(self.tokenizer.eos_token_id)
-
-        # Truncate or pad to seq_len + 1 (for input and label)
-        pad_len = 0
-        if len(tokens) < self.seq_len + 1:
-            pad_len = self.seq_len + 1 - len(tokens)
-            tokens = tokens + [self.tokenizer.pad_token_id] * pad_len
-        else:
-            tokens = tokens[:self.seq_len + 1]
-
-        # Create input_ids and labels for next-token prediction
-        input_ids = tokens[:-1]
-        labels = tokens[1:]
-
-        # Mask padding positions in labels so the model doesn't learn to predict pad tokens
-        if pad_len > 0:
-            for i in range(len(labels) - pad_len, len(labels)):
-                labels[i] = -100
-
-        return {
-            'input_ids': torch.tensor(input_ids, dtype=torch.long),
-            'labels': torch.tensor(labels, dtype=torch.long)
-        }
-
-    def __len__(self):
-        if self.streaming:
-            # For streaming datasets, we can't know the length in advance
-            # Return a large number and rely on steps_per_epoch
-            return 10**9  # Effectively infinite
-        return len(self._tokenized_data)
-
-    def __getitem__(self, idx):
-        if self.streaming:
-            # Streaming mode: idx is ignored; returns next sequential item.
-            # Only works with shuffle=False and num_workers=0.
-            if self._stream_iterator is None:
-                self._stream_iterator = iter(self.dataset)
-
-            # Try to get next item from iterator
-            try:
-                example = next(self._stream_iterator)
-                return self._tokenize_example(example)
-            except StopIteration:
-                # Reset iterator if we've exhausted it
-                self._stream_iterator = iter(self.dataset)
-                example = next(self._stream_iterator)
-                return self._tokenize_example(example)
-        else:
-            return self._tokenized_data[idx]
+def texts_to_tokens(texts, tokenizer) -> np.ndarray:
+    """Encode documents (EOS after each) into one flat uint16 array."""
+    tokens = []
+    for doc_tokens in tqdm(encode_documents(texts, tokenizer), total=len(texts), desc="Tokenizing"):
+        tokens.extend(doc_tokens)
+    return np.asarray(tokens, dtype=np.uint16)
 
 
 def compute_perplexity(loss):
@@ -371,9 +207,12 @@ def compute_perplexity(loss):
     return math.exp(min(loss, 100))
 
 
-def resolve_model_config(args, tokenizer, accelerator):
+def resolve_model_config(args, tokenizer, seq_len):
     """
     Resolve model config from checkpoint or model-size preset.
+
+    The model's attention window (max_seq_len) is set to the training sequence
+    length so inference uses exactly the context the model was trained on.
 
     Returns (config, checkpoint_dict_or_None) so the caller can reuse
     the loaded checkpoint later instead of deserializing it twice.
@@ -383,10 +222,11 @@ def resolve_model_config(args, tokenizer, accelerator):
         checkpoint = compat_load(args.resume)
         if 'config' not in checkpoint:
             raise ValueError(f"Checkpoint missing 'config' key: {args.resume}")
+        check_tokenizer(checkpoint, tokenizer, args.resume)
         config = checkpoint['config']
-        if accelerator.is_main_process:
-            print(f"✓ Loaded model config from checkpoint")
-        config.base_moe.vocab_size = len(tokenizer)
+        if seq_len > config.base_moe.max_seq_len:
+            print(f"Extending attention window {config.base_moe.max_seq_len} → {seq_len}")
+            config.base_moe.max_seq_len = seq_len
     else:
         config = {
             'micro': get_micro_config,
@@ -394,44 +234,42 @@ def resolve_model_config(args, tokenizer, accelerator):
             'small': get_small_config,
             'base': get_base_config
         }[args.model_size]()
-        config.base_moe.vocab_size = len(tokenizer)
+        config.base_moe.max_seq_len = seq_len
+    config.base_moe.vocab_size = len(tokenizer)
     return config, checkpoint
 
 
-def _detect_pretokenized_seq_len(dataset_path):
-    """
-    Detect the actual seq_len baked into a pretokenized dataset.
-
-    Checks preprocessing_config.json first (written by preprocess_data.py),
-    falls back to peeking at the first sample's input_ids length.
-    Returns None if detection fails.
-    """
-    import json
+def _read_preprocessing_config(dataset_path):
+    """Read preprocessing_config.json written by preprocess_data.py (or {} if absent)."""
     config_path = os.path.join(dataset_path, 'preprocessing_config.json')
     if os.path.exists(config_path):
         with open(config_path) as f:
-            return json.load(f).get('seq_len')
+            return json.load(f)
+    return {}
 
-    # Fallback: peek at first sample (fast — HF datasets are memory-mapped)
-    try:
-        ds = load_from_disk(dataset_path)
-        return len(ds[0]['input_ids'])
-    except Exception:
-        return None
+
+def _check_pretokenized(dataset_path, tokenizer):
+    """Return (seq_len, stride) of a pretokenized dataset and verify its tokenizer."""
+    prep = _read_preprocessing_config(dataset_path)
+    expected = prep.get('tokenizer_fingerprint')
+    if expected is not None and expected != tokenizer.fingerprint():
+        raise ValueError(
+            f"{dataset_path} was tokenized with a different vocabulary "
+            f"(fingerprint {expected}, current {tokenizer.fingerprint()})"
+        )
+    seq_len = prep.get('seq_len')
+    if seq_len is None:
+        seq_len = len(load_from_disk(dataset_path)[0]['input_ids'])
+    return seq_len, prep.get('stride', seq_len)
 
 
 def load_or_create_tokenizer(tokenizer_path=None):
     """
-    Load existing tokenizer or create new one.
-
-    Args:
-        tokenizer_path: Path to saved tokenizer directory (e.g., '/checkpoints/tokenizer')
-                       If None, creates a new tokenizer
-
-    Returns:
-        MANTISTokenizer instance
+    Load an existing tokenizer, or create the built-in one when no path is given.
     """
-    if tokenizer_path and os.path.exists(tokenizer_path):
+    if tokenizer_path:
+        if not os.path.isdir(tokenizer_path):
+            raise FileNotFoundError(f"Tokenizer not found: {tokenizer_path}")
         print(f"Loading tokenizer from {tokenizer_path}...")
         tokenizer = MANTISTokenizer.load(tokenizer_path)
         print(f"Loaded vocabulary: {len(tokenizer):,} tokens")
@@ -443,671 +281,464 @@ def load_or_create_tokenizer(tokenizer_path=None):
     return tokenizer
 
 
+def build_datasets(args, tokenizer, seq_len, is_main):
+    """Return (train_dataset, val_dataset_or_None) for the selected data source."""
+    stride = args.stride or seq_len
+
+    if args.hf_dataset:
+        if is_main:
+            print("Using HuggingFace dataset from Hub")
+        load = lambda split: load_dataset(
+            args.hf_dataset, name=args.hf_config, split=split, streaming=args.streaming
+        )
+        train_split = args.hf_train_split or "train"
+
+        if args.streaming:
+            train = StreamingTextDataset(load(train_split), tokenizer, seq_len, stride,
+                                         args.hf_text_column, shuffle=True)
+            val = None
+            if args.hf_val_split:
+                val = StreamingTextDataset(load(args.hf_val_split), tokenizer, seq_len, seq_len,
+                                           args.hf_text_column, shuffle=False)
+            return train, val
+
+        train_hf = load(train_split)
+        if args.hf_text_column not in train_hf.column_names:
+            raise ValueError(
+                f"Text column '{args.hf_text_column}' not found. Available columns: {train_hf.column_names}"
+            )
+        val_hf = None
+        if args.hf_val_split:
+            val_hf = load(args.hf_val_split)
+        elif args.val_split:
+            if is_main:
+                print(f"Auto-splitting documents: {args.val_split*100:.0f}% for validation")
+            split = train_hf.train_test_split(test_size=args.val_split, seed=42)
+            train_hf, val_hf = split['train'], split['test']
+
+        train = TextDataset(texts_to_tokens(train_hf[args.hf_text_column], tokenizer), seq_len, stride, 'train split')
+        val = None
+        if val_hf is not None:
+            val = TextDataset(texts_to_tokens(val_hf[args.hf_text_column], tokenizer), seq_len, seq_len, 'validation split')
+        return train, val
+
+    if args.pretokenized:
+        if is_main:
+            print("Using pre-tokenized datasets (fast!)")
+        _, stride = _check_pretokenized(args.train_file, tokenizer)
+        train_hf = load_from_disk(args.train_file)
+        if args.val_file:
+            _check_pretokenized(args.val_file, tokenizer)
+            return PreTokenizedDataset(train_hf), PreTokenizedDataset(load_from_disk(args.val_file))
+        if args.val_split:
+            if is_main:
+                print(f"Auto-splitting windows: last {args.val_split*100:.0f}% for validation "
+                      f"(overlapping windows dropped)")
+            train_hf, val_hf = split_packed(train_hf, args.val_split, seq_len, stride)
+            return PreTokenizedDataset(train_hf), PreTokenizedDataset(val_hf)
+        return PreTokenizedDataset(train_hf), None
+
+    if is_main:
+        print("Tokenizing on the fly (consider using --pretokenized for faster training)")
+    tokens, doc_ends = tokenize_file(args.train_file, tokenizer)
+    if is_main:
+        print(f"Total tokens: {len(tokens):,} in {len(doc_ends):,} documents")
+    if args.val_split:
+        if is_main:
+            print(f"Auto-splitting documents: last {args.val_split*100:.0f}% for validation")
+        train_tokens, val_tokens = split_at_document(tokens, doc_ends, args.val_split)
+        return (TextDataset(train_tokens, seq_len, stride, 'train split'),
+                TextDataset(val_tokens, seq_len, seq_len, 'validation split'))
+    val = None
+    if args.val_file:
+        val = TextDataset(tokenize_file(args.val_file, tokenizer)[0], seq_len, seq_len, args.val_file)
+    return TextDataset(tokens, seq_len, stride, args.train_file), val
+
+
 @torch.no_grad()
-def validate(model, dataloader, tokenizer, device, rank=0):
-    """Run validation. Returns (avg_loss, perplexity, total_loss, total_tokens)."""
+def validate(model, dataloader, accelerator, max_batches=None):
+    """Run validation on this rank. Returns (summed_loss, token_count)."""
     model.eval()
     total_loss = 0.0
     total_tokens = 0
 
-    iterator = tqdm(dataloader, desc="Validating", leave=False, disable=(rank != 0))
+    iterator = tqdm(dataloader, desc="Validating", leave=False, disable=not accelerator.is_main_process,
+                    total=max_batches)
 
-    for batch in iterator:
-        input_ids = batch['input_ids'].to(device)
-        labels = batch['labels'].to(device)
-
-        output = model(input_ids)
-        logits = output['logits']
-
+    for i, batch in enumerate(iterator):
+        if max_batches is not None and i >= max_batches:
+            break
+        with accelerator.autocast():
+            logits = model(batch['input_ids'])['logits']
+        labels = batch['labels']
         loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
+            logits.float().view(-1, logits.size(-1)),
             labels.view(-1),
             ignore_index=-100,
             reduction='sum'
         )
-
         total_loss += loss.item()
-        # Count only non-masked tokens for accurate PPL calculation
-        non_pad_tokens = (labels != -100).sum().item()
-        total_tokens += non_pad_tokens
+        total_tokens += (labels != -100).sum().item()
 
-    avg_loss = total_loss / total_tokens if total_tokens > 0 else 0.0
-    perplexity = compute_perplexity(avg_loss)
+    return total_loss, total_tokens
 
-    return avg_loss, perplexity, total_loss, total_tokens
+
+def gather_val_loss(accelerator, raw_loss, raw_tokens):
+    """Token-weighted validation loss across all ranks."""
+    gathered_loss = accelerator.gather(torch.tensor([raw_loss], device=accelerator.device)).sum()
+    gathered_tokens = accelerator.gather(torch.tensor([float(raw_tokens)], device=accelerator.device)).sum()
+    return (gathered_loss / gathered_tokens).item() if gathered_tokens > 0 else float('inf')
 
 
 def train(args):
-    deepspeed_plugin = None
-    if args.deepspeed:
-        try:
-            from accelerate import DeepSpeedPlugin
-
-            if args.cpu_offload:
-                deepspeed_plugin = DeepSpeedPlugin(
-                    zero_stage=2,
-                    offload_optimizer_device="cpu",
-                    zero3_init_flag=False,
-                )
-            else:
-                deepspeed_plugin = DeepSpeedPlugin(
-                    zero_stage=2,
-                    zero3_init_flag=False,
-                )
-            if torch.cuda.device_count() < 2:
-                print("Warning: --deepspeed requires multiple GPUs, ignoring flag")
-                deepspeed_plugin = None
-        except ImportError:
-            print("Warning: DeepSpeed not installed, ignoring --deepspeed flag")
-            deepspeed_plugin = None
-    elif args.cpu_offload:
-        print("Warning: --cpu-offload requires --deepspeed, ignoring flag")
-
-    accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision='fp16' if args.mixed_precision else 'no',
-        deepspeed_plugin=deepspeed_plugin,
-        log_with=None
-    )
-
-    use_deepspeed = accelerator.state.deepspeed_plugin is not None
-
-    if use_deepspeed and accelerator.is_main_process:
-        print("\n✓ DeepSpeed ZeRO-3 enabled")
-        if args.cpu_offload:
-            print("✓ CPU offloading enabled")
-
     tokenizer = load_or_create_tokenizer(args.tokenizer_path)
 
-    # Resolve model config early; also keeps loaded checkpoint for reuse during resume
-    config, preloaded_checkpoint = resolve_model_config(args, tokenizer, accelerator)
+    # Sequence length: pretokenized data fixes it at preprocessing time
+    seq_len = args.seq_len
+    if args.pretokenized:
+        seq_len, _ = _check_pretokenized(args.train_file, tokenizer)
+        if seq_len != args.seq_len:
+            print(f"⚠️  Pretokenized data has seq_len={seq_len}, overriding --seq-len={args.seq_len}")
 
-    # Detect actual seq_len from pretokenized dataset (may differ from --seq-len)
-    effective_seq_len = args.seq_len
-    if args.pretokenized and args.train_file:
-        detected_seq_len = _detect_pretokenized_seq_len(args.train_file)
-        if detected_seq_len is not None and detected_seq_len != args.seq_len:
-            if accelerator.is_main_process:
-                print(f"⚠️  Pretokenized data has seq_len={detected_seq_len}, "
-                      f"overriding --seq-len={args.seq_len} for VRAM estimation")
-            effective_seq_len = detected_seq_len
+    config, preloaded_checkpoint = resolve_model_config(args, tokenizer, seq_len)
 
-    # Determine DeepSpeed ZeRO stage for VRAM estimation
-    deepspeed_zero_stage = 0
-    if use_deepspeed and accelerator.state.deepspeed_plugin is not None:
-        ds_config = accelerator.state.deepspeed_plugin
-        deepspeed_zero_stage = getattr(ds_config, 'zero_stage', 2)
+    accelerator, use_deepspeed = build_accelerator(args)
+    is_main = accelerator.is_main_process
+    from accelerate.utils import set_seed
+    set_seed(42)
 
     # VRAM-aware batch size adjustment
-    should_auto_batch = (
-        (accelerator.num_processes > 1 and torch.cuda.is_available())
-        or (getattr(args, 'auto_batch', False) and torch.cuda.is_available())
-    )
-
+    should_auto_batch = torch.cuda.is_available() and (accelerator.num_processes > 1 or args.auto_batch)
     if should_auto_batch:
         device_id = accelerator.local_process_index
         props = torch.cuda.get_device_properties(device_id)
         gpu_vram = props.total_memory
         gpu_name = props.name
-
-        optimal_batch_sizes = compute_optimal_batch_sizes(
-            config.base_moe,
-            effective_seq_len,
-            [gpu_vram],
-            safety_margin=0.85,
+        vram_kwargs = dict(
             mixed_precision=args.mixed_precision,
             gradient_checkpointing=args.gradient_checkpointing,
             use_8bit_optimizer=args.use_8bit_optimizer,
-            deepspeed_zero_stage=deepspeed_zero_stage,
+            deepspeed_zero_stage=2 if use_deepspeed else 0,
             num_gpus=accelerator.num_processes,
-            max_batch_size=args.batch_size,
         )
-        optimal_bs = optimal_batch_sizes[0]
-
-        # Print VRAM summary on main process
-        if accelerator.is_main_process:
-            est = estimate_training_vram(
-                config.base_moe,
-                effective_seq_len,
-                batch_size=1,
-                mixed_precision=args.mixed_precision,
-                gradient_checkpointing=args.gradient_checkpointing,
-                use_8bit_optimizer=args.use_8bit_optimizer,
-                deepspeed_zero_stage=deepspeed_zero_stage,
-                num_gpus=accelerator.num_processes,
-            )
-            print(f"\n{format_vram_summary(config.base_moe, effective_seq_len, [(gpu_name, gpu_vram)], [optimal_bs], est)}")
-
-        original_batch_size = args.batch_size
+        optimal_bs = compute_optimal_batch_sizes(
+            config.base_moe, seq_len, [gpu_vram], safety_margin=0.85,
+            max_batch_size=args.batch_size, **vram_kwargs,
+        )[0]
+        if is_main:
+            est = estimate_training_vram(config.base_moe, seq_len, batch_size=1, **vram_kwargs)
+            print(f"\n{format_vram_summary(config.base_moe, seq_len, [(gpu_name, gpu_vram)], [optimal_bs], est)}")
+        print(f"[Rank {accelerator.process_index}] GPU {device_id} ({gpu_name}, "
+              f"{gpu_vram / (1024**3):.1f} GB): batch_size {args.batch_size} → {optimal_bs}")
         args.batch_size = optimal_bs
-        if args.batch_size != original_batch_size:
-            print(f"[Rank {accelerator.process_index}] GPU {device_id} ({gpu_name}, "
-                  f"{gpu_vram / (1024**3):.1f} GB): "
-                  f"batch_size {original_batch_size} → {args.batch_size}")
-        else:
-            print(f"[Rank {accelerator.process_index}] GPU {device_id} ({gpu_name}, "
-                  f"{gpu_vram / (1024**3):.1f} GB): "
-                  f"batch_size={args.batch_size}")
 
-    # Datasets
-    if accelerator.is_main_process:
+    if is_main:
         print("\nLoading datasets...")
+    train_dataset, val_dataset = build_datasets(args, tokenizer, seq_len, is_main)
+    if is_main and not isinstance(train_dataset, IterableDataset):
+        print(f"Train sequences: {len(train_dataset):,}")
+        if val_dataset is not None:
+            print(f"Val sequences: {len(val_dataset):,}")
 
-    # HuggingFace datasets (direct from Hub)
-    if args.hf_dataset:
-        if accelerator.is_main_process:
-            print("Using HuggingFace dataset from Hub")
-
-        # Determine split (with optional slicing)
-        train_split = args.hf_train_split or "train"
-
-        train_dataset = HuggingFaceDataset(
-            dataset_name=args.hf_dataset,
-            split=train_split,
-            tokenizer=tokenizer,
-            seq_len=args.seq_len,
-            streaming=args.streaming,
-            config_name=args.hf_config,
-            text_column=args.hf_text_column
-        )
-
-        # Validation dataset
-        if args.hf_val_split:
-            val_dataset = HuggingFaceDataset(
-                dataset_name=args.hf_dataset,
-                split=args.hf_val_split,
-                tokenizer=tokenizer,
-                seq_len=args.seq_len,
-                streaming=args.streaming,
-                config_name=args.hf_config,
-                text_column=args.hf_text_column
-            )
-        elif args.val_split and not args.streaming:
-            # Auto-split only works for non-streaming
-            if accelerator.is_main_process:
-                print(f"Auto-splitting dataset: {args.val_split*100:.0f}% for validation")
-            # Split the underlying HF dataset
-            split_dataset = train_dataset.dataset.train_test_split(
-                test_size=args.val_split,
-                seed=42
-            )
-
-            # Create new HuggingFaceDataset instances
-            train_dataset.dataset = split_dataset['train']
-            train_dataset._tokenized_data = []
-            for idx in tqdm(range(len(train_dataset.dataset)), desc="Tokenizing train"):
-                train_dataset._tokenized_data.append(train_dataset._tokenize_example(train_dataset.dataset[idx]))
-
-            val_dataset = HuggingFaceDataset.__new__(HuggingFaceDataset)
-            val_dataset.tokenizer = tokenizer
-            val_dataset.seq_len = args.seq_len
-            val_dataset.streaming = False
-            val_dataset.text_column = args.hf_text_column
-            val_dataset.dataset = split_dataset['test']
-            val_dataset._tokenized_data = []
-            for idx in tqdm(range(len(val_dataset.dataset)), desc="Tokenizing val"):
-                val_dataset._tokenized_data.append(val_dataset._tokenize_example(val_dataset.dataset[idx]))
-
-            if accelerator.is_main_process:
-                print(f"Train examples: {len(train_dataset.dataset):,}")
-                print(f"Val examples: {len(val_dataset.dataset):,}")
-        else:
-            val_dataset = None
-
-        # Warn if streaming without steps_per_epoch
-        if args.streaming and not args.steps_per_epoch:
-            print("\n⚠️  WARNING: Streaming mode without --steps-per-epoch will run indefinitely!")
-            print("   Recommend: --steps-per-epoch 1000 (or appropriate value)")
-
-    elif args.pretokenized:
-        if accelerator.is_main_process:
-            print("Using pre-tokenized datasets (fast!)")
-        train_dataset = PreTokenizedDataset(args.train_file)
-
-        if args.val_split and not args.val_file:
-            if accelerator.is_main_process:
-                print(f"Auto-splitting dataset: {args.val_split*100:.0f}% for validation")
-            full_dataset = train_dataset.dataset
-            split = full_dataset.train_test_split(test_size=args.val_split, seed=42)
-
-            train_dataset.dataset = split['train']
-            val_dataset = PreTokenizedDataset.__new__(PreTokenizedDataset)
-            val_dataset.dataset = split['test']
-
-            if accelerator.is_main_process:
-                print(f"Train sequences: {len(train_dataset):,}")
-                print(f"Val sequences: {len(val_dataset):,}")
-        else:
-            val_dataset = PreTokenizedDataset(args.val_file) if args.val_file else None
-    else:
-        if accelerator.is_main_process:
-            print("Tokenizing on-the-fly (consider using --pretokenized for faster training)")
-        train_dataset = TextDataset(args.train_file, tokenizer, args.seq_len, args.stride)
-
-        if args.val_split and not args.val_file:
-            if accelerator.is_main_process:
-                print(f"Auto-splitting dataset: {args.val_split*100:.0f}% for validation")
-            total_sequences = len(train_dataset.sequences)
-            val_count = int(total_sequences * args.val_split)
-            train_count = total_sequences - val_count
-
-            val_sequences = train_dataset.sequences[-val_count:]
-            train_dataset.sequences = train_dataset.sequences[:train_count]
-
-            val_dataset = TextDataset.__new__(TextDataset)
-            val_dataset.tokenizer = tokenizer
-            val_dataset.seq_len = args.seq_len
-            val_dataset.tokens = train_dataset.tokens
-            val_dataset.sequences = val_sequences
-
-            if accelerator.is_main_process:
-                print(f"Train sequences: {len(train_dataset):,}")
-                print(f"Val sequences: {len(val_dataset):,}")
-        else:
-            val_dataset = TextDataset(args.val_file, tokenizer, args.seq_len) if args.val_file else None
-
-    # Determine shuffle setting - streaming datasets should not shuffle in DataLoader
-    use_shuffle = True
-    if args.hf_dataset and args.streaming:
-        use_shuffle = False
-        if accelerator.is_main_process:
-            print("Note: Shuffle disabled for streaming mode (dataset streams in sequential order)")
-
+    streaming = isinstance(train_dataset, IterableDataset)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=use_shuffle,
-        num_workers=args.num_workers,
+        shuffle=not streaming,
+        num_workers=0 if streaming else args.num_workers,
         pin_memory=True
     )
-
     val_loader = None
-    if val_dataset:
+    if val_dataset is not None:
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=args.num_workers,
+            num_workers=0 if isinstance(val_dataset, IterableDataset) else args.num_workers,
             pin_memory=True
         )
 
-    # Model (config already resolved above, before datasets)
-    if accelerator.is_main_process:
+    if is_main:
         print("\nInitializing model...")
-
-    model = BaseMoEModel(
-        vocab_size=config.base_moe.vocab_size,
-        d_model=config.base_moe.d_model,
-        n_layers=config.base_moe.n_layers,
-        n_heads=config.base_moe.n_heads,
-        d_ff=config.base_moe.d_ff,
-        n_experts=config.base_moe.n_experts,
-        top_k=config.base_moe.top_k,
-        max_seq_len=config.base_moe.max_seq_len,
-        dropout=config.base_moe.dropout,
-        load_balance_weight=config.base_moe.load_balance_weight
-    )
-
-    if accelerator.is_main_process:
+    model = BaseMoEModel.from_config(config.base_moe)
+    if is_main:
         param_counts = model.count_parameters()
-        print(f"Model: {param_counts['total'] / 1e6:.2f}M total, {param_counts['active'] / 1e6:.2f}M active")
+        print(f"Model: {param_counts['total'] / 1e6:.2f}M total, {param_counts['active'] / 1e6:.2f}M active, "
+              f"window {config.base_moe.max_seq_len} tokens")
 
-    if args.use_8bit_optimizer and not use_deepspeed:
-        try:
-            import bitsandbytes as bnb
-            optimizer = bnb.optim.AdamW8bit(
-                model.parameters(),
-                lr=args.learning_rate,
-                weight_decay=args.weight_decay,
-                betas=(0.9, 0.95)
-            )
-            if accelerator.is_main_process:
-                print("✓ Using 8-bit AdamW optimizer (saves ~50% optimizer memory)")
-        except ImportError:
-            if accelerator.is_main_process:
-                print("⚠️  bitsandbytes not installed, falling back to standard AdamW")
-                print("   Install with: pip install bitsandbytes")
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=args.learning_rate,
-                weight_decay=args.weight_decay,
-                betas=(0.9, 0.95)
-            )
-    else:
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=args.learning_rate,
-            weight_decay=args.weight_decay,
-            betas=(0.9, 0.95)
-        )
+    optimizer = build_optimizer(model, args, use_deepspeed, is_main)
 
-    if use_deepspeed and accelerator.is_main_process:
-        print("✓ Using DeepSpeed ZeRO optimizer")
-
-    # Prepare model, optimizer, and dataloaders with Accelerate (before loading checkpoint).
-    # Scheduler is created AFTER prepare so that steps_per_epoch is computed from the
-    # distributed DataLoader, which accounts for DistributedSampler and per-rank batch sizes.
-    model, optimizer, train_loader = accelerator.prepare(
-        model, optimizer, train_loader
-    )
-
-    if val_loader:
+    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+    if val_loader is not None:
         val_loader = accelerator.prepare(val_loader)
 
-    # Compute steps_per_epoch from the PREPARED DataLoader.  With heterogeneous GPUs
-    # and different per-rank batch sizes, each rank's DataLoader yields a different
-    # number of batches.  Take the minimum across ranks so every rank runs the same
-    # number of steps and stays synchronised for NCCL collectives.
+    # Steps per epoch from the PREPARED DataLoader. With heterogeneous GPUs and
+    # per-rank batch sizes each rank yields a different number of batches; take
+    # the minimum so every rank runs the same number of steps.
     accum = args.gradient_accumulation_steps
-    if args.steps_per_epoch:
-        steps_per_epoch = args.steps_per_epoch
-    else:
-        local_steps = len(train_loader)
-        if accelerator.num_processes > 1:
-            steps_tensor = torch.tensor([local_steps], dtype=torch.long, device=accelerator.device)
-            gathered = accelerator.gather(steps_tensor)
-            steps_per_epoch = int(gathered.min().item())
-        else:
-            steps_per_epoch = local_steps
+    steps_per_epoch = round_steps_to_accumulation(args.steps_per_epoch, accum, is_main) if args.steps_per_epoch else None
+    if not streaming:
+        # Every rank must run the same whole accumulation windows: a rank that
+        # reaches the end of its loader mid-window syncs alone and hangs the others.
+        steps = torch.tensor([len(train_loader)], dtype=torch.long, device=accelerator.device)
+        loader_steps = int(accelerator.gather(steps).min().item()) // accum * accum
+        if loader_steps == 0:
+            raise ValueError(f"Fewer batches per rank than --gradient-accumulation-steps ({accum})")
+        if steps_per_epoch is None or steps_per_epoch > loader_steps:
+            steps_per_epoch = loader_steps
 
-    # Round up to nearest multiple of gradient_accumulation_steps
-    if accum > 1 and steps_per_epoch % accum != 0:
-        old_steps = steps_per_epoch
-        steps_per_epoch = ((steps_per_epoch + accum - 1) // accum) * accum
-        if accelerator.is_main_process:
-            print(f"⚠️  Rounded steps_per_epoch {old_steps} → {steps_per_epoch} "
-                  f"(nearest multiple of gradient_accumulation_steps={accum}) "
-                  f"to prevent stale gradient leakage across epoch boundaries")
-
-    # Always set so the training loop break condition fires on every rank
-    args.steps_per_epoch = steps_per_epoch
-
-    effective_steps_per_epoch = steps_per_epoch // accum
-    total_steps = effective_steps_per_epoch * args.epochs
-
-    if accelerator.is_main_process:
-        print(f"\nScheduler: {effective_steps_per_epoch} optimizer steps/epoch × "
-              f"{args.epochs} epochs = {total_steps} total optimizer steps")
-        if args.warmup_steps > 0:
-            warmup_pct = args.warmup_steps / total_steps * 100 if total_steps > 0 else 0
-            print(f"Warmup: {args.warmup_steps} optimizer steps ({warmup_pct:.1f}% of training)")
-            if warmup_pct > 30:
-                print(f"⚠️  WARNING: Warmup consumes {warmup_pct:.0f}% of training! "
-                      f"The model will spend most of training at a sub-optimal learning rate.")
-                print(f"   Consider reducing --warmup-steps to ~{max(1, total_steps // 10)} "
-                      f"(10% of {total_steps} total steps)")
-
-    def lr_lambda(step):
-        if step < args.warmup_steps:
-            if args.warmup_steps == 0:
-                return 1.0
-            return step / args.warmup_steps
-        else:
-            if total_steps <= args.warmup_steps:
-                return 0.1
-            progress = (step - args.warmup_steps) / (total_steps - args.warmup_steps)
-            return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    scheduler = accelerator.prepare(scheduler)
+    total_steps = steps_per_epoch // accum * args.epochs
+    if is_main:
+        report_schedule(steps_per_epoch, accum, args.epochs, args.warmup_steps)
+    scheduler = warmup_cosine_schedule(optimizer, args.warmup_steps, total_steps)
 
     if args.gradient_checkpointing:
-        unwrapped_model = accelerator.unwrap_model(model)
-        if hasattr(unwrapped_model, 'gradient_checkpointing_enable'):
-            unwrapped_model.gradient_checkpointing_enable()
-            if accelerator.is_main_process:
-                print("✓ Gradient checkpointing enabled (trades compute for memory)")
+        accelerator.unwrap_model(model).gradient_checkpointing_enable()
+        if is_main:
+            print("✓ Gradient checkpointing enabled (trades compute for memory)")
 
-    # Resume from checkpoint if specified (AFTER accelerator.prepare())
-    start_epoch = 0
-    start_step = 0
-    start_global_step = 0
+    # Resume from checkpoint (AFTER accelerator.prepare())
+    start_epoch, start_epoch_step = 0, 0
+    optimizer_step, global_step = 0, 0
     best_val_loss = float('inf')
     epochs_without_improvement = 0
 
     if args.resume:
-        if accelerator.is_main_process:
-            print(f"\nResuming from checkpoint: {args.resume}")
-
-        # Reuse checkpoint already loaded during config resolution
         checkpoint = preloaded_checkpoint
-
-        # Restore model state using unwrap_model to access actual model beneath Accelerate's wrapper
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.load_state_dict(checkpoint['model_state_dict'])
-
-        # Restore optimizer state (Accelerate-wrapped optimizer can load state directly)
-        if 'optimizer_state_dict' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        else:
-            if accelerator.is_main_process:
-                print("⚠️  Warning: No optimizer state in checkpoint, starting with fresh optimizer")
-
-        # Restore scheduler state
-        if 'scheduler_state_dict' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        else:
-            if accelerator.is_main_process:
-                print("⚠️  Warning: No scheduler state in checkpoint, starting with fresh scheduler")
-
-        # Restore training state
-        start_epoch = checkpoint.get('epoch', 0)
-        start_step = checkpoint.get('step', 0)
-        start_global_step = checkpoint.get('global_step', 0)
-        best_val_loss = checkpoint.get('best_val_loss', checkpoint.get('val_loss', float('inf')))
-        epochs_without_improvement = checkpoint.get('epochs_without_improvement', 0)
-
-        if accelerator.is_main_process:
-            print(f"✓ Resumed from epoch {start_epoch}, step {start_step}")
+        accelerator.unwrap_model(model).load_state_dict(checkpoint['model_state_dict'])
+        state = restore_training_state(
+            checkpoint,
+            optimizer=None if use_deepspeed else optimizer,
+            scheduler=scheduler,
+            scaler=accelerator.scaler,
+        )
+        start_epoch, start_epoch_step = state['epoch'], state['epoch_step']
+        optimizer_step, global_step = state['step'], state['global_step']
+        best_val_loss = state['best_val_loss']
+        epochs_without_improvement = state['epochs_without_improvement']
+        if is_main:
+            for w in state['warnings']:
+                print(f"⚠️  {w}")
+            print(f"✓ Resumed at epoch {start_epoch + 1}, batch {start_epoch_step}, "
+                  f"optimizer step {optimizer_step}")
             if best_val_loss < float('inf'):
                 print(f"✓ Best validation loss: {best_val_loss:.4f}")
 
-    # Save tokenizer (main process only)
-    if accelerator.is_main_process:
+    if is_main:
         os.makedirs(args.output_dir, exist_ok=True)
         tokenizer_save_path = os.path.join(args.output_dir, 'tokenizer')
         tokenizer.save(tokenizer_save_path)
         print(f"Tokenizer saved: {tokenizer_save_path}")
 
-    # Training loop
-    if accelerator.is_main_process:
+    def save(name, epoch, epoch_step, **extra):
+        """Save on the main process after all ranks reach this point."""
+        if epoch_step >= steps_per_epoch:
+            epoch, epoch_step = epoch + 1, 0
+        accelerator.wait_for_everyone()
+        if is_main:
+            path = os.path.join(args.output_dir, name)
+            save_training_checkpoint(
+                path,
+                model=accelerator.unwrap_model(model),
+                config=config,
+                tokenizer=tokenizer,
+                epoch=epoch,
+                epoch_step=epoch_step,
+                optimizer_step=optimizer_step,
+                global_step=global_step,
+                optimizer=None if use_deepspeed else optimizer,
+                scheduler=scheduler,
+                scaler=accelerator.scaler,
+                best_val_loss=best_val_loss,
+                epochs_without_improvement=epochs_without_improvement,
+                **extra,
+            )
+            return path
+
+    def run_validation():
+        raw_loss, raw_tokens = validate(accelerator.unwrap_model(model), val_loader, accelerator,
+                                        args.val_max_batches)
+        model.train()
+        return gather_val_loss(accelerator, raw_loss, raw_tokens)
+
+    if is_main:
         print(f"\n{'='*80}")
-        if args.resume:
-            print(f"Resuming training on {accelerator.num_processes} GPU(s): epochs {start_epoch+1}-{args.epochs}")
-        else:
-            gpu_desc = f"{accelerator.num_processes} GPU(s)"
-            if use_deepspeed:
-                gpu_desc += " with DeepSpeed ZeRO-3"
-            print(f"Training on {gpu_desc}: {args.epochs} epochs")
-        if args.steps_per_epoch:
-            print(f"Steps per epoch: {args.steps_per_epoch}")
+        gpu_desc = f"{accelerator.num_processes} GPU(s)" + (" with DeepSpeed ZeRO-2" if use_deepspeed else "")
+        print(f"Training on {gpu_desc}: epochs {start_epoch + 1}-{args.epochs}, "
+              f"{steps_per_epoch} steps/epoch")
         print(f"{'='*80}\n")
 
-    global_step = start_global_step
-    optimizer_step = start_step
-
+    completed_epochs = start_epoch
     for epoch in range(start_epoch, args.epochs):
         model.train()
-        epoch_loss = 0.0
-        epoch_steps = 0
+        # The prepared loader re-applies its own epoch to the sampler/dataset on
+        # every iteration, so the epoch must be set here (the skip loader inherits it)
+        train_loader.set_epoch(epoch)
 
-        pbar = tqdm(
-            train_loader,
-            desc=f"Epoch {epoch+1}/{args.epochs}",
-            total=args.steps_per_epoch if args.steps_per_epoch else len(train_loader),
-            disable=not accelerator.is_main_process
-        )
+        skip = start_epoch_step if epoch == start_epoch else 0
+        loader = accelerator.skip_first_batches(train_loader, skip) if skip else train_loader
+        epoch_loss = 0.0
+        epoch_steps = skip
+
+        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{args.epochs}", initial=skip,
+                    total=steps_per_epoch, disable=not is_main)
 
         for batch in pbar:
-            if args.steps_per_epoch and epoch_steps >= args.steps_per_epoch:
+            if epoch_steps >= steps_per_epoch:
                 break
 
             with accelerator.accumulate(model):
-                input_ids = batch['input_ids']
-                labels = batch['labels']
-
-                output = model(input_ids)
+                output = model(batch['input_ids'])
                 logits = output['logits']
-                load_balance_loss = output.get('load_balance_loss', 0.0)
-
                 lm_loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    labels.view(-1),
+                    logits.float().view(-1, logits.size(-1)),
+                    batch['labels'].view(-1),
                     ignore_index=-100
                 )
-                total_loss = lm_loss + load_balance_loss
-
-                accelerator.backward(total_loss)
+                accelerator.backward(lm_loss + output['load_balance_loss'])
 
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), args.grad_clip)
-
                 optimizer.step()
                 optimizer.zero_grad()
 
-                if accelerator.sync_gradients:
+            stepped = accelerator.sync_gradients
+            if stepped:
+                if not accelerator.optimizer_step_was_skipped:
                     scheduler.step()
-                    optimizer_step += 1
+                optimizer_step += 1
 
             epoch_loss += lm_loss.item()
             epoch_steps += 1
             global_step += 1
+            pbar.set_postfix({'loss': f'{lm_loss.item():.4f}', 'lr': f'{scheduler.get_last_lr()[0]:.2e}'})
 
-            if accelerator.is_main_process:
-                pbar.set_postfix({'loss': f'{lm_loss.item():.4f}'})
+            if stepped and val_loader is not None and args.eval_every and optimizer_step % args.eval_every == 0:
+                val_loss = run_validation()
+                if is_main:
+                    print(f"\nStep {optimizer_step} - Val Loss: {val_loss:.4f}, "
+                          f"Val PPL: {compute_perplexity(val_loss):.2f}")
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    if save('best_model.pt', epoch, epoch_steps, val_loss=val_loss):
+                        print("✓ Best model saved")
 
-            if args.eval_every and optimizer_step > 0 and optimizer_step % args.eval_every == 0:
-                if val_loader:
-                    val_loss, val_ppl, raw_loss, raw_tokens = validate(
-                        accelerator.unwrap_model(model),
-                        val_loader,
-                        tokenizer,
-                        accelerator.device,
-                        accelerator.process_index
-                    )
-
-                    # Gather raw totals for mathematically correct multi-GPU averaging
-                    gathered_loss = accelerator.gather(torch.tensor(raw_loss, device=accelerator.device)).sum()
-                    gathered_tokens = accelerator.gather(torch.tensor(float(raw_tokens), device=accelerator.device)).sum()
-                    val_loss = (gathered_loss / gathered_tokens).item() if gathered_tokens > 0 else 0.0
-                    val_ppl = compute_perplexity(val_loss)
-
-                    if accelerator.is_main_process:
-                        print(f"\nStep {optimizer_step} - Val Loss: {val_loss:.4f}, Val PPL: {val_ppl:.2f}")
-
-                    if val_loss < best_val_loss:
-                        best_val_loss = val_loss
-                        accelerator.wait_for_everyone()
-                        if accelerator.is_main_process:
-                            unwrapped_model = accelerator.unwrap_model(model)
-                            best_path = os.path.join(args.output_dir, 'best_model.pt')
-                            torch.save({
-                                'epoch': epoch + 1,
-                                'step': optimizer_step,
-                                'global_step': global_step,
-                                'model_state_dict': unwrapped_model.state_dict(),
-                                'optimizer_state_dict': optimizer.state_dict(),
-                                'scheduler_state_dict': scheduler.state_dict(),
-                                'config': config,
-                                'val_loss': val_loss,
-                                'best_val_loss': best_val_loss
-                            }, best_path)
-                            print(f"✓ Best model saved")
-
-                model.train()
-
-        # Epoch summary
-        avg_loss = epoch_loss / epoch_steps
-
-        if accelerator.is_main_process:
+        completed_epochs = epoch + 1
+        trained = epoch_steps - skip
+        avg_loss = epoch_loss / trained if trained else float('nan')
+        if is_main:
             print(f"\nEpoch {epoch+1} - Loss: {avg_loss:.4f}, PPL: {compute_perplexity(avg_loss):.2f}")
 
-        # Validation (all processes participate)
-        if val_loader:
-            val_loss, val_ppl, raw_loss, raw_tokens = validate(
-                accelerator.unwrap_model(model),
-                val_loader,
-                tokenizer,
-                accelerator.device,
-                accelerator.process_index
-            )
-
-            # Gather raw totals for mathematically correct multi-GPU averaging
-            gathered_loss = accelerator.gather(torch.tensor(raw_loss, device=accelerator.device)).sum()
-            gathered_tokens = accelerator.gather(torch.tensor(float(raw_tokens), device=accelerator.device)).sum()
-            val_loss = (gathered_loss / gathered_tokens).item() if gathered_tokens > 0 else 0.0
-            val_ppl = compute_perplexity(val_loss)
-
-            if accelerator.is_main_process:
-                print(f"Epoch {epoch+1} - Val Loss: {val_loss:.4f}, Val PPL: {val_ppl:.2f}")
+        stop_early = False
+        if val_loader is not None:
+            val_loss = run_validation()
+            if is_main:
+                print(f"Epoch {epoch+1} - Val Loss: {val_loss:.4f}, Val PPL: {compute_perplexity(val_loss):.2f}")
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 epochs_without_improvement = 0
-                accelerator.wait_for_everyone()
-                if accelerator.is_main_process:
-                    unwrapped_model = accelerator.unwrap_model(model)
-                    best_path = os.path.join(args.output_dir, 'best_model.pt')
-                    torch.save({
-                        'epoch': epoch + 1,
-                        'step': optimizer_step,
-                        'global_step': global_step,
-                        'model_state_dict': unwrapped_model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict(),
-                        'config': config,
-                        'val_loss': val_loss,
-                        'best_val_loss': best_val_loss,
-                        'epochs_without_improvement': epochs_without_improvement
-                    }, best_path)
-                    print(f"✓ Best model saved")
+                if save('best_model.pt', completed_epochs, 0, val_loss=val_loss):
+                    print("✓ Best model saved")
             else:
                 epochs_without_improvement += 1
 
             if args.patience and epochs_without_improvement >= args.patience:
-                if accelerator.is_main_process:
+                if is_main:
                     print(f"\nEarly stopping: No improvement for {args.patience} epochs")
-                break
+                stop_early = True
 
-        if args.save_every and (epoch + 1) % args.save_every == 0:
-            accelerator.wait_for_everyone()
-            if accelerator.is_main_process:
-                unwrapped_model = accelerator.unwrap_model(model)
-                ckpt_path = os.path.join(args.output_dir, f'epoch_{epoch+1}.pt')
-                torch.save({
-                    'epoch': epoch + 1,
-                    'step': optimizer_step,
-                    'global_step': global_step,
-                    'model_state_dict': unwrapped_model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'config': config,
-                    'best_val_loss': best_val_loss,
-                    'epochs_without_improvement': epochs_without_improvement
-                }, ckpt_path)
-                print(f"Checkpoint saved: {ckpt_path}")
+        if args.save_every and completed_epochs % args.save_every == 0:
+            path = save(f'epoch_{completed_epochs}.pt', completed_epochs, 0)
+            if path:
+                print(f"Checkpoint saved: {path}")
 
-    # Final checkpoint
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        unwrapped_model = accelerator.unwrap_model(model)
-        final_path = os.path.join(args.output_dir, 'final_model.pt')
-        torch.save({
-            'epoch': epoch + 1,
-            'step': optimizer_step,
-            'global_step': global_step,
-            'model_state_dict': unwrapped_model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'config': config,
-            'best_val_loss': best_val_loss
-        }, final_path)
+        if stop_early:
+            break
 
+    final_path = save('final_model.pt', completed_epochs, 0)
+    if is_main:
         print(f"\n{'='*80}")
         print(f"Training complete! Final model: {final_path}")
-        if val_loader:
+        if val_loader is not None and best_val_loss < float('inf'):
             print(f"Best validation loss: {best_val_loss:.4f} (PPL: {compute_perplexity(best_val_loss):.2f})")
         print(f"{'='*80}\n")
+
+
+STAGE1_ONLY_FLAGS = {
+    'hf_dataset': None, 'pretokenized': False, 'streaming': False, 'val_file': None,
+    'val_split': None, 'mixed_precision': False, 'deepspeed': False, 'cpu_offload': False,
+    'use_8bit_optimizer': False, 'gradient_checkpointing': False, 'auto_batch': False,
+}
+
+
+def validate_stage1_args(args):
+    """Return an error message for invalid Stage 1 arguments, or None."""
+    if args.hf_dataset:
+        if args.train_file:
+            print("Warning: --hf-dataset provided, ignoring train_file argument")
+        if args.pretokenized:
+            return "Cannot use --pretokenized with --hf-dataset"
+        if not DATASETS_AVAILABLE:
+            return "HuggingFace datasets requires 'datasets' library. Install with: pip install datasets"
+        if args.streaming and args.val_split:
+            return "--val-split not supported with --streaming. Use --hf-val-split instead."
+        if args.streaming and not args.steps_per_epoch:
+            return "--streaming requires --steps-per-epoch (a stream has no length)"
+        if args.val_file:
+            return "Cannot use --val-file with --hf-dataset. Use --hf-val-split instead."
+    else:
+        if not args.train_file:
+            return "Either train_file or --hf-dataset must be provided"
+        if not os.path.exists(args.train_file):
+            return f"Training {'dataset' if args.pretokenized else 'file'} not found: {args.train_file}"
+        if args.val_file and not os.path.exists(args.val_file):
+            return f"Validation {'dataset' if args.pretokenized else 'file'} not found: {args.val_file}"
+        if args.streaming:
+            return "--streaming only works with --hf-dataset"
+        if args.hf_train_split or args.hf_val_split or args.hf_config or args.hf_text_column != 'text':
+            return "HuggingFace-specific arguments require --hf-dataset"
+
+    if args.resume:
+        if not os.path.exists(args.resume):
+            return f"Checkpoint not found: {args.resume}"
+        if not args.tokenizer_path:
+            tokenizer_dir = os.path.join(os.path.dirname(args.resume), 'tokenizer')
+            hint = f"Try: --tokenizer-path {tokenizer_dir}" if os.path.exists(tokenizer_dir) \
+                else "Use the tokenizer from the original training run"
+            return f"--tokenizer-path required when resuming from checkpoint\n       {hint}"
+
+    if args.val_split and args.val_file:
+        return ("Cannot use both --val-split and --val-file. Choose one:\n"
+                "  --val-split: Auto-split from training data (convenience mode)\n"
+                "  --val-file: Use pre-split validation data (production mode)")
+    if args.val_split and not 0 < args.val_split < 1:
+        return f"--val-split must be between 0 and 1, got {args.val_split}"
+    if args.stride and not 0 < args.stride <= args.seq_len:
+        return f"--stride must be between 1 and --seq-len ({args.seq_len}), got {args.stride}"
+    if args.pretokenized and not DATASETS_AVAILABLE:
+        return "--pretokenized requires 'datasets' library. Install with: pip install datasets"
+    return None
+
+
+def validate_later_stage_args(args):
+    """Stages 2-4 load a Stage 1 checkpoint and an optional JSONL file."""
+    if not args.resume or not args.tokenizer_path:
+        return (f"Stage {args.stage} requires the Stage 1 model and tokenizer:\n"
+                "  --resume checkpoints/stage1/best_model.pt --tokenizer-path checkpoints/stage1/tokenizer")
+    for path in (args.resume, args.tokenizer_path, args.train_file,
+                 args.memory_checkpoint, args.critic_checkpoint):
+        if path and not os.path.exists(path):
+            return f"Not found: {path}"
+    if args.semantic_store and not os.path.exists(f"{args.semantic_store}.meta"):
+        return f"Semantic store not found: {args.semantic_store}.meta"
+    used = [f"--{name.replace('_', '-')}" for name, default in STAGE1_ONLY_FLAGS.items()
+            if getattr(args, name) != default]
+    if args.gradient_accumulation_steps != 1:
+        used.append('--gradient-accumulation-steps')
+    if used:
+        return f"Stage {args.stage} does not support: {', '.join(used)}"
+    return None
 
 
 def main():
@@ -1122,7 +753,7 @@ Examples:
 
   # Stream dataset without downloading (no storage needed!)
   python train.py --hf-dataset roneneldan/TinyStories \\
-      --hf-val-split validation \\
+      --hf-val-split validation --val-max-batches 200 \\
       --streaming \\
       --steps-per-epoch 1000 \\
       --epochs 10
@@ -1133,19 +764,14 @@ Examples:
       --hf-train-split "train[:10%]" \\
       --hf-val-split validation
 
-  # Use first 1000 examples (great for testing)
-  python train.py --hf-dataset openwebtext \\
-      --hf-train-split "train[:1000]" \\
-      --hf-val-split "train[1000:1200]"
-
   # Auto-split validation from HuggingFace dataset (no validation split available)
   python train.py --hf-dataset c4 \\
       --hf-config en \\
       --hf-train-split "train[:1%]" \\
       --val-split 0.1
 
-  # LOCAL FILES (when you have your own data)
-  # =========================================
+  # LOCAL FILES (documents separated by blank lines)
+  # ================================================
 
   # CONVENIENCE MODE: Auto-split validation (quick iteration)
   python train.py data/tokenized/train --pretokenized --val-split 0.1
@@ -1161,37 +787,38 @@ Examples:
   # ADVANCED OPTIONS
   # ===============
 
-  # Resume from checkpoint (continues training)
-  python train.py data/train.txt --resume checkpoints/train/best_model.pt --val-split 0.1
+  # Resume from checkpoint (continues mid-epoch if the checkpoint was saved mid-epoch)
+  python train.py data/train.txt --resume checkpoints/train/best_model.pt \\
+      --tokenizer-path checkpoints/train/tokenizer --val-split 0.1
 
   # Resume and train for more epochs (e.g., was 20, now train to 50 total)
-  python train.py data/train.txt --resume checkpoints/train/final_model.pt --epochs 50 --val-split 0.1
-
-  # Use specific GPUs (e.g., only GPU 0)
-  python train.py data/tokenized/train --pretokenized --gpu-ids 0 --val-split 0.1
+  python train.py data/train.txt --resume checkpoints/train/final_model.pt \\
+      --tokenizer-path checkpoints/train/tokenizer --epochs 50 --val-split 0.1
 
   # Mixed VRAM GPUs: Use gradient accumulation (effective batch: 2×4×N_GPUs)
   python train.py data/train.txt --gradient-accumulation-steps 4 --batch-size 2 --val-split 0.1
 
-  # Use existing tokenizer from checkpoint
-  python train.py data/train.txt --tokenizer-path checkpoints/improved_train/tokenizer --val-split 0.1
-
-  # Control steps per epoch (useful for large datasets)
-  python train.py data/train.txt --steps-per-epoch 1000 --val-split 0.1
-
-  # Train larger model
-  python train.py data/train.txt --model-size small --batch-size 4 --val-split 0.1
+  # LATER STAGES (JSONL data file optional; demo data otherwise)
+  # ============================================================
+  python train.py --stage 2 data/memory.jsonl --resume ckpt/best_model.pt --tokenizer-path ckpt/tokenizer
+  python train.py --stage 4 data/critic.jsonl --resume ckpt/best_model.pt --tokenizer-path ckpt/tokenizer
+  python train.py --stage 3 data/qa.jsonl --resume ckpt/best_model.pt --tokenizer-path ckpt/tokenizer \\
+      --memory-checkpoint ckpt/memory_system_final.pt --semantic-store ckpt/semantic_memory \\
+      --critic-checkpoint ckpt/critic_best.pt
         """
     )
 
     # Data
     parser.add_argument('train_file', type=str, nargs='?',
-                       help='Training data: text file or pre-tokenized dataset directory (not needed with --hf-dataset)')
+                       help='Stage 1: text file (blank-line separated documents) or pre-tokenized dataset '
+                            'directory. Stages 2-4: optional JSONL file.')
     parser.add_argument('--val-file', type=str,
                        help='Validation data: text file or pre-tokenized dataset directory')
     parser.add_argument('--val-split', type=float,
-                       help='Auto-split validation fraction (e.g., 0.1 for 10%%). '
-                            'Convenience mode - cannot be used with --val-file')
+                       help='Auto-split validation fraction (e.g., 0.1 for 10%%), split at document '
+                            'boundaries. Cannot be used with --val-file')
+    parser.add_argument('--val-max-batches', type=int,
+                        help='Cap validation at N batches per run (needed for large streamed splits)')
     parser.add_argument('--output-dir', type=str, default='./checkpoints/train',
                         help='Output directory (default: ./checkpoints/train)')
     parser.add_argument('--pretokenized', action='store_true',
@@ -1200,7 +827,7 @@ Examples:
     # HuggingFace datasets
     parser.add_argument('--hf-dataset', type=str,
                         help='HuggingFace dataset name (e.g., "roneneldan/TinyStories"). '
-                             'Loads directly from Hub without needing local files.')
+                             'Each example is one document.')
     parser.add_argument('--hf-train-split', type=str,
                         help='Train split with optional slice (e.g., "train[:10%%]", "train[:1000]"). '
                              'Default: "train"')
@@ -1212,50 +839,55 @@ Examples:
     parser.add_argument('--hf-text-column', type=str, default='text',
                         help='Name of the text column (default: "text")')
     parser.add_argument('--streaming', action='store_true',
-                        help='Stream dataset without downloading (requires --steps-per-epoch). '
-                             'Useful for very large datasets to avoid storage issues.')
+                        help='Stream dataset without downloading (requires --steps-per-epoch).')
 
     # Tokenizer
     parser.add_argument('--tokenizer-path', type=str,
-                        help='Path to existing tokenizer (e.g., checkpoints/improved_train/tokenizer). '
-                             'If not provided, creates new tokenizer')
+                        help='Path to existing tokenizer directory. If not provided, uses the built-in vocabulary')
 
     # Resumption
     parser.add_argument('--resume', type=str,
-                        help='Resume training from checkpoint (e.g., checkpoints/train/best_model.pt)')
+                        help='Stage 1: resume training from checkpoint. Stages 2-4: the Stage 1 model')
 
     # Model
     parser.add_argument('--model-size', type=str, choices=['micro', 'tiny', 'small', 'base'], default='tiny',
                         help='Model size: micro (10M), tiny (100M), small (1B), base (12B) (default: tiny)')
 
     # Training Stage
-    parser.add_argument('--stage', type=int, choices=[1, 2, 3], default=1,
-                        help='Training stage: 1=Base MoE pre-training (default), '
-                             '2=Memory fine-tuning (not yet implemented), '
-                             '3=RL meta-controller training')
+    parser.add_argument('--stage', type=int, choices=[1, 2, 3, 4], default=1,
+                        help='1=Base MoE pre-training (default), 2=Memory fine-tuning, '
+                             '3=RL meta-controller training, 4=Critic training')
 
     # Stage 3 (RL) specific options
     parser.add_argument('--rl-episodes', type=int, default=50000,
                         help='Number of RL episodes for stage 3 (default: 50000)')
     parser.add_argument('--rl-batch-size', type=int, default=256,
-                        help='RL batch size for stage 3 (default: 256)')
+                        help='Episodes collected per PPO update in stage 3 (default: 256)')
+    parser.add_argument('--memory-checkpoint', type=str,
+                        help='Stage 3: Stage 2 output (memory_system_*.pt) enabling episodic memory')
+    parser.add_argument('--semantic-store', type=str,
+                        help='Stage 3: semantic memory store prefix saved by Stage 2 (e.g. ckpt/semantic_memory)')
+    parser.add_argument('--critic-checkpoint', type=str,
+                        help='Stage 3: Stage 4 output (critic_*.pt) enabling verification')
 
     # Training
     parser.add_argument('--epochs', type=int, default=20, help='Training epochs (default: 20)')
     parser.add_argument('--batch-size', type=int, default=8, help='Batch size per GPU (default: 8)')
-    parser.add_argument('--learning-rate', type=float, default=3e-4, help='Peak learning rate (default: 3e-4)')
+    parser.add_argument('--learning-rate', type=float,
+                        help='Peak learning rate (default: 3e-4 for stage 1, config values for stages 2-4)')
     parser.add_argument('--weight-decay', type=float, default=0.01, help='Weight decay (default: 0.01)')
-    parser.add_argument('--warmup-steps', type=int, default=1000, help='Warmup steps (default: 1000)')
+    parser.add_argument('--warmup-steps', type=int, default=1000, help='Warmup optimizer steps (default: 1000)')
     parser.add_argument('--steps-per-epoch', type=int, help='Max steps per epoch (default: full dataset)')
     parser.add_argument('--grad-clip', type=float, default=1.0, help='Gradient clipping (default: 1.0)')
 
     # Data loading
-    parser.add_argument('--seq-len', type=int, default=512, help='Sequence length (default: 512)')
+    parser.add_argument('--seq-len', type=int, default=512,
+                        help='Sequence length; also the model attention window for new models (default: 512)')
     parser.add_argument('--stride', type=int, help='Stride for sequences (default: seq-len, non-overlapping)')
     parser.add_argument('--num-workers', type=int, default=4, help='DataLoader workers (default: 4)')
 
     # Validation
-    parser.add_argument('--eval-every', type=int, help='Evaluate every N steps (default: off)')
+    parser.add_argument('--eval-every', type=int, help='Evaluate every N optimizer steps (default: off)')
     parser.add_argument('--patience', type=int, help='Early stopping patience in epochs (default: off)')
 
     # Checkpointing
@@ -1274,9 +906,9 @@ Examples:
     parser.add_argument('--use-8bit-optimizer', action='store_true',
                         help='Use 8-bit AdamW optimizer (saves ~50%% optimizer memory, requires bitsandbytes)')
     parser.add_argument('--deepspeed', action='store_true',
-                        help='Enable DeepSpeed ZeRO-3 for multi-GPU training (auto-detected, handles mixed VRAM)')
+                        help='Enable DeepSpeed ZeRO-2 for multi-GPU training')
     parser.add_argument('--cpu-offload', action='store_true',
-                        help='Offload DeepSpeed optimizer and parameters to CPU (requires --deepspeed, slower but lower GPU memory)')
+                        help='Offload DeepSpeed optimizer state to CPU (requires --deepspeed)')
     parser.add_argument('--auto-batch', action='store_true',
                         help='Automatically set batch size based on VRAM estimation '
                              '(always active for multi-GPU; this flag enables it for single-GPU too). '
@@ -1284,139 +916,39 @@ Examples:
 
     args = parser.parse_args()
 
-    # Validate data source
-    if args.hf_dataset:
-        # Using HuggingFace dataset
-        if args.train_file:
-            print("Warning: --hf-dataset provided, ignoring train_file argument")
-        if args.pretokenized:
-            print("Error: Cannot use --pretokenized with --hf-dataset")
-            return
-        if not DATASETS_AVAILABLE:
-            print("Error: HuggingFace datasets requires 'datasets' library. Install with: pip install datasets")
-            return
-        if args.streaming and args.val_split:
-            print("Error: --val-split not supported with --streaming. Use --hf-val-split instead.")
-            return
-        if args.val_file:
-            print("Error: Cannot use --val-file with --hf-dataset. Use --hf-val-split instead.")
-            return
-    else:
-        # Using local files
-        if not args.train_file:
-            print("Error: Either train_file or --hf-dataset must be provided")
-            return
-        if not os.path.exists(args.train_file):
-            print(f"Error: Training {'dataset' if args.pretokenized else 'file'} not found: {args.train_file}")
-            return
-        if args.val_file and not os.path.exists(args.val_file):
-            print(f"Error: Validation {'dataset' if args.pretokenized else 'file'} not found: {args.val_file}")
-            return
-        if args.streaming:
-            print("Error: --streaming only works with --hf-dataset")
-            return
-        if args.hf_train_split or args.hf_val_split or args.hf_config or args.hf_text_column != 'text':
-            print("Error: HuggingFace-specific arguments require --hf-dataset")
-            return
-
-    # Validate resumption arguments
-    if args.resume:
-        if not os.path.exists(args.resume):
-            print(f"Error: Checkpoint not found: {args.resume}")
-            return
-        if not args.tokenizer_path:
-            checkpoint_dir = os.path.dirname(args.resume)
-            tokenizer_dir = os.path.join(checkpoint_dir, 'tokenizer')
-            print("Error: --tokenizer-path required when resuming from checkpoint")
-            if os.path.exists(tokenizer_dir):
-                print(f"       Try: --tokenizer-path {tokenizer_dir}")
-            else:
-                print(f"       Use the tokenizer from the original training run")
-            return
-
-    # Validate val-split arguments
-    if args.val_split and args.val_file:
-        print("Error: Cannot use both --val-split and --val-file. Choose one:")
-        print("  --val-split: Auto-split from training data (convenience mode)")
-        print("  --val-file: Use pre-split validation data (production mode)")
-        return
-    if args.val_split and (args.val_split <= 0 or args.val_split >= 1):
-        print(f"Error: --val-split must be between 0 and 1, got {args.val_split}")
+    error = validate_stage1_args(args) if args.stage == 1 else validate_later_stage_args(args)
+    if error:
+        print(f"Error: {error}")
         return
 
-    # Validate pretokenized mode
-    if args.pretokenized and not DATASETS_AVAILABLE:
-        print("Error: --pretokenized requires 'datasets' library. Install with: pip install datasets")
-        return
+    if args.stage == 1 and args.learning_rate is None:
+        args.learning_rate = 3e-4
 
-    # Auto-adjust num_workers for streaming mode
     if args.streaming and args.num_workers > 0:
         print(f"\n⚠️  Streaming mode detected: setting num_workers=0 (was {args.num_workers})")
-        print("   Streaming datasets require num_workers=0 to avoid shard distribution issues")
         args.num_workers = 0
 
     # GPU configuration for Accelerate
     if args.gpu_ids:
         os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, args.gpu_ids))
 
-    # Run training based on stage
+    titles = {1: "Base MoE Pre-training", 2: "Memory Fine-tuning",
+              3: "RL Training (Meta-Controller Optimization)", 4: "Critic Training"}
+    print(f"\n{'='*80}")
+    print(f"STAGE {args.stage}: {titles[args.stage]}")
+    print(f"{'='*80}\n")
+
     if args.stage == 1:
-        # Stage 1: Base MoE pre-training (current implementation)
-        print(f"\n{'='*80}")
-        print("STAGE 1: Base MoE Pre-training")
-        print(f"{'='*80}\n")
         train(args)
-
     elif args.stage == 2:
-        # Stage 2: Memory fine-tuning
-        print(f"\n{'='*80}")
-        print("STAGE 2: Memory Fine-tuning")
-        print(f"{'='*80}\n")
-
-        if not args.resume:
-            raise ValueError(
-                "Stage 2 requires a pre-trained model from Stage 1.\n"
-                "Use: --resume checkpoints/stage1/best_model.pt --tokenizer-path checkpoints/stage1/tokenizer"
-            )
-
-        # Import memory training components
-        try:
-            from mantis.training.memory_train import train_memory_stage
-        except ImportError as e:
-            raise ImportError(
-                f"Failed to import memory training module: {e}\n\n"
-                "Stage 2 requires memory training implementation in mantis/training/memory_train.py"
-            )
-
-        # Run memory fine-tuning
+        from mantis.training.memory_train import train_memory_stage
         train_memory_stage(args)
-
     elif args.stage == 3:
-        # Stage 3: RL training for meta-controller
-        print(f"\n{'='*80}")
-        print("STAGE 3: RL Training (Meta-Controller Optimization)")
-        print(f"{'='*80}\n")
-
-        if not args.resume:
-            raise ValueError(
-                "Stage 3 requires a pre-trained model from Stage 1.\n"
-                "Use: --resume checkpoints/stage1/best_model.pt --tokenizer-path checkpoints/stage1/tokenizer"
-            )
-
-        # Import RL training components
-        try:
-            from mantis.training.rl_train import train_rl_stage
-        except ImportError as e:
-            raise ImportError(
-                f"Failed to import RL training module: {e}\n\n"
-                "Stage 3 requires RL training implementation in mantis/training/rl_train.py"
-            )
-
-        # Run RL training
+        from mantis.training.rl_train import train_rl_stage
         train_rl_stage(args)
-
     else:
-        raise ValueError(f"Invalid stage: {args.stage}. Must be 1, 2, or 3.")
+        from mantis.training.critic_train import train_critic_stage
+        train_critic_stage(args)
 
 
 if __name__ == '__main__':

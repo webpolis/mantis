@@ -23,23 +23,20 @@ def estimate_model_params(config):
     H = config.n_heads
     F = config.d_ff
     E = config.n_experts
-    S = config.max_seq_len
 
-    # Embeddings (lm_head is tied to token_embedding, so 0 extra)
-    embed_params = V * D + S * D
+    # Token embeddings (lm_head is tied; RoPE has no parameters)
+    embed_params = V * D
 
-    # Per-layer attention: nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-    #   in_proj_weight: 3 * D * D, in_proj_bias: 3 * D
-    #   out_proj.weight: D * D, out_proj.bias: D
+    # Per-layer attention: qkv Linear(D, 3D) + out Linear(D, D), with biases
     attn_params = 4 * D * D + 4 * D
 
     # Per-layer norms: attn_norm + ff_norm, each LayerNorm(D) = weight(D) + bias(D)
     norm_params = 4 * D
 
     # Per-layer MoE:
-    #   gate: Linear(D, E) = D * E + E
+    #   gate: Linear(D, E) = D * E + E (absent in dense blocks, E == 1)
     #   E experts, each: w1(D, F) + w2(F, D) = 2*D*F + F + D
-    gate_params = D * E + E
+    gate_params = D * E + E if E > 1 else 0
     expert_params = E * (2 * D * F + F + D)
     moe_params = gate_params + expert_params
 
