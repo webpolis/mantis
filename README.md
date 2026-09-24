@@ -39,36 +39,22 @@ python train.py --stage 1 \
 
 ## Training Pipeline
 
-MANTIS trains in four stages. Stage 1 is required; Stages 2 and 4 each need only Stage 1, and Stage 3 uses whatever Stages 2 and 4 produced:
+MANTIS trains in four stages, but they do not form a chain. Only Stage 1 trains the base model. Stages 2–4 each train a separate component and leave the base model unchanged, which is why all of them pass the Stage 1 checkpoint to `--resume`. Stage 3 then picks up the Stage 2 and Stage 4 outputs through their own flags:
 
+```mermaid
+flowchart LR
+    S1["Stage 1 (required)<br/>Base MoE pre-training<br/>best_model.pt + tokenizer/"]
+    S2["Stage 2<br/>Memory fine-tuning<br/>episodic SSM + semantic store"]
+    S4["Stage 4<br/>Critic training<br/>critic_best.pt"]
+    S3["Stage 3<br/>RL routing policy<br/>meta_controller_rl.pt"]
+    S1 -- "--resume (frozen base)" --> S2
+    S1 -- "--resume (config + tokenizer)" --> S4
+    S1 -- "--resume (frozen base)" --> S3
+    S2 -. "--memory-checkpoint<br/>--semantic-store" .-> S3
+    S4 -. "--critic-checkpoint" .-> S3
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Stage 1: Base MoE Pre-training (REQUIRED)                     │
-│  ├─ Trains: Transformer backbone + MoE experts                 │
-│  ├─ Duration: Days-weeks                                        │
-│  └─ Output: Functional LLM ready for text generation            │
-└─────────────────────────────────────────────────────────────────┘
-                            ↓
-┌─────────────────────────────────────────────────────────────────┐
-│  Stage 2: Memory Fine-tuning (OPTIONAL)                        │
-│  ├─ Trains: Episodic + Semantic memory systems                 │
-│  ├─ Duration: Days                                              │
-│  └─ Output: Extended context beyond 8K tokens                   │
-└─────────────────────────────────────────────────────────────────┘
-                            ↓
-┌─────────────────────────────────────────────────────────────────┐
-│  Stage 4: Critic Training (OPTIONAL)                           │
-│  ├─ Trains: Hallucination critic (enables verification)        │
-│  └─ Output: critic_best.pt                                      │
-└─────────────────────────────────────────────────────────────────┘
-                            ↓
-┌─────────────────────────────────────────────────────────────────┐
-│  Stage 3: RL Training (OPTIONAL)                               │
-│  ├─ Trains: Meta-controller routing policy                     │
-│  ├─ Duration: Hours-days                                        │
-│  └─ Output: Adaptive compute & improved efficiency             │
-└─────────────────────────────────────────────────────────────────┘
-```
+
+The dotted inputs are optional. Without them, Stage 3 keeps the matching gates closed. Run Stages 2 and 4 in any order, then Stage 3.
 
 **What you need**:
 - Basic LLM: Stage 1 only
