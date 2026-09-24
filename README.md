@@ -60,6 +60,12 @@ MANTIS uses a **3-stage training pipeline**. Each stage builds on the previous:
 └─────────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────────┐
+│  Stage 4: Critic Training (OPTIONAL)                           │
+│  ├─ Trains: Hallucination critic (enables verification)        │
+│  └─ Output: critic_best.pt                                      │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
 │  Stage 3: RL Training (OPTIONAL)                               │
 │  ├─ Trains: Meta-controller routing policy                     │
 │  ├─ Duration: Hours-days                                        │
@@ -195,7 +201,7 @@ python train.py --stage 1 data/train.txt \
     --val-split 0.1
 # Effective batch: 2 × 4 × num_gpus = 8 per GPU
 
-# DeepSpeed ZeRO-3 (for very large models or mixed VRAM)
+# DeepSpeed ZeRO-2 with optimizer offload (for very large models or mixed VRAM)
 python train.py --stage 1 data/train.txt \
     --deepspeed \
     --cpu-offload \
@@ -300,10 +306,10 @@ python train.py --stage 1 \
 
 ## Stage 2: Memory Fine-tuning (OPTIONAL)
 
-**What it trains**: Hierarchical memory systems for extended context
-- Episodic memory (SSM-based, 8K recent context)
-- Semantic memory (FAISS vector DB, 1M+ long-term entries)
-- Memory consolidation (episodic → semantic transfer)
+**What it trains**: Hierarchical memory systems for extended context, with the Stage 1 model frozen
+- Episodic memory SSM: a query's state learns to match its context's state (contrastive)
+- Semantic projection: projected query embeddings learn to retrieve their context (contrastive)
+- Afterwards every context goes into a semantic memory store (`semantic_memory.index/.meta`)
 
 **When to use**: If you need context beyond the 8K attention window
 
@@ -319,16 +325,31 @@ python train.py --stage 2 \
     --epochs 5 \
     --output-dir checkpoints/stage2
 
-# With custom dataset (recommended for production)
-python train.py --stage 2 \
+# With your own data (recommended): JSONL lines of {"query": ..., "context": ...}
+python train.py --stage 2 data/memory.jsonl \
     --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
-    --hf-dataset QuALITY \
     --epochs 5 \
-    --steps-per-epoch 500
+    --steps-per-epoch 500 \
+    --output-dir checkpoints/stage2
 ```
 
-**Note**: Uses demo dataset by default. For production, provide long-context datasets (QuALITY, NarrativeQA, etc.).
+**Note**: Without a data file, Stage 2 uses an 8-pair demo set. Build real pairs from long-context datasets (QuALITY, NarrativeQA, etc.). Stage 1-only flags such as `--hf-dataset` or `--mixed-precision` are rejected.
+
+---
+
+## Stage 4: Critic Training (OPTIONAL)
+
+**What it trains**: The critic that scores whether a response is correct. A trained critic enables the verification gate in Stage 3 and in the full engine.
+
+```bash
+# JSONL lines of {"query": ..., "response": ..., "facts": ... (optional), "label": 0 or 1}
+python train.py --stage 4 data/critic.jsonl \
+    --resume checkpoints/stage1/best_model.pt \
+    --tokenizer-path checkpoints/stage1/tokenizer \
+    --epochs 3 \
+    --output-dir checkpoints/critic
+```
 
 ---
 
@@ -344,7 +365,7 @@ python train.py --stage 2 \
 - PPO (Proximal Policy Optimization)
 - Multi-objective reward: accuracy - 0.3×latency - 0.2×compute + 0.5×calibration
 
-**When to use**: After Stage 1 (or Stage 2) to optimize dynamic routing and efficiency
+**When to use**: After Stage 1 to optimize dynamic routing and efficiency. Each optional component (Stage 2 memory, Stage 2 semantic store, Stage 4 critic) enables its gate; without it the gate stays closed.
 
 **Status**: IMPLEMENTED
 
@@ -359,15 +380,18 @@ python train.py --stage 3 \
     --rl-batch-size 256 \
     --output-dir checkpoints/stage3
 
-# After Stage 2 (with memory systems)
-python train.py --stage 3 \
-    --resume checkpoints/stage2/memory_system_final.pt \
+# All gates, with your own JSONL lines of {"query": ..., "answer": ...}
+python train.py --stage 3 data/qa.jsonl \
+    --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
+    --memory-checkpoint checkpoints/stage2/memory_system_final.pt \
+    --semantic-store checkpoints/stage2/semantic_memory \
+    --critic-checkpoint checkpoints/critic/critic_best.pt \
     --rl-episodes 100000 \
     --output-dir checkpoints/stage3_full
 ```
 
-**Note**: Uses demo dataset by default (10 Q&A pairs). For production, provide large Q&A datasets (1000+ examples).
+**Note**: Without a data file, Stage 3 uses a 10-pair demo set. For production, provide 1000+ query-answer pairs. The saved `meta_controller_rl.pt` records the component paths, so `MANTISInferenceEngine.from_checkpoints(policy_checkpoint=...)` rebuilds the full engine.
 
 **Expected Results**:
 - Improved efficiency via adaptive routing
@@ -404,11 +428,13 @@ python inference.py checkpoints/stage1/best_model.pt \
     --input prompts.txt \
     --output results.txt
 
-# Quantized inference (2-4x faster)
+# INT8 dynamic quantization (always runs on CPU)
 python inference.py checkpoints/stage1/best_model.pt \
     --prompt "Hello world" \
     --quantize int8
 ```
+
+The model's context window equals the `--seq-len` it was trained with. Longer generations re-encode the most recent half-window when the cache fills.
 
 **RTX 3060 Known Issue**: If you encounter `CUBLAS_STATUS_NOT_INITIALIZED` errors:
 ```bash
@@ -425,7 +451,7 @@ python inference.py checkpoints/stage1/best_model.pt --prompt "Hello"
 
 | Flag | Description | Example |
 |------|-------------|---------|
-| `--stage` | Training stage (1, 2, or 3) | `--stage 1` |
+| `--stage` | Training stage (1-4) | `--stage 1` |
 | `--model-size` | Model size (micro/tiny/small/base) | `--model-size small` |
 | `--hf-dataset` | HuggingFace dataset name | `--hf-dataset wikitext` |
 | `--streaming` | Stream without download | `--streaming` |
@@ -436,7 +462,7 @@ python inference.py checkpoints/stage1/best_model.pt --prompt "Hello"
 | `--mixed-precision` | Use FP16 (2x memory save) | `--mixed-precision` |
 | `--gradient-checkpointing` | Trade compute for memory | `--gradient-checkpointing` |
 | `--use-8bit-optimizer` | 8-bit AdamW (50% optimizer memory) | `--use-8bit-optimizer` |
-| `--deepspeed` | Enable DeepSpeed ZeRO-3 | `--deepspeed` |
+| `--deepspeed` | Enable DeepSpeed ZeRO-2 | `--deepspeed` |
 | `--gpu-ids` | Select specific GPUs | `--gpu-ids 0 2` |
 
 Full list: `python train.py --help`
@@ -444,7 +470,7 @@ Full list: `python train.py --help`
 ### Validation Options
 
 ```bash
-# Auto-split (convenient, reshuffles each run)
+# Auto-split at document boundaries (convenient; no document lands in both splits)
 --val-split 0.1
 
 # Pre-split file (reproducible, production)
@@ -543,7 +569,7 @@ python train.py --stage 1 data/train.txt \
     --mixed-precision \
     --val-split 0.1
 
-# Or use DeepSpeed ZeRO-3 (handles automatically)
+# Or use DeepSpeed ZeRO-2 (shards optimizer state across GPUs)
 python train.py --stage 1 data/train.txt \
     --deepspeed \
     --batch-size 2 \
@@ -643,7 +669,7 @@ Stores embeddings in RAM (12GB+ for 1M entries).
 - **Solution**: Disk-backed storage planned for production
 
 ### TextDataset Memory
-Loads all tokens into RAM (not true streaming).
+Loads all tokens into RAM (2 bytes per token, not true streaming). Text files hold documents separated by blank lines; each document ends with one EOS token.
 - **Limit**: ~10GB text files on 32GB RAM systems
 - **Solution**: Use `--pretokenized` or `--hf-dataset --streaming`
 
@@ -659,16 +685,16 @@ python scripts/run_eval.py checkpoints/stage1/best_model.pt \
     --tokenizer checkpoints/stage1/tokenizer \
     --all --demo
 
-# Run specific benchmarks
+# Run specific benchmarks (downloaded from the HuggingFace Hub)
 python scripts/run_eval.py checkpoints/stage1/best_model.pt \
     --tokenizer checkpoints/stage1/tokenizer \
-    --benchmarks mmlu truthfulqa \
+    --benchmarks mmlu truthfulqa --limit 500 \
     --output results.json
 
-# After downloading real datasets
+# Full MANTIS engine rebuilt from a Stage 3 policy
 python scripts/run_eval.py checkpoints/stage1/best_model.pt \
-    --tokenizer checkpoints/stage1/tokenizer \
     --all \
+    --policy-checkpoint checkpoints/stage3/meta_controller_rl.pt \
     --output full_results.json
 ```
 
@@ -678,7 +704,7 @@ python scripts/run_eval.py checkpoints/stage1/best_model.pt \
 - HumanEval (code generation)
 - GSM8K (math reasoning)
 
-**Metrics**: Accuracy, F1, hallucination rate, calibration error, pass rate
+**Metrics**: Accuracy, hallucination rate, calibration error, pass rate. Confidence is the geometric-mean probability of the generated tokens. TruthfulQA counts a response as truthful when it is closer (token F1) to a true reference than to any false one. HumanEval runs generated code in a resource-limited subprocess, which is not a security sandbox.
 
 ---
 

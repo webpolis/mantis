@@ -50,22 +50,31 @@ python train.py --stage 1 data/train.txt \
     --val-split 0.1
 ```
 
-### Stage 2: Memory Fine-tuning (OPTIONAL)
+### Stages 2-4 (OPTIONAL)
+
+Each takes the Stage 1 model and an optional JSONL file (demo data without it). Stage 1-only flags are rejected.
 
 ```bash
-python train.py --stage 2 \
+# Stage 2: memory fine-tuning. JSONL: {"query", "context"}
+python train.py --stage 2 data/memory.jsonl \
     --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
-    --epochs 5
-```
+    --epochs 5 --output-dir checkpoints/stage2
 
-### Stage 3: RL Training (OPTIONAL)
-
-```bash
-python train.py --stage 3 \
+# Stage 4: critic training. JSONL: {"query", "response", "facts"?, "label"}
+python train.py --stage 4 data/critic.jsonl \
     --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
-    --rl-episodes 50000
+    --output-dir checkpoints/critic
+
+# Stage 3: RL routing policy. JSONL: {"query", "answer"}. Each optional component enables its gate.
+python train.py --stage 3 data/qa.jsonl \
+    --resume checkpoints/stage1/best_model.pt \
+    --tokenizer-path checkpoints/stage1/tokenizer \
+    --memory-checkpoint checkpoints/stage2/memory_system_final.pt \
+    --semantic-store checkpoints/stage2/semantic_memory \
+    --critic-checkpoint checkpoints/critic/critic_best.pt \
+    --rl-episodes 50000 --output-dir checkpoints/stage3
 ```
 
 ## Evolution Curriculum Training
@@ -100,9 +109,10 @@ python train_evo.py --bio data/evo_bio.txt \
 
 **Key differences from `train.py`**:
 - Uses `EvoWorldDataset` (world-boundary-aware chunking, never crosses `\n\n` boundaries)
-- Per-token loss weights via `tokenizer.compute_loss_weights()` (protocol markers set weight for subsequent tokens)
-- `CurriculumDataset` (IterableDataset) mixes partitions with shifting proportions across training
-- `--steps-per-epoch` is required (IterableDataset has no length)
+- Per-token loss weights via `tokenizer.compute_loss_weights()`, computed once per whole world (protocol markers set weight for subsequent tokens); ignored labels get weight 0
+- `--val-split` holds out whole worlds per partition
+- `CurriculumDataset` is an endless stream; partitions are addressed by name, and each schedule entry sets token shares that follow training progress (micro-steps done / planned)
+- `--steps-per-epoch` defines an epoch (required); the LR schedule and curriculum both follow it
 - Three schedule presets: `default` (gradual shift), `linear`, `bio-only`
 
 ## Inference Commands
@@ -120,11 +130,13 @@ python inference.py checkpoints/stage1/best_model.pt \
     --prompt "Hello" \
     --temperature 0
 
-# Quantized inference (2-4x faster)
+# INT8 dynamic quantization (always runs on CPU)
 python inference.py checkpoints/stage1/best_model.pt \
     --prompt "Hello" \
     --quantize int8
 ```
+
+All decode loops share `mantis/inference/generation.py`: KV cache, banned tokens (pad, bos, unk, reserved), and a context window of `max_seq_len`. When the cache fills, the latest half-window is re-encoded from scratch.
 
 ### Evolution Inference
 
@@ -165,33 +177,23 @@ python inference.py checkpoints/stage1/best_model.pt --prompt "Hello"
 
 This bug affects RTX 30xx/40xx series and A-series Ampere GPUs at sequence length ≥5 with large vocabulary matrices (128K tokens). The workaround is automatically applied in `train.py`, `train_evo.py`, `inference.py`, and `inference_evo.py`.
 
-## Testing
-
-```bash
-# Run all tests
-python -m pytest tests/ -v
-
-# Run specific test suite
-python -m pytest tests/test_models.py -v
-
-# With coverage
-python -m pytest tests/ --cov=mantis --cov-report=html
-```
-
 ## Evaluation
 
 ```bash
 # Test with demo dataset
-python scripts/run_eval.py checkpoints/stage1/best_model.pt \
-    --tokenizer checkpoints/stage1/tokenizer \
-    --all --demo
+python scripts/run_eval.py checkpoints/stage1/best_model.pt --all --demo
 
-# Run specific benchmarks
+# Run specific benchmarks (downloaded from the HuggingFace Hub)
 python scripts/run_eval.py checkpoints/stage1/best_model.pt \
-    --tokenizer checkpoints/stage1/tokenizer \
-    --benchmarks mmlu truthfulqa \
+    --benchmarks mmlu truthfulqa --limit 500 \
     --output results.json
+
+# Evaluate the full engine rebuilt from a Stage 3 policy
+python scripts/run_eval.py checkpoints/stage1/best_model.pt --all \
+    --policy-checkpoint checkpoints/stage3/meta_controller_rl.pt
 ```
+
+Confidence is the geometric-mean probability of generated tokens. TruthfulQA counts a response as truthful when it is closer (token F1) to a true reference than to any false one. HumanEval runs generated code in a resource-limited subprocess, which is not a security sandbox.
 
 ## Architecture Overview
 
@@ -209,14 +211,19 @@ mantis/
 │   ├── semantic.py      # FAISS-based long-term memory (1M+ entries)
 │   └── consolidation.py # Memory transfer logic
 ├── training/            # Training pipelines
-│   ├── pretrain.py      # Stage 1: Base MoE pre-training
+│   ├── common.py        # Accelerator, optimizer, LR schedule shared by train.py/train_evo.py
+│   ├── pretrain.py      # Standalone single-GPU Stage 1 trainer (train.py is the main path)
 │   ├── memory_train.py  # Stage 2: Memory fine-tuning
-│   └── rl_train.py      # Stage 3: RL meta-controller training
+│   ├── rl_train.py      # Stage 3: RL meta-controller training
+│   └── critic_train.py  # Stage 4: Critic training
 ├── inference/           # Generation engine
+│   ├── generation.py    # Shared decode loop (cache, window, sampling)
 │   └── engine.py        # Dynamic routing and generation
 ├── configs/             # Configuration management
 │   └── model_config.py  # Presets: micro/tiny/small/base
-└── tokenizer.py         # MANTISTokenizer (trie-based, 512 tokens)
+├── utils/checkpoints.py # Checkpoint schema, model/tokenizer loading
+├── data.py              # Documents, EOS, packing, leak-free splits
+└── tokenizer.py         # MANTISTokenizer (trie-based, 512 tokens, byte fallback)
 
 evaluation/              # Evaluation harness
 ├── benchmarks.py        # MMLU, TruthfulQA, HumanEval, GSM8K
@@ -237,10 +244,11 @@ scripts/                 # Utility scripts
 #### BaseMoEModel (`mantis/models/base_moe.py`)
 
 Sparse MoE transformer with:
-- 8 experts, top-2 routing
-- Load balancing loss
+- 8 experts, top-2 routing (dense feedforward when `n_experts == 1`, e.g. micro)
+- Load balancing loss, weighted by `load_balance_weight`
 - Scales from 100M to 12B parameters
-- Standard transformer backbone with rotary positional embeddings
+- Pre-norm transformer backbone with rotary positional embeddings and `scaled_dot_product_attention`
+- `max_seq_len` is the attention window; new models set it to the training `--seq-len`
 
 **Important**: The model uses `top_k=2` sparse routing by default. When modifying expert selection, ensure load balancing loss is maintained to prevent expert collapse.
 
@@ -255,7 +263,7 @@ RL-trainable routing controller with 5 gates:
 4. **Expert selection**: Additive bias to MoE routing (raw logits, not probabilities)
 5. **Verification**: Trigger critic model
 
-Trained with PPO in Stage 3. Gates 1-3 and 5 output continuous values [0,1] thresholded for binary decisions. Gate 4 outputs raw logits applied as bias to learned routing.
+A residual MLP over the pooled query embedding and a state summary. Trained with PPO in Stage 3 as a stochastic policy: gates 1-3 and 5 are Bernoulli, and gate 4 is a Gaussian around its raw logits. Deterministic inference thresholds gate probabilities (`InferenceConfig.routing_threshold`) and uses the Gaussian mean as the routing bias. A gate whose component is missing stays 0 and adds nothing to the policy log-probability.
 
 #### Memory Systems
 
@@ -263,23 +271,26 @@ Trained with PPO in Stage 3. Gates 1-3 and 5 output continuous values [0,1] thre
 - Mamba SSM using mamba-ssm library (CUDA-optimized)
 - 8K token window
 - L2 cache in memory hierarchy
-- Thread-safe operations with locking for concurrent access
+- The engine stores every query and response; retrieval returns token IDs, which the engine decodes into context
+- Entries have unique IDs; thread-safe operations with locking and snapshots
 
 **Semantic Memory** (`mantis/memory/semantic.py`):
-- FAISS vector database with IndexIDMap for efficient deletion
+- FAISS vector database with stable IDs; eviction tombstones IDs and the index rebuilds when >20% are stale
+- IVF serves exact search until 10K entries, then trains with a cluster count sized to the data
+- Optional projection (trained in Stage 2) applied before L2-normalized indexing
 - 1M+ entries capacity
 - L3 cache in memory hierarchy
-- Deferred IVF index rebuild (only when >20% entries stale)
 - **WARNING**: Stores embeddings in RAM (12GB+ for 1M entries). Limit to ~100K entries on 16GB RAM systems.
 
 **Consolidation** (`mantis/memory/consolidation.py`):
 - Background transfer from episodic → semantic
-- Uses importance scoring and decay
-- Encodes facts using base model embeddings (no longer placeholder)
+- Uses importance scoring and similarity grouping; stores each group's decoded text
+- Encodes facts using base model embeddings, like queries
+- Removes only entries whose semantic write succeeded
 
 #### Critic Model (`mantis/models/critic.py`)
 
-1-2B parameter verification model for hallucination detection via consistency checking. Used when meta-controller triggers verification gate.
+1-2B parameter verification model for hallucination detection via consistency checking. Trained in Stage 4. Used when meta-controller triggers verification gate; inputs are truncated to its `max_seq_len` budget.
 
 ### Model Configuration
 
@@ -292,16 +303,18 @@ Model sizes are defined in `mantis/configs/model_config.py`:
 
 **Vocabulary**: All models use 512 tokens (custom domain-specific trie tokenizer, synced at runtime via `len(tokenizer)`).
 
-**Critical alignment requirements** (validated in `MANTISConfig.__post_init__`):
+**Critical alignment requirements** (checked by `MANTISConfig.validate()`, which runs at construction and after each preset):
 - `MetaControllerConfig.d_model` must match `BaseMoEConfig.d_model`
 - `MetaControllerConfig.n_experts` must match `BaseMoEConfig.n_experts`
 - `SemanticMemoryConfig.dimension` must match `BaseMoEConfig.d_model`
+- `EpisodicMemoryConfig.d_model` must match `BaseMoEConfig.d_model`
+- `d_model / n_heads` must be an even integer (RoPE)
 
-When adding new model sizes, ensure these dimensions are synchronized. Config mismatches will raise assertions at initialization.
+Add new model sizes through `_sized_config()`, which aligns these fields. Mismatches raise `ValueError`.
 
 ### Training Pipeline
 
-MANTIS uses a 3-stage training pipeline:
+MANTIS uses a staged training pipeline:
 
 1. **Stage 1 (REQUIRED)**: Base MoE pre-training
    - Standard next-token prediction
@@ -313,12 +326,17 @@ MANTIS uses a 3-stage training pipeline:
    - Enables context beyond 8K tokens
    - Requires Stage 1 checkpoint
 
-3. **Stage 3 (OPTIONAL)**: RL training
-   - Trains meta-controller routing policy with PPO
-   - Optimizes accuracy/latency/compute trade-offs
-   - Requires Stage 1 (or Stage 2) checkpoint
+3. **Stage 4 (OPTIONAL)**: Critic training
+   - Supervised correctness classifier; enables the verification gate
+   - Requires Stage 1 checkpoint (config and tokenizer)
 
-Each stage builds on the previous. Training is implemented in `mantis/training/` with separate modules per stage.
+4. **Stage 3 (OPTIONAL)**: RL training
+   - Trains meta-controller routing policy and state encoder with PPO
+   - Optimizes accuracy/latency/compute trade-offs
+   - Requires Stage 1 checkpoint; Stage 2 and Stage 4 outputs enable their gates
+   - Saves `meta_controller_rl.pt`, which records component paths; `MANTISInferenceEngine.from_checkpoints(policy_checkpoint=...)` rebuilds the full engine
+
+Stages 2 and 4 depend only on Stage 1. Training is implemented in `mantis/training/` with separate modules per stage.
 
 ## Development Guidelines
 
@@ -337,41 +355,40 @@ The main training script (`train.py`) uses HuggingFace Accelerate for:
 - Multi-GPU training (auto-detected)
 - Mixed precision (FP16)
 - Gradient accumulation
-- DeepSpeed ZeRO-3 (optional)
+- DeepSpeed ZeRO-2 (optional; checkpoints then omit the sharded optimizer state)
+- DDP with `find_unused_parameters=True` (experts without tokens get no gradient)
 
 **Critical**: When modifying training loop:
 - Restore model state using `accelerator.unwrap_model()` before loading checkpoints
 - Round `steps_per_epoch` to nearest multiple of `gradient_accumulation_steps` to prevent stale gradient leakage
-- Validate tokenizer exists when resuming (`--tokenizer-path` required)
-- Save checkpoints with `config` dict for proper resumption
+- Step the LR scheduler manually once per real optimizer update; `accelerator.prepare(scheduler)` steps it once per process
+- Validate tokenizer exists when resuming (`--tokenizer-path` required); checkpoints store a tokenizer fingerprint that must match
+- Save checkpoints with `save_training_checkpoint()`: config, optimizer/scheduler/scaler/RNG state, and the position (`epoch` completed, `epoch_step` batches into the next). Mid-epoch checkpoints resume at the exact batch
 
 ### Dataset Handling
+
+All modes follow `mantis/data.py`: documents are separated by blank lines (one HuggingFace example = one document), each gets one EOS, and documents are packed into windows of `seq_len + 1` tokens every `--stride` tokens.
 
 Three dataset modes supported:
 
 1. **Raw text** (`TextDataset`): Tokenizes on-the-fly, slower but simple
 2. **Pre-tokenized** (`PreTokenizedDataset`): 5-10x faster, requires preprocessing with `scripts/preprocess_data.py`
-3. **HuggingFace streaming** (`HuggingFaceDataset`): No download needed, use with `--streaming` flag
+3. **HuggingFace streaming** (`StreamingTextDataset`): No download needed, use with `--streaming` and `--steps-per-epoch`; reshuffled per epoch; cap validation with `--val-max-batches`
 
-**WARNING**: `TextDataset` loads all tokens into RAM (not true streaming). For files >10GB, use `--pretokenized` or `--hf-dataset --streaming`.
+**WARNING**: `TextDataset` loads all tokens into RAM (2 bytes per token). For files >10GB, use `--pretokenized` or `--hf-dataset --streaming`.
 
 ### Validation Split Modes
 
 Two validation modes:
 
-1. **Auto-split** (`--val-split 0.1`): Convenient for iteration, reshuffles each run
+1. **Auto-split** (`--val-split 0.1`): Convenient for iteration. Raw text splits at a document boundary (last documents), HuggingFace data splits examples, and pre-tokenized data takes the tail windows and drops the windows that would overlap it
 2. **Pre-split** (`--val-file data/val.txt`): Reproducible, recommended for production
 
 Cannot combine both. HuggingFace datasets use `--hf-val-split` instead.
 
 ### Inference Engine
 
-Full MANTIS inference requires all components:
-- Base MoE model
-- Meta-controller
-- Episodic memory
-- Semantic memory
-- Critic model
+Full MANTIS inference needs the base model and meta-controller; episodic memory, semantic memory and the critic are optional, and each enables its gate. `MANTISInferenceEngine.from_checkpoints()` builds the engine from saved artifacts; routing thresholds come from `InferenceConfig`. `generate()` returns only the completion.
 
 For basic generation (Stage 1 only), use `inference.py` which provides simplified inference without memory systems.
 
@@ -386,9 +403,9 @@ Production inference engine is in `mantis/inference/engine.py` and coordinates:
 ### KV Caching
 
 KV caching is implemented in `BaseMoEModel` for efficient inference. When adding new attention mechanisms, ensure:
-- Cache shape: `(batch, n_heads, seq_len, d_head)`
+- Cache shape: `(batch, n_heads, seq_len, d_head)`, keys stored after RoPE
 - Cache is optional (training doesn't use it)
-- Cache grows incrementally during generation
+- Cache grows incrementally during generation; `generation.py` re-encodes the latest half-window when it would exceed `max_seq_len`
 
 ### Known Issues
 
@@ -396,9 +413,9 @@ KV caching is implemented in `BaseMoEModel` for efficient inference. When adding
 
 2. **TextDataset Memory**: Not true streaming, loads all tokens into RAM. Use `--pretokenized` or `--streaming` for large datasets.
 
-3. **RTX 3060 cuBLAS Bug**: Ampere GPUs have kernel bug with large vocab matrices at seq_len ≥5. Automatic workaround applied in `train.py` and `inference.py`.
+3. **RTX 3060 cuBLAS Bug**: Ampere GPUs have kernel bug with large vocab matrices at seq_len ≥5. Automatic workaround applied in `train.py`, `train_evo.py`, `inference.py` and `inference_evo.py`.
 
-4. **mamba-ssm Dependency**: Requires CUDA-capable GPU for compilation and runtime. CPU-only systems cannot use episodic memory.
+4. **mamba-ssm Dependency**: Requires CUDA-capable GPU for compilation and runtime. CPU-only systems cannot use episodic memory. Package imports are lazy, so Stage 1, the tokenizer and basic inference need neither mamba-ssm nor faiss (`pip install -e .[memory]` adds them).
 
 ## Important Notes
 
