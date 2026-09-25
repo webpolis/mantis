@@ -88,7 +88,11 @@ def estimate_training_vram(
     Returns:
         dict with 'model_weights', 'optimizer_state', 'gradients',
         'activations', 'cuda_overhead', 'total' (all in bytes),
-        plus 'fixed' and 'per_sample' subtotals
+        plus 'fixed' and 'per_sample' subtotals and the per-device split used
+        by plan_layer_placement: 'layer_fixed' and 'layer_per_sample' (one
+        transformer block), 'head_fixed' and 'head_per_sample' (embedding,
+        final norm, logits and inputs) and 'recompute_per_sample' (the one
+        block recomputed under gradient checkpointing, once per device)
     """
     params = estimate_model_params(config)
     n_params = params['total']
@@ -139,7 +143,10 @@ def estimate_training_vram(
         reduce_bucket = min(int(5e8) * 2, n_params * 2)
         ds_buffer_bytes += reduce_bucket
 
-    fixed = model_bytes + optim_bytes + grad_bytes + cuda_overhead + ds_buffer_bytes
+    param_bytes = model_bytes + optim_bytes + grad_bytes
+    layer_fixed = param_bytes * (params['per_layer_attn'] + params['per_layer_moe'] + params['per_layer_norms']) // n_params
+    head_fixed = param_bytes - L * layer_fixed + ds_buffer_bytes
+    fixed = param_bytes + cuda_overhead + ds_buffer_bytes
 
     # --- Variable costs (per sample) ---
 
@@ -171,17 +178,6 @@ def estimate_training_vram(
     # Total per-layer: forward acts × 2 (gradients + saved outputs) + extra autograd saves
     per_layer_total = per_layer_acts * 2 + autograd_extras
 
-    if gradient_checkpointing:
-        # Boundary saves: input to each layer (L × seq_len × D)
-        boundary = L * seq_len * D * act_elem
-        # During backward, one layer is recomputed with autograd enabled.
-        # Peak = full forward + autograd saves for that single layer.
-        one_layer_peak = per_layer_total * act_elem
-        activation_per_sample = boundary + one_layer_peak
-    else:
-        # Full activation storage: all L layers
-        activation_per_sample = L * per_layer_total * act_elem
-
     # Overhead multiplier for costs not captured by the analytical formula:
     # - PyTorch allocator block rounding and fragmentation (~10%)
     # - Autograd graph node metadata (~5%)
@@ -193,7 +189,17 @@ def estimate_training_vram(
         overhead = 1.35
     else:
         overhead = 1.15
-    activation_per_sample = int(activation_per_sample * overhead)
+
+    if gradient_checkpointing:
+        # Boundary saves: input to each layer. During backward, one layer at a
+        # time is recomputed with autograd enabled (full forward + saves).
+        layer_per_sample = int(seq_len * D * act_elem * overhead)
+        recompute_per_sample = int(per_layer_total * act_elem * overhead)
+    else:
+        # Full activation storage: all L layers
+        layer_per_sample = int(per_layer_total * act_elem * overhead)
+        recompute_per_sample = 0
+    activation_per_sample = L * layer_per_sample + recompute_per_sample
 
     # Input tensors: input_ids + labels (int64)
     input_per_sample = seq_len * 8 * 2
@@ -201,7 +207,8 @@ def estimate_training_vram(
     # Final logits: seq_len × vocab_size
     logits_per_sample = seq_len * V * act_elem
 
-    per_sample = activation_per_sample + input_per_sample + logits_per_sample
+    head_per_sample = input_per_sample + logits_per_sample
+    per_sample = activation_per_sample + head_per_sample
 
     total = fixed + per_sample * batch_size
 
@@ -216,7 +223,60 @@ def estimate_training_vram(
         'fixed': fixed,
         'per_sample': per_sample,
         'n_params': n_params,
+        'layer_fixed': layer_fixed,
+        'layer_per_sample': layer_per_sample,
+        'head_fixed': head_fixed,
+        'head_per_sample': head_per_sample,
+        'recompute_per_sample': recompute_per_sample,
     }
+
+
+def plan_layer_placement(
+    config,
+    seq_len,
+    batch_size,
+    free_bytes,
+    safety_margin=0.85,
+    mixed_precision=False,
+    gradient_checkpointing=False,
+    use_8bit_optimizer=False,
+):
+    """
+    Assign transformer blocks to devices in order, filling each device's free
+    VRAM before moving to the next (see BaseMoEModel.place_layers).
+
+    Args:
+        config: BaseMoEConfig
+        seq_len: Training sequence length
+        batch_size: Batch size
+        free_bytes: Free VRAM per device, in pipeline order
+        safety_margin: Fraction of free VRAM to fill
+
+    Returns:
+        list[int] device index per layer, or None when the model does not fit
+    """
+    est = estimate_training_vram(
+        config, seq_len, batch_size,
+        mixed_precision=mixed_precision,
+        gradient_checkpointing=gradient_checkpointing,
+        use_8bit_optimizer=use_8bit_optimizer,
+    )
+    budgets = [free * safety_margin for free in free_bytes]
+    per_device = est['cuda_overhead'] + est['recompute_per_sample'] * batch_size
+    layer = est['layer_fixed'] + est['layer_per_sample'] * batch_size
+
+    placement = []
+    device = 0
+    used = per_device + est['head_fixed'] + est['head_per_sample'] * batch_size
+    for _ in range(config.n_layers):
+        while used + layer > budgets[device]:
+            device += 1
+            if device == len(budgets):
+                return None
+            used = per_device
+        placement.append(device)
+        used += layer
+    return placement
 
 
 def compute_optimal_batch_sizes(

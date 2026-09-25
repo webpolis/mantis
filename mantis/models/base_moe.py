@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from typing import Tuple, Optional, Dict, List
+from typing import Tuple, Optional, Dict, List, Sequence
 
 KVCache = List[Tuple[torch.Tensor, torch.Tensor]]
 
@@ -288,6 +288,7 @@ class BaseMoEModel(nn.Module):
         self.n_experts = n_experts
         self.top_k = top_k
         self.gradient_checkpointing = False
+        self.layer_devices: Optional[List[torch.device]] = None
 
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.rotary = RotaryEmbedding(d_model // n_heads)
@@ -337,6 +338,24 @@ class BaseMoEModel(nn.Module):
                 nn.init.ones_(module.weight)
 
         self.apply(_init_module)
+
+    def place_layers(self, devices: Sequence[torch.device]) -> None:
+        """
+        Pipeline the model over several devices: `devices[i]` hosts layer i.
+
+        The embedding, final norm and tied head stay on `devices[0]`, and the
+        hidden state moves between devices inside forward. Devices run one
+        after another, so this adds memory, not speed.
+        """
+        if len(devices) != self.n_layers:
+            raise ValueError(f"place_layers needs one device per layer ({self.n_layers}), got {len(devices)}")
+        devices = [torch.device(d) for d in devices]
+        self.token_embedding.to(devices[0])
+        self.rotary.to(devices[0])
+        self.final_norm.to(devices[0])
+        for layer, device in zip(self.layers, devices):
+            layer.to(device)
+        self.layer_devices = devices
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory efficiency."""
@@ -422,6 +441,13 @@ class BaseMoEModel(nn.Module):
             layer_past = past_key_values[i] if past_key_values else None
             layer_bias = expert_weights[:, i] if expert_weights is not None else None
 
+            if self.layer_devices is not None and x.device != self.layer_devices[i]:
+                device = self.layer_devices[i]
+                x = x.to(device)
+                rope = (rope[0].to(device), rope[1].to(device))
+                attn_mask = attn_mask.to(device) if attn_mask is not None else None
+                layer_bias = layer_bias.to(device) if layer_bias is not None else None
+
             if self.gradient_checkpointing and self.training:
                 x, load_loss, dispatch, present_kv = torch.utils.checkpoint.checkpoint(
                     layer, x, rope, attn_mask, layer_bias, None, False,
@@ -431,11 +457,12 @@ class BaseMoEModel(nn.Module):
                 x, load_loss, dispatch, present_kv = layer(x, rope, attn_mask, layer_bias, layer_past, use_cache)
 
             if load_loss is not None:
-                total_load_loss = total_load_loss + load_loss
-                expert_load.append(dispatch.detach())
+                total_load_loss = total_load_loss + load_loss.to(total_load_loss.device)
+                expert_load.append(dispatch.detach().to(total_load_loss.device))
             if use_cache:
                 present_key_values.append(present_kv)
 
+        x = x.to(total_load_loss.device)
         x = self.final_norm(x)
         logits = self.lm_head(x)
 

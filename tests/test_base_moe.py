@@ -1,7 +1,9 @@
+import dataclasses
+
 import pytest
 import torch
 
-from mantis.models.base_moe import MoELayer
+from mantis.models.base_moe import BaseMoEModel, MoELayer
 from tests.conftest import DEVICE, seed
 
 
@@ -61,3 +63,31 @@ def test_skipped_experts_have_zero_gradients():
     for expert in layer.experts[2:]:
         for param in expert.parameters():
             assert torch.count_nonzero(param.grad) == 0
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+def test_placed_layers_match_single_device_model(config):
+    cfg = dataclasses.replace(config.base_moe, dropout=0.0)
+    seed()
+    single = BaseMoEModel.from_config(cfg).to('cuda:0')
+    placed = BaseMoEModel.from_config(cfg)
+    placed.load_state_dict(single.state_dict())
+    placed.place_layers(['cuda:0', 'cuda:1'])
+    placed.gradient_checkpointing_enable()
+    assert placed.lm_head.weight.data_ptr() == placed.token_embedding.weight.data_ptr()
+    assert placed.layers[1].attn.q_proj.weight.device == torch.device('cuda:1')
+
+    seed()
+    ids = torch.randint(4, 300, (2, 16), device='cuda:0')
+    outputs = []
+    for model in (single, placed):
+        model.train()
+        out = model(ids)
+        (out['logits'].sum() + out['load_balance_loss']).backward()
+        outputs.append(out)
+    assert torch.allclose(outputs[0]['logits'], outputs[1]['logits'], atol=1e-5)
+    assert torch.allclose(outputs[0]['expert_load'], outputs[1]['expert_load'])
+    single_grad = single.layers[1].attn.q_proj.weight.grad
+    placed_grad = placed.layers[1].attn.q_proj.weight.grad
+    assert placed_grad.device == torch.device('cuda:1')
+    assert torch.allclose(single_grad, placed_grad.to('cuda:0'), atol=1e-5)
