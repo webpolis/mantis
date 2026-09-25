@@ -103,6 +103,7 @@ def estimate_training_vram(
     F = config.d_ff
     K = config.top_k
     V = config.vocab_size
+    KV = getattr(config, 'n_kv_heads', H)
 
     # --- Fixed costs (independent of batch_size) ---
 
@@ -118,17 +119,25 @@ def estimate_training_vram(
     # Gradients: FP32
     grad_bytes = n_params * 4
 
+    # The foreach AdamW step materializes sqrt(v) for every parameter while
+    # the gradients are still alive; this is the peak of a step once
+    # activations are small (measured: 20 bytes/param for the small preset)
+    step_bytes = n_params * 4
+
     # DeepSpeed ZeRO sharding
     shard = max(1, num_gpus) if deepspeed_zero_stage > 0 else 1
     if deepspeed_zero_stage >= 3:
         model_bytes //= shard
         optim_bytes //= shard
         grad_bytes //= shard
+        step_bytes //= shard
     elif deepspeed_zero_stage >= 2:
         optim_bytes //= shard
         grad_bytes //= shard
+        step_bytes //= shard
     if optimizer_offload and deepspeed_zero_stage > 0:
         optim_bytes = 0
+        step_bytes = 0
 
     cuda_overhead = 300 * 1024 * 1024  # ~300 MB (CUDA context + allocator + fragmentation)
 
@@ -143,40 +152,31 @@ def estimate_training_vram(
         reduce_bucket = min(int(5e8) * 2, n_params * 2)
         ds_buffer_bytes += reduce_bucket
 
-    param_bytes = model_bytes + optim_bytes + grad_bytes
+    param_bytes = model_bytes + optim_bytes + grad_bytes + step_bytes
     layer_fixed = param_bytes * (params['per_layer_attn'] + params['per_layer_moe'] + params['per_layer_norms']) // n_params
     head_fixed = param_bytes - L * layer_fixed + ds_buffer_bytes
     fixed = param_bytes + cuda_overhead + ds_buffer_bytes
 
     # --- Variable costs (per sample) ---
 
-    # Bytes per activation element
-    act_elem = 2 if mixed_precision else 4
+    # Bytes per autocast activation element; the residual stream stays FP32
+    act = 2 if mixed_precision else 4
+    kv_share = KV / H
 
-    # Per-layer forward activation elements
-    per_layer_acts = (
-        3 * seq_len * D      # Q, K, V
-        + H * seq_len * seq_len  # attention scores
-        + seq_len * D        # attention output
-        + K * seq_len * F    # MoE FFN intermediate
-        + K * seq_len * D    # MoE FFN output
-        + 4 * seq_len * D    # norms, residuals, masks
+    # Tensors autograd keeps alive per block, in units of seq_len * d_model bytes:
+    #   two LayerNorm inputs (FP32) and their normalized outputs (cast)
+    #   q, k, v and the attention output; scores are never materialized (SDPA)
+    #   two dropout masks (1 byte)
+    #   gathered expert inputs, GELU input and output, weighted expert outputs (FP32)
+    #   the FP32 scatter buffer that collects the expert outputs
+    per_layer_units = (
+        2 * 4 + 2 * act
+        + act * (1 + 2 * kv_share) + act
+        + 2
+        + K * act + 2 * K * act * (F / D) + K * 4
+        + 4
     )
-
-    # Autograd-saved tensors beyond forward activations:
-    # nn.Linear saves its input for weight gradient (dW = input^T @ grad_output)
-    # GELU saves its input for backward derivative computation
-    autograd_extras = (
-        seq_len * D          # attn in_proj input
-        + seq_len * D        # attn out_proj input
-        + seq_len * D        # MoE gate input
-        + K * seq_len * D    # expert w1 inputs
-        + K * seq_len * F    # expert w2 inputs
-        + K * seq_len * F    # GELU input saves
-    )
-
-    # Total per-layer: forward acts × 2 (gradients + saved outputs) + extra autograd saves
-    per_layer_total = per_layer_acts * 2 + autograd_extras
+    per_layer_total = int(per_layer_units * seq_len * D)
 
     # Overhead multiplier for costs not captured by the analytical formula:
     # - PyTorch allocator block rounding and fragmentation (~10%)
@@ -191,23 +191,24 @@ def estimate_training_vram(
         overhead = 1.15
 
     if gradient_checkpointing:
-        # Boundary saves: input to each layer. During backward, one layer at a
-        # time is recomputed with autograd enabled (full forward + saves).
-        layer_per_sample = int(seq_len * D * act_elem * overhead)
-        recompute_per_sample = int(per_layer_total * act_elem * overhead)
+        # Boundary saves: the FP32 input of each block. During backward, one
+        # block at a time is recomputed with autograd enabled (full saves)
+        # while the backward temporaries of the block above are still alive
+        # (measured: 1.5x the block's saves)
+        layer_per_sample = int(seq_len * D * 4 * overhead)
+        recompute_per_sample = int(1.5 * per_layer_total * overhead)
     else:
         # Full activation storage: all L layers
-        layer_per_sample = int(per_layer_total * act_elem * overhead)
+        layer_per_sample = int(per_layer_total * overhead)
         recompute_per_sample = 0
     activation_per_sample = L * layer_per_sample + recompute_per_sample
 
     # Input tensors: input_ids + labels (int64)
     input_per_sample = seq_len * 8 * 2
 
-    # Final logits: seq_len × vocab_size
-    logits_per_sample = seq_len * V * act_elem
-
-    head_per_sample = input_per_sample + logits_per_sample
+    # Embedding output and final norm input (FP32), normalized output (cast),
+    # logits (cast) plus their FP32 copy and softmax gradient for the loss
+    head_per_sample = int((8 * seq_len * D + act * seq_len * D + (act + 8) * seq_len * V) * overhead)
     per_sample = activation_per_sample + head_per_sample
 
     total = fixed + per_sample * batch_size
@@ -216,6 +217,7 @@ def estimate_training_vram(
         'model_weights': model_bytes,
         'optimizer_state': optim_bytes,
         'gradients': grad_bytes,
+        'optimizer_step': step_bytes,
         'deepspeed_buffers': ds_buffer_bytes,
         'activations': per_sample * batch_size,
         'cuda_overhead': cuda_overhead,
@@ -381,6 +383,7 @@ def format_vram_summary(config, seq_len, gpu_infos, batch_sizes, est, safety_mar
     lines.append(f"  Model weights:    {format_bytes(est['model_weights'])}")
     lines.append(f"  Optimizer state:  {format_bytes(est['optimizer_state'])}")
     lines.append(f"  Gradients:        {format_bytes(est['gradients'])}")
+    lines.append(f"  Optimizer step:   {format_bytes(est['optimizer_step'])}")
     if est.get('deepspeed_buffers', 0) > 0:
         lines.append(f"  DeepSpeed bufs:   {format_bytes(est['deepspeed_buffers'])}")
     lines.append(f"  CUDA overhead:    {format_bytes(est['cuda_overhead'])}")

@@ -7,7 +7,8 @@ def test_optimizer_offload_frees_gpu_optimizer_state():
     on_gpu = estimate_training_vram(cfg, 256, 4, deepspeed_zero_stage=2, num_gpus=2)
     offloaded = estimate_training_vram(cfg, 256, 4, deepspeed_zero_stage=2, num_gpus=2, optimizer_offload=True)
     assert offloaded['optimizer_state'] == 0
-    assert on_gpu['total'] - offloaded['total'] == on_gpu['optimizer_state']
+    assert offloaded['optimizer_step'] == 0
+    assert on_gpu['total'] - offloaded['total'] == on_gpu['optimizer_state'] + on_gpu['optimizer_step']
 
 
 def test_per_device_split_adds_up_to_the_total():
