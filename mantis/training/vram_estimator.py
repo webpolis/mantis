@@ -255,7 +255,8 @@ def plan_layer_placement(
         safety_margin: Fraction of free VRAM to fill
 
     Returns:
-        list[int] device index per layer, or None when the model does not fit
+        (placement, used): device index per layer and estimated bytes per
+        device, or None when the model does not fit
     """
     est = estimate_training_vram(
         config, seq_len, batch_size,
@@ -268,17 +269,17 @@ def plan_layer_placement(
     layer = est['layer_fixed'] + est['layer_per_sample'] * batch_size
 
     placement = []
+    used = [per_device] * len(budgets)
+    used[0] += est['head_fixed'] + est['head_per_sample'] * batch_size
     device = 0
-    used = per_device + est['head_fixed'] + est['head_per_sample'] * batch_size
     for _ in range(config.n_layers):
-        while used + layer > budgets[device]:
+        while used[device] + layer > budgets[device]:
             device += 1
             if device == len(budgets):
                 return None
-            used = per_device
         placement.append(device)
-        used += layer
-    return placement
+        used[device] += layer
+    return placement, used
 
 
 def compute_optimal_batch_sizes(

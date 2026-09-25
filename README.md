@@ -167,8 +167,8 @@ uv run train.py --stage 1 data/train.txt --val-file data/val.txt
 |------|-----------|------|------|------|----------|-------------|
 | `micro` | ~3M (dense) | 4/4 | 0.6M | 2.2M | Ultra-fast testing | ~0.4GB |
 | `tiny` | ~55M (~30M) | 8/4 | 2.4M | 14M | Development/debugging | ~1.4GB |
-| `small` | ~435M (~234M) | 32/8 | 18M | 45M | Experimentation | ~8GB |
-| `base` | ~6.7B (~1.9B) | 32/8 | 106M | 80M | Production | ~104GB (~63GB with `--gradient-checkpointing --use-8bit-optimizer`) |
+| `small` | ~435M (~234M) | 32/8 | 18M | 45M | Experimentation | ~9GB (~6GB with `--gradient-checkpointing --use-8bit-optimizer`) |
+| `base` | ~6.7B (~1.9B) | 32/8 | 106M | 80M | Production | ~127GB (~88GB with `--gradient-checkpointing --use-8bit-optimizer`) |
 
 The controller and critic scale with the preset, so a `micro` full-system run is a micro-size system. VRAM comes from `mantis/training/vram_estimator.py` for FP16 mixed precision, batch size 1 and `--seq-len 512`.
 

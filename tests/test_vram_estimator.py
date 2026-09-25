@@ -27,7 +27,8 @@ def test_layer_placement_fills_devices_in_order():
     head = est['cuda_overhead'] + est['head_fixed'] + est['head_per_sample'] * 2
     # Device 0 holds the head plus three layers, device 1 the rest
     free = [(head + 3.5 * layer) / 0.85, (est['cuda_overhead'] + cfg.n_layers * layer) / 0.85]
-    placement = plan_layer_placement(cfg, 256, 2, free)
+    placement, used = plan_layer_placement(cfg, 256, 2, free)
     assert placement == [0, 0, 0] + [1] * (cfg.n_layers - 3)
+    assert used == [head + 3 * layer, est['cuda_overhead'] + (cfg.n_layers - 3) * layer]
     assert plan_layer_placement(cfg, 256, 2, [free[0]]) is None
     assert plan_layer_placement(cfg, 256, 2, [layer / 2] * 100) is None

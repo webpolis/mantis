@@ -451,8 +451,8 @@ def pipeline_plan(config, seq_len, args):
         use_8bit_optimizer=args.use_8bit_optimizer,
     )
     for batch_size in range(args.batch_size, 0, -1):
-        placement = plan_layer_placement(config, seq_len, batch_size, free, safety_margin=0.85, **vram_kwargs)
-        if placement is not None:
+        plan = plan_layer_placement(config, seq_len, batch_size, free, safety_margin=0.85, **vram_kwargs)
+        if plan is not None:
             break
     else:
         est = estimate_training_vram(config, seq_len, batch_size=1, **vram_kwargs)
@@ -461,18 +461,14 @@ def pipeline_plan(config, seq_len, args):
             f"{', '.join(format_bytes(f) for f in free)} free. Try --gradient-checkpointing, "
             f"--use-8bit-optimizer or a smaller --seq-len"
         )
-    est = estimate_training_vram(config, seq_len, batch_size, **vram_kwargs)
+    placement, used = plan
     print(f"\nPipeline placement (seq_len={seq_len}, batch_size {args.batch_size} → {batch_size}):")
     for device in range(len(free)):
         layers = [i for i, d in enumerate(placement) if d == device]
-        used = est['cuda_overhead'] + est['recompute_per_sample'] * batch_size
-        used += len(layers) * (est['layer_fixed'] + est['layer_per_sample'] * batch_size)
-        if device == 0:
-            used += est['head_fixed'] + est['head_per_sample'] * batch_size
         span = f"layers {layers[0]}-{layers[-1]}" if layers else "no layers"
         print(f"  GPU {device} ({torch.cuda.get_device_name(device)}): {span}"
               f"{', embedding and head' if device == 0 else ''}, "
-              f"est. {format_bytes(used)} / {format_bytes(free[device])} free")
+              f"est. {format_bytes(used[device])} / {format_bytes(free[device])} free")
     return batch_size, placement
 
 
@@ -779,6 +775,15 @@ def validate_sft_args(args):
         return "Cannot use both --val-split and --val-file"
     if args.val_split and not 0 < args.val_split < 1:
         return f"--val-split must be between 0 and 1, got {args.val_split}"
+    return validate_pipeline_args(args)
+
+
+def validate_pipeline_args(args):
+    """--pipeline splits one model over the local GPUs in a single process."""
+    if args.pipeline and args.deepspeed:
+        return "--pipeline splits one model over the GPUs; --deepspeed replicates it. Choose one"
+    if args.pipeline and not torch.cuda.is_available():
+        return "--pipeline needs CUDA GPUs"
     return None
 
 
@@ -818,10 +823,6 @@ def validate_stage1_args(args):
                 else "Use the tokenizer from the original training run"
             return f"--tokenizer-path required when resuming from checkpoint\n       {hint}"
 
-    if args.pipeline and args.deepspeed:
-        return "--pipeline splits one model over the GPUs; --deepspeed replicates it. Choose one"
-    if args.pipeline and not torch.cuda.is_available():
-        return "--pipeline needs CUDA GPUs"
     if args.val_split and args.val_file:
         return ("Cannot use both --val-split and --val-file. Choose one:\n"
                 "  --val-split: Auto-split from training data (convenience mode)\n"
@@ -832,7 +833,7 @@ def validate_stage1_args(args):
         return f"--stride must be between 1 and --seq-len ({args.seq_len}), got {args.stride}"
     if args.pretokenized and not DATASETS_AVAILABLE:
         return "--pretokenized requires 'datasets' library. Install with: uv sync"
-    return None
+    return validate_pipeline_args(args)
 
 
 def validate_later_stage_args(args):
