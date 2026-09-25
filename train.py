@@ -411,6 +411,38 @@ def gather_val_loss(accelerator, raw_loss, raw_tokens):
     return (gathered_loss / gathered_tokens).item() if gathered_tokens > 0 else float('inf')
 
 
+def shared_batch_size(accelerator, config, seq_len, args, use_deepspeed):
+    """
+    Largest batch size (at most --batch-size) that fits the free VRAM of every rank's GPU.
+
+    All ranks must use the same value: Accelerate shards the shuffled index
+    stream by batch number, so unequal batch sizes would train some windows on
+    several ranks and others on none.
+    """
+    from accelerate.utils import gather_object
+    device_id = accelerator.local_process_index
+    free, _ = torch.cuda.mem_get_info(device_id)
+    name = torch.cuda.get_device_name(device_id)
+    vram_kwargs = dict(
+        mixed_precision=args.mixed_precision,
+        gradient_checkpointing=args.gradient_checkpointing,
+        use_8bit_optimizer=args.use_8bit_optimizer,
+        deepspeed_zero_stage=2 if use_deepspeed else 0,
+        num_gpus=accelerator.num_processes,
+        optimizer_offload=use_deepspeed and args.cpu_offload,
+    )
+    local = compute_optimal_batch_sizes(
+        config, seq_len, [free], safety_margin=0.85, max_batch_size=args.batch_size, **vram_kwargs,
+    )[0]
+    gpus = gather_object([(name, free, local)])
+    batch_size = min(bs for _, _, bs in gpus)
+    if accelerator.is_main_process:
+        est = estimate_training_vram(config, seq_len, batch_size=1, **vram_kwargs)
+        print(f"\n{format_vram_summary(config, seq_len, [(n, f) for n, f, _ in gpus], [batch_size] * len(gpus), est)}")
+        print(f"batch_size {args.batch_size} → {batch_size} on every rank")
+    return batch_size
+
+
 def train(args):
     tokenizer = load_or_create_tokenizer(args.tokenizer_path)
 
@@ -428,30 +460,8 @@ def train(args):
     from accelerate.utils import set_seed
     set_seed(42)
 
-    # VRAM-aware batch size adjustment
-    should_auto_batch = torch.cuda.is_available() and (accelerator.num_processes > 1 or args.auto_batch)
-    if should_auto_batch:
-        device_id = accelerator.local_process_index
-        props = torch.cuda.get_device_properties(device_id)
-        gpu_vram = props.total_memory
-        gpu_name = props.name
-        vram_kwargs = dict(
-            mixed_precision=args.mixed_precision,
-            gradient_checkpointing=args.gradient_checkpointing,
-            use_8bit_optimizer=args.use_8bit_optimizer,
-            deepspeed_zero_stage=2 if use_deepspeed else 0,
-            num_gpus=accelerator.num_processes,
-        )
-        optimal_bs = compute_optimal_batch_sizes(
-            config.base_moe, seq_len, [gpu_vram], safety_margin=0.85,
-            max_batch_size=args.batch_size, **vram_kwargs,
-        )[0]
-        if is_main:
-            est = estimate_training_vram(config.base_moe, seq_len, batch_size=1, **vram_kwargs)
-            print(f"\n{format_vram_summary(config.base_moe, seq_len, [(gpu_name, gpu_vram)], [optimal_bs], est)}")
-        print(f"[Rank {accelerator.process_index}] GPU {device_id} ({gpu_name}, "
-              f"{gpu_vram / (1024**3):.1f} GB): batch_size {args.batch_size} → {optimal_bs}")
-        args.batch_size = optimal_bs
+    if torch.cuda.is_available() and (accelerator.num_processes > 1 or args.auto_batch):
+        args.batch_size = shared_batch_size(accelerator, config.base_moe, seq_len, args, use_deepspeed)
 
     if is_main:
         print("\nLoading datasets...")

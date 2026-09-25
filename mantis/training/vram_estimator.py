@@ -69,6 +69,7 @@ def estimate_training_vram(
     use_8bit_optimizer=False,
     deepspeed_zero_stage=0,
     num_gpus=1,
+    optimizer_offload=False,
 ):
     """
     Estimate training VRAM usage in bytes.
@@ -82,6 +83,7 @@ def estimate_training_vram(
         use_8bit_optimizer: Whether 8-bit AdamW is used
         deepspeed_zero_stage: 0 (none), 2, or 3
         num_gpus: Number of GPUs (for ZeRO sharding calculation)
+        optimizer_offload: ZeRO keeps the optimizer state in host RAM
 
     Returns:
         dict with 'model_weights', 'optimizer_state', 'gradients',
@@ -121,6 +123,8 @@ def estimate_training_vram(
     elif deepspeed_zero_stage >= 2:
         optim_bytes //= shard
         grad_bytes //= shard
+    if optimizer_offload and deepspeed_zero_stage > 0:
+        optim_bytes = 0
 
     cuda_overhead = 300 * 1024 * 1024  # ~300 MB (CUDA context + allocator + fragmentation)
 
@@ -225,15 +229,16 @@ def compute_optimal_batch_sizes(
     use_8bit_optimizer=False,
     deepspeed_zero_stage=0,
     num_gpus=1,
+    optimizer_offload=False,
     max_batch_size=None,
 ):
     """
-    Given a list of per-GPU VRAM (bytes), return the max batch_size per GPU.
+    Given a list of per-GPU free VRAM (bytes), return the max batch_size per GPU.
 
     Args:
         config: BaseMoEConfig
         seq_len: Training sequence length
-        gpu_vram_list: List of per-GPU total VRAM in bytes
+        gpu_vram_list: List of per-GPU free VRAM in bytes
         safety_margin: Fraction of VRAM to target (default 0.85)
         mixed_precision: Whether FP16 mixed precision is used
         gradient_checkpointing: Whether gradient checkpointing is enabled
@@ -253,6 +258,7 @@ def compute_optimal_batch_sizes(
         use_8bit_optimizer=use_8bit_optimizer,
         deepspeed_zero_stage=deepspeed_zero_stage,
         num_gpus=num_gpus,
+        optimizer_offload=optimizer_offload,
     )
 
     fixed = est['fixed']
@@ -264,7 +270,7 @@ def compute_optimal_batch_sizes(
         available = vram_bytes * safety_margin
         if available < fixed:
             warnings.append(
-                f"WARNING: GPU {i} has {vram_bytes / (1024**3):.1f} GB VRAM but model "
+                f"WARNING: GPU {i} has {vram_bytes / (1024**3):.1f} GB free VRAM but model "
                 f"fixed costs alone require ~{fixed / (1024**3):.1f} GB. "
                 f"Training will likely OOM. Consider a smaller model or enabling "
                 f"--gradient-checkpointing / --use-8bit-optimizer / --deepspeed."
@@ -301,7 +307,7 @@ def format_vram_summary(config, seq_len, gpu_infos, batch_sizes, est, safety_mar
     Args:
         config: BaseMoEConfig
         seq_len: Sequence length
-        gpu_infos: List of (name, total_vram_bytes) per GPU
+        gpu_infos: List of (name, free_vram_bytes) per GPU
         batch_sizes: List of batch sizes per GPU
         est: Dict from estimate_training_vram (with batch_size=1, for fixed/per_sample)
         safety_margin: Safety margin used
@@ -327,7 +333,7 @@ def format_vram_summary(config, seq_len, gpu_infos, batch_sizes, est, safety_mar
         pct = used / vram * 100 if vram > 0 else 0
         lines.append(
             f"  GPU {i} ({name}, {format_bytes(vram)}): "
-            f"batch_size={bs} (est. {format_bytes(used)} / {format_bytes(vram)}, {pct:.0f}%)"
+            f"batch_size={bs} (est. {format_bytes(used)} / {format_bytes(vram)} free, {pct:.0f}%)"
         )
 
     return "\n".join(lines)
