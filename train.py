@@ -80,9 +80,8 @@ from tqdm import tqdm
 import warnings
 import numpy as np
 
-# Disable TF32 for cross-architecture compatibility
-torch.backends.cuda.matmul.allow_tf32 = False
-torch.backends.cudnn.allow_tf32 = False
+# TF32 matmuls on Ampere and newer; older GPUs keep full FP32
+torch.set_float32_matmul_precision('high')
 
 # Suppress cuBLAS recovery warnings (these are expected when workaround is applied)
 warnings.filterwarnings('ignore', message='.*gemm_and_bias error: CUBLAS_STATUS_NOT_INITIALIZED.*')
