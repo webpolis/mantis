@@ -29,7 +29,7 @@ def build_accelerator(args):
             raise
         raise RuntimeError(
             f"accelerate is missing from {sys.executable}. Install it in the Python environment "
-            "used to launch torchrun (python -m pip install accelerate)."
+            "used to launch torchrun (uv sync)."
         ) from exc
 
     deepspeed_plugin = None
@@ -40,7 +40,7 @@ def build_accelerator(args):
             if importlib.util.find_spec('deepspeed') is None:
                 raise RuntimeError(
                     f"deepspeed is missing from {sys.executable}. Install it in the Python environment "
-                    "used to launch torchrun (python -m pip install deepspeed)."
+                    "used to launch torchrun (uv sync --extra distributed)."
                 )
             try:
                 from accelerate import DeepSpeedPlugin

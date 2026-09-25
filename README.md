@@ -20,15 +20,19 @@ A novel LLM architecture exploring hallucination mitigation and long-context mem
 
 ## Quick Start
 
-```bash
-# Install everything (mamba-ssm needs CUDA)
-pip install -r requirements.txt && pip install -e .
+The project is managed with [uv](https://docs.astral.sh/uv/): `uv run <script>` creates `.venv` from `uv.lock` on first use and keeps it in sync, so no manual environment setup is needed. Activate `.venv` instead if you prefer plain `python`.
 
-# Or install only the core: Stage 1, the tokenizer and basic inference
-pip install -e .
+```bash
+# Core: Stage 1, the tokenizer and basic inference (CUDA torch on Linux)
+uv sync
+
+# Extras: memory (mamba-ssm + faiss, needs CUDA and nvcc), distributed (deepspeed),
+# bnb (8-bit optimizer), wandb, web (playground server). mamba-ssm compiles from
+# source when no prebuilt wheel matches; TORCH_CUDA_ARCH_LIST limits it to your GPUs.
+TORCH_CUDA_ARCH_LIST="8.6" MAX_JOBS=4 uv sync --extra memory --extra distributed
 
 # Start training (Stage 1)
-python train.py --stage 1 \
+uv run train.py --stage 1 \
     --hf-dataset roneneldan/TinyStories \
     --hf-val-split validation \
     --streaming \
@@ -81,7 +85,7 @@ The dotted inputs are optional. Without them, Stage 3 keeps the matching gates c
 
 ```bash
 # Streaming HuggingFace dataset (recommended - no storage needed)
-python train.py --stage 1 \
+uv run train.py --stage 1 \
     --hf-dataset roneneldan/TinyStories \
     --hf-val-split validation \
     --streaming \
@@ -90,14 +94,14 @@ python train.py --stage 1 \
     --model-size tiny
 
 # Local text file (auto-split validation)
-python train.py --stage 1 \
+uv run train.py --stage 1 \
     data/train.txt \
     --val-split 0.1 \
     --epochs 20 \
     --model-size tiny
 
 # Production: Pre-split validation for reproducibility
-python train.py --stage 1 \
+uv run train.py --stage 1 \
     data/train.txt \
     --val-file data/val.txt \
     --output-dir checkpoints/stage1 \
@@ -109,7 +113,7 @@ python train.py --stage 1 \
 **Option 1: HuggingFace Streaming (Easiest)**
 ```bash
 # No download needed - stream directly
-python train.py --stage 1 \
+uv run train.py --stage 1 \
     --hf-dataset HuggingFaceFW/fineweb-edu \
     --hf-config sample-10BT \
     --streaming \
@@ -117,7 +121,7 @@ python train.py --stage 1 \
     --mixed-precision
 
 # Use only 10% of dataset
-python train.py --stage 1 \
+uv run train.py --stage 1 \
     --hf-dataset wikitext \
     --hf-config wikitext-2-raw-v1 \
     --hf-train-split "train[:10%]" \
@@ -133,15 +137,15 @@ python train.py --stage 1 \
 **Option 2: Pre-tokenized Local Data (Fastest)**
 ```bash
 # Step 1: Pre-tokenize once (5-10x faster for multiple runs)
-python scripts/preprocess_data.py \
+uv run scripts/preprocess_data.py \
     --input data/train.txt \
     --output data/tokenized/train
 
 # Step 2: Split data
-python scripts/split_dataset.py  # Creates train_split/ and val/
+uv run scripts/split_dataset.py  # Creates train_split/ and val/
 
 # Step 3: Train
-python train.py --stage 1 \
+uv run train.py --stage 1 \
     data/tokenized/train_split \
     --pretokenized \
     --val-file data/tokenized/val \
@@ -151,10 +155,10 @@ python train.py --stage 1 \
 **Option 3: Raw Text Files (Simplest)**
 ```bash
 # Single file with auto-split validation
-python train.py --stage 1 data/train.txt --val-split 0.1
+uv run train.py --stage 1 data/train.txt --val-split 0.1
 
 # Separate train/val files (recommended for production)
-python train.py --stage 1 data/train.txt --val-file data/val.txt
+uv run train.py --stage 1 data/train.txt --val-file data/val.txt
 ```
 
 ### Model Sizes
@@ -170,28 +174,28 @@ The controller and critic scale with the preset, so a `micro` full-system run is
 
 ```bash
 # Specify size with --model-size
-python train.py --stage 1 data/train.txt --model-size small --val-split 0.1
+uv run train.py --stage 1 data/train.txt --model-size small --val-split 0.1
 ```
 
 ### Multi-GPU Training
 
 ```bash
-# Auto-detect all GPUs
-python train.py --stage 1 data/train.txt --mixed-precision --val-split 0.1
+# One process per GPU (a plain `uv run train.py` uses a single GPU)
+uv run torchrun --nproc_per_node=2 train.py --stage 1 data/train.txt --mixed-precision --val-split 0.1
 
 # Use specific GPUs only
-python train.py --stage 1 data/train.txt --gpu-ids 0 2 --val-split 0.1
+uv run torchrun --nproc_per_node=2 train.py --stage 1 data/train.txt --gpu-ids 0 2 --val-split 0.1
 
 # Mixed VRAM (e.g., 12GB + 6GB GPUs)
-python train.py --stage 1 data/train.txt \
+uv run train.py --stage 1 data/train.txt \
     --batch-size 2 \
     --gradient-accumulation-steps 4 \
     --mixed-precision \
     --val-split 0.1
 # Effective batch: 2 × 4 = 8 per GPU, times the number of GPUs
 
-# DeepSpeed ZeRO-2 with optimizer offload (for very large models or mixed VRAM)
-python train.py --stage 1 data/train.txt \
+# DeepSpeed ZeRO-2 with optimizer offload (for very large models or mixed VRAM; needs `--extra distributed`)
+uv run torchrun --nproc_per_node=2 train.py --stage 1 data/train.txt \
     --deepspeed \
     --cpu-offload \
     --model-size small \
@@ -204,16 +208,16 @@ python train.py --stage 1 data/train.txt \
 
 ```bash
 # Basic: Mixed precision (2x memory savings); `--mixed-precision bf16` on Ampere or newer
-python train.py --stage 1 data/train.txt --mixed-precision --val-split 0.1
+uv run train.py --stage 1 data/train.txt --mixed-precision --val-split 0.1
 
 # Advanced: Gradient checkpointing (40% memory, 30% slower)
-python train.py --stage 1 data/train.txt \
+uv run train.py --stage 1 data/train.txt \
     --mixed-precision \
     --gradient-checkpointing \
     --val-split 0.1
 
 # Maximum: 8-bit optimizer (50% optimizer memory)
-python train.py --stage 1 data/train.txt \
+uv run train.py --stage 1 data/train.txt \
     --mixed-precision \
     --gradient-checkpointing \
     --use-8bit-optimizer \
@@ -222,7 +226,7 @@ python train.py --stage 1 data/train.txt \
     --val-split 0.1
 
 # Extreme: Small model on 12GB GPU
-python train.py --stage 1 data/train.txt \
+uv run train.py --stage 1 data/train.txt \
     --model-size small \
     --mixed-precision \
     --gradient-checkpointing \
@@ -236,13 +240,13 @@ python train.py --stage 1 data/train.txt \
 
 ```bash
 # Resume from checkpoint (continues from saved state)
-python train.py --stage 1 data/train.txt \
+uv run train.py --stage 1 data/train.txt \
     --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
     --val-split 0.1
 
 # Continue for more epochs (e.g., 20 → 50 total epochs)
-python train.py --stage 1 data/train.txt \
+uv run train.py --stage 1 data/train.txt \
     --resume checkpoints/stage1/final_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
     --epochs 50 \
@@ -262,7 +266,7 @@ python train.py --stage 1 data/train.txt \
 
 ```bash
 # High-quality training run with all optimizations
-python train.py --stage 1 \
+uv run train.py --stage 1 \
     --hf-dataset HuggingFaceFW/fineweb-edu \
     --hf-config sample-10BT \
     --streaming \
@@ -302,14 +306,14 @@ python train.py --stage 1 \
 
 ```bash
 # Fine-tune memory on top of Stage 1 model
-python train.py --stage 2 \
+uv run train.py --stage 2 \
     --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
     --epochs 5 \
     --output-dir checkpoints/stage2
 
 # With your own data (recommended): JSONL lines of {"query": ..., "context": ...}
-python train.py --stage 2 data/memory.jsonl \
+uv run train.py --stage 2 data/memory.jsonl \
     --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
     --epochs 5 \
@@ -327,7 +331,7 @@ python train.py --stage 2 data/memory.jsonl \
 
 ```bash
 # JSONL lines of {"query": ..., "response": ..., "evidence": "..." or [...] (optional), "label": 0 or 1}
-python train.py --stage 4 data/critic.jsonl \
+uv run train.py --stage 4 data/critic.jsonl \
     --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
     --epochs 3 \
@@ -360,7 +364,7 @@ python train.py --stage 4 data/critic.jsonl \
 
 ```bash
 # Optimize meta-controller on top of Stage 1 model
-python train.py --stage 3 \
+uv run train.py --stage 3 \
     --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
     --rl-episodes 50000 \
@@ -368,7 +372,7 @@ python train.py --stage 3 \
     --output-dir checkpoints/stage3
 
 # All gates, with your own JSONL lines of {"query": ..., "answer": ...}
-python train.py --stage 3 data/qa.jsonl \
+uv run train.py --stage 3 data/qa.jsonl \
     --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
     --memory-checkpoint checkpoints/stage2/memory_system_final.pt \
@@ -391,7 +395,7 @@ python train.py --stage 3 data/qa.jsonl \
 
 ```bash
 # JSONL lines of {"query": ..., "response": ..., "evidence": [...] (optional)}
-python train.py --stage 5 data/sft.jsonl \
+uv run train.py --stage 5 data/sft.jsonl \
     --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
     --val-split 0.1 --epochs 3 --mixed-precision bf16 \
@@ -408,30 +412,30 @@ After Stage 1 training completes, use the model for text generation:
 
 ```bash
 # Interactive mode
-python inference.py checkpoints/stage1/best_model.pt
+uv run inference.py checkpoints/stage1/best_model.pt
 
 # Single prompt
-python inference.py checkpoints/stage1/best_model.pt \
+uv run inference.py checkpoints/stage1/best_model.pt \
     --prompt "Once upon a time"
 
 # Greedy decoding (deterministic, temperature=0)
-python inference.py checkpoints/stage1/best_model.pt \
+uv run inference.py checkpoints/stage1/best_model.pt \
     --prompt "The capital of France is" \
     --temperature 0
 
 # Creative generation (higher temperature)
-python inference.py checkpoints/stage1/best_model.pt \
+uv run inference.py checkpoints/stage1/best_model.pt \
     --prompt "Write a story about robots:" \
     --temperature 1.2 \
     --max-length 200
 
 # Batch generation from file
-python inference.py checkpoints/stage1/best_model.pt \
+uv run inference.py checkpoints/stage1/best_model.pt \
     --input prompts.txt \
     --output results.txt
 
 # INT8 dynamic quantization (always runs on CPU)
-python inference.py checkpoints/stage1/best_model.pt \
+uv run inference.py checkpoints/stage1/best_model.pt \
     --prompt "Hello world" \
     --quantize int8
 ```
@@ -460,7 +464,7 @@ engine.close()  # flushes consolidation and saves memory_dir
 ```bash
 export CUBLAS_WORKSPACE_CONFIG=:0:0
 export TORCH_BLAS_PREFER_CUBLASLT=0
-python inference.py checkpoints/stage1/best_model.pt --prompt "Hello"
+uv run inference.py checkpoints/stage1/best_model.pt --prompt "Hello"
 ```
 
 ---
@@ -471,19 +475,19 @@ The 512-token tokenizer is built for the protocol of `mantis/simulation`, an eco
 
 ```bash
 # 1. Generate three datasets, capped at increasing epochs
-python scripts/gen_evo_dataset.py --worlds 5000 --max-epoch CAMBRIAN  --output data/evo_bio.txt --compact --workers 8
-python scripts/gen_evo_dataset.py --worlds 5000 --max-epoch ECOSYSTEM --output data/evo_eco.txt --compact --workers 8 --enable-agents
-python scripts/gen_evo_dataset.py --worlds 5000                       --output data/evo_intel.txt --compact --workers 8 --enable-agents
+uv run scripts/gen_evo_dataset.py --worlds 5000 --max-epoch CAMBRIAN  --output data/evo_bio.txt --compact --workers 8
+uv run scripts/gen_evo_dataset.py --worlds 5000 --max-epoch ECOSYSTEM --output data/evo_eco.txt --compact --workers 8 --enable-agents
+uv run scripts/gen_evo_dataset.py --worlds 5000                       --output data/evo_intel.txt --compact --workers 8 --enable-agents
 
 # 2. Train with a curriculum that shifts from the bio to the intel data
-python train_evo.py \
+uv run train_evo.py \
     --bio data/evo_bio.txt --eco data/evo_eco.txt --intel data/evo_intel.txt \
     --model-size tiny --seq-len 2048 --batch-size 8 \
     --steps-per-epoch 1000 --epochs 20 --mixed-precision --val-split 0.1
 # Partitions are tokenized once into data/.evo_cache (--cache-dir); --prepare-data-only builds the cache and exits
 
 # 3. Generate a new world
-python inference_evo.py checkpoints/evo_train/best_model.pt --new-world --seed 42 --max-ticks 100
+uv run inference_evo.py checkpoints/evo_train/best_model.pt --new-world --seed 42 --max-ticks 100
 ```
 
 To route **each tick** through episodic and semantic retrieval, the trained
@@ -492,7 +496,7 @@ the same evolution backbone. Its checkpoint can carry the Stage 2 memory/store
 and Stage 4 critic paths; pass the explicit overrides if those paths moved:
 
 ```bash
-python inference_evo.py checkpoints/evo_train/best_model.pt \
+uv run inference_evo.py checkpoints/evo_train/best_model.pt \
     --new-world --seed 42 --max-ticks 100 \
     --policy-checkpoint checkpoints/evo_policy/meta_controller_rl.pt \
     --memory-checkpoint checkpoints/evo_memory/memory_system_final.pt \
@@ -522,8 +526,8 @@ with the repository, so its quality and cost benefits remain to be measured.
 
 ```bash
 cd web/client && npm install && npm run build && cd ../..
-pip install -r web/server/requirements.txt
-python web/server/app.py   # open http://localhost:5000
+uv sync --extra web
+uv run web/server/app.py   # open http://localhost:5000
 ```
 
 ---
@@ -569,11 +573,11 @@ Full list: `python train.py --help`
 
 ```bash
 # First run: Creates tokenizer
-python train.py --stage 1 data/train.txt --val-split 0.1
+uv run train.py --stage 1 data/train.txt --val-split 0.1
 # → Saves to checkpoints/train/tokenizer
 
 # Later runs: Reuse for consistency
-python train.py --stage 1 data/new.txt \
+uv run train.py --stage 1 data/new.txt \
     --tokenizer-path checkpoints/train/tokenizer \
     --val-split 0.1
 ```
@@ -598,17 +602,17 @@ Try these in order (the full commands are under [Memory Optimization](#memory-op
 
 ```bash
 # Pre-tokenize data (5-10x faster)
-python scripts/preprocess_data.py --input data/train.txt --output data/tok
-python train.py --stage 1 data/tok --pretokenized --val-split 0.1
+uv run scripts/preprocess_data.py --input data/train.txt --output data/tok
+uv run train.py --stage 1 data/tok --pretokenized --val-split 0.1
 
 # Use streaming HF datasets (no disk I/O)
-python train.py --stage 1 --hf-dataset wikitext --streaming
+uv run train.py --stage 1 --hf-dataset wikitext --streaming
 
 # Enable mixed precision (2x faster)
-python train.py --stage 1 data/train.txt --mixed-precision --val-split 0.1
+uv run train.py --stage 1 data/train.txt --mixed-precision --val-split 0.1
 
 # Use multiple GPUs
-python train.py --stage 1 data/train.txt --val-split 0.1  # Auto-detects
+uv run train.py --stage 1 data/train.txt --val-split 0.1  # Auto-detects
 ```
 
 ---
@@ -717,18 +721,18 @@ Run benchmarks on trained models:
 
 ```bash
 # Test with demo dataset
-python scripts/run_eval.py checkpoints/stage1/best_model.pt \
+uv run scripts/run_eval.py checkpoints/stage1/best_model.pt \
     --tokenizer checkpoints/stage1/tokenizer \
     --all --demo
 
 # Run specific benchmarks (downloaded from the HuggingFace Hub)
-python scripts/run_eval.py checkpoints/stage1/best_model.pt \
+uv run scripts/run_eval.py checkpoints/stage1/best_model.pt \
     --tokenizer checkpoints/stage1/tokenizer \
     --benchmarks mmlu truthfulqa --limit 500 \
     --output results.json
 
 # Full MANTIS engine rebuilt from a Stage 3 policy
-python scripts/run_eval.py checkpoints/stage1/best_model.pt \
+uv run scripts/run_eval.py checkpoints/stage1/best_model.pt \
     --all \
     --policy-checkpoint checkpoints/stage3/meta_controller_rl.pt \
     --output full_results.json
@@ -736,12 +740,12 @@ python scripts/run_eval.py checkpoints/stage1/best_model.pt \
 
 ```bash
 # Ablations: fixed route policies, expert bias, serving precision, stateful memory
-python scripts/run_eval.py checkpoints/stage1/best_model.pt --benchmarks memory \
+uv run scripts/run_eval.py checkpoints/stage1/best_model.pt --benchmarks memory \
     --policy-checkpoint checkpoints/stage3/meta_controller_rl.pt \
     --route-policy always --dtype bfloat16 --records records.jsonl
 
 # The same memory benchmark as a recent-text-buffer baseline on the bare model
-python scripts/run_eval.py checkpoints/stage1/best_model.pt --benchmarks memory --memory-bench-mode prompt
+uv run scripts/run_eval.py checkpoints/stage1/best_model.pt --benchmarks memory --memory-bench-mode prompt
 ```
 
 **Available Benchmarks**:

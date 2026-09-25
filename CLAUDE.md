@@ -17,30 +17,30 @@ MANTIS (Metacognitive Adaptive Network with Tiered Inference Strategies) is a re
 
 ```bash
 # Basic training with HuggingFace streaming dataset
-python train.py --stage 1 \
+uv run train.py --stage 1 \
     --hf-dataset roneneldan/TinyStories \
     --hf-val-split validation \
     --streaming \
     --steps-per-epoch 1000
 
 # Local file with auto-split validation (convenient)
-python train.py --stage 1 data/train.txt --val-split 0.1
+uv run train.py --stage 1 data/train.txt --val-split 0.1
 
 # Production: Pre-tokenized dataset with separate validation
-python scripts/preprocess_data.py --input data/train.txt --output data/tokenized/train
-python scripts/split_dataset.py
-python train.py --stage 1 data/tokenized/train_split \
+uv run scripts/preprocess_data.py --input data/train.txt --output data/tokenized/train
+uv run scripts/split_dataset.py
+uv run train.py --stage 1 data/tokenized/train_split \
     --pretokenized \
     --val-file data/tokenized/val
 
 # Resume training
-python train.py --stage 1 data/train.txt \
+uv run train.py --stage 1 data/train.txt \
     --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
     --val-split 0.1
 
-# Multi-GPU with memory optimizations
-python train.py --stage 1 data/train.txt \
+# Multi-GPU (one process per GPU) with memory optimizations
+uv run torchrun --nproc_per_node=2 train.py --stage 1 data/train.txt \
     --model-size small \
     --mixed-precision \
     --gradient-checkpointing \
@@ -54,21 +54,21 @@ Stages 2-4 take the Stage 1 model and an optional JSONL file (demo data without 
 
 ```bash
 # Stage 2: memory fine-tuning. JSONL: {"query", "context"}
-python train.py --stage 2 data/memory.jsonl \
+uv run train.py --stage 2 data/memory.jsonl \
     --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
     --epochs 5 --output-dir checkpoints/stage2
 
 # Stage 4: critic training. JSONL: {"query", "response", "evidence"? (str or list), "label"}
 # Splits train/calibration/validation; fits the score temperature; reports Brier and ECE
-python train.py --stage 4 data/critic.jsonl \
+uv run train.py --stage 4 data/critic.jsonl \
     --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
     --output-dir checkpoints/critic
 
 # Stage 3: RL routing policy. JSONL: {"query", "answer"}. Each optional component enables its gate.
 # --rl-supervised-episodes runs a route-search warm start on frozen memory before PPO.
-python train.py --stage 3 data/qa.jsonl \
+uv run train.py --stage 3 data/qa.jsonl \
     --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
     --memory-checkpoint checkpoints/stage2/memory_system_final.pt \
@@ -78,7 +78,7 @@ python train.py --stage 3 data/qa.jsonl \
 
 # Stage 5: generator adaptation (SFT in the engine's chat prompt format). JSONL: {"query", "response", "evidence"?}
 # --resume gives weights only; the checkpoint records prompt_format='chat'
-python train.py --stage 5 data/sft.jsonl \
+uv run train.py --stage 5 data/sft.jsonl \
     --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
     --val-split 0.1 --epochs 3 --mixed-precision bf16 --output-dir checkpoints/stage5
@@ -92,12 +92,12 @@ Dedicated training pipeline for the evolution simulation with per-token loss wei
 
 ```bash
 # 1. Generate partitioned datasets (cap by epoch)
-python scripts/gen_evo_dataset.py --worlds 5000 --max-epoch CAMBRIAN  --output data/evo_bio.txt --compact --workers 8
-python scripts/gen_evo_dataset.py --worlds 5000 --max-epoch ECOSYSTEM --output data/evo_eco.txt --compact --workers 8 --enable-agents
-python scripts/gen_evo_dataset.py --worlds 5000                       --output data/evo_intel.txt --compact --workers 8 --enable-agents
+uv run scripts/gen_evo_dataset.py --worlds 5000 --max-epoch CAMBRIAN  --output data/evo_bio.txt --compact --workers 8
+uv run scripts/gen_evo_dataset.py --worlds 5000 --max-epoch ECOSYSTEM --output data/evo_eco.txt --compact --workers 8 --enable-agents
+uv run scripts/gen_evo_dataset.py --worlds 5000                       --output data/evo_intel.txt --compact --workers 8 --enable-agents
 
 # 2. Train with curriculum (all 3 partitions)
-python train_evo.py \
+uv run train_evo.py \
     --bio data/evo_bio.txt --eco data/evo_eco.txt --intel data/evo_intel.txt \
     --model-size tiny --seq-len 2048 --batch-size 8 \
     --steps-per-epoch 1000 --epochs 20 \
@@ -105,12 +105,12 @@ python train_evo.py \
     --mixed-precision --val-split 0.1
 
 # Single partition (bio only)
-python train_evo.py --bio data/evo_bio.txt --schedule bio-only \
+uv run train_evo.py --bio data/evo_bio.txt --schedule bio-only \
     --model-size micro --seq-len 256 --batch-size 4 \
     --steps-per-epoch 100 --epochs 5 --val-split 0.1
 
 # Resume from checkpoint
-python train_evo.py --bio data/evo_bio.txt \
+uv run train_evo.py --bio data/evo_bio.txt \
     --resume checkpoints/evo_train/best_model.pt \
     --tokenizer-path checkpoints/evo_train/tokenizer \
     --steps-per-epoch 1000 --epochs 40 --val-split 0.1
@@ -129,19 +129,19 @@ python train_evo.py --bio data/evo_bio.txt \
 
 ```bash
 # Interactive mode
-python inference.py checkpoints/stage1/best_model.pt
+uv run inference.py checkpoints/stage1/best_model.pt
 
 # Single prompt
-python inference.py checkpoints/stage1/best_model.pt \
+uv run inference.py checkpoints/stage1/best_model.pt \
     --prompt "Once upon a time"
 
 # Greedy decoding (deterministic)
-python inference.py checkpoints/stage1/best_model.pt \
+uv run inference.py checkpoints/stage1/best_model.pt \
     --prompt "Hello" \
     --temperature 0
 
 # INT8 dynamic quantization (always runs on CPU)
-python inference.py checkpoints/stage1/best_model.pt \
+uv run inference.py checkpoints/stage1/best_model.pt \
     --prompt "Hello" \
     --quantize int8
 ```
@@ -169,20 +169,20 @@ Tick-by-tick generation of evolution simulation traces. Importable as a module f
 
 ```bash
 # Generate a new world
-python inference_evo.py checkpoints/evo_train/best_model.pt \
+uv run inference_evo.py checkpoints/evo_train/best_model.pt \
     --new-world --seed 42 --max-ticks 100
 
 # Continue from partial trace
-python inference_evo.py checkpoints/evo_train/best_model.pt \
+uv run inference_evo.py checkpoints/evo_train/best_model.pt \
     --continue trace.txt --max-ticks 50
 
 # Generate from custom prompt
-python inference_evo.py checkpoints/evo_train/best_model.pt \
+uv run inference_evo.py checkpoints/evo_train/best_model.pt \
     --prompt "=EPOCH 1 1000 W0"
 
 # Full per-tick routing, retrieval and verification (requires compatible
 # Stage 3 policy, Stage 2 memory/store and Stage 4 critic artifacts)
-python inference_evo.py checkpoints/evo_train/best_model.pt \
+uv run inference_evo.py checkpoints/evo_train/best_model.pt \
     --new-world --policy-checkpoint checkpoints/evo_policy/meta_controller_rl.pt \
     --memory-checkpoint checkpoints/evo_memory/memory_system_final.pt \
     --semantic-store checkpoints/evo_memory/semantic_memory \
@@ -214,7 +214,7 @@ If you encounter `CUBLAS_STATUS_NOT_INITIALIZED` errors during inference:
 ```bash
 export CUBLAS_WORKSPACE_CONFIG=:0:0
 export TORCH_BLAS_PREFER_CUBLASLT=0
-python inference.py checkpoints/stage1/best_model.pt --prompt "Hello"
+uv run inference.py checkpoints/stage1/best_model.pt --prompt "Hello"
 ```
 
 This bug affects RTX 30xx/40xx series and A-series Ampere GPUs at sequence length ≥5 with large vocabulary matrices (128K tokens). The workaround is automatically applied in `train.py`, `train_evo.py`, `inference.py`, and `inference_evo.py`.
@@ -223,29 +223,29 @@ This bug affects RTX 30xx/40xx series and A-series Ampere GPUs at sequence lengt
 
 ```bash
 # Test with demo dataset
-python scripts/run_eval.py checkpoints/stage1/best_model.pt --all --demo
+uv run scripts/run_eval.py checkpoints/stage1/best_model.pt --all --demo
 
 # Run specific benchmarks (downloaded from the HuggingFace Hub)
-python scripts/run_eval.py checkpoints/stage1/best_model.pt \
+uv run scripts/run_eval.py checkpoints/stage1/best_model.pt \
     --benchmarks mmlu truthfulqa --limit 500 \
     --output results.json
 
 # Evaluate the full engine rebuilt from a Stage 3 policy
-python scripts/run_eval.py checkpoints/stage1/best_model.pt --all \
+uv run scripts/run_eval.py checkpoints/stage1/best_model.pt --all \
     --policy-checkpoint checkpoints/stage3/meta_controller_rl.pt
 ```
 
 ```bash
 # Ablation controls and the synthetic multi-session memory benchmark
-python scripts/run_eval.py checkpoints/stage1/best_model.pt --benchmarks memory \
+uv run scripts/run_eval.py checkpoints/stage1/best_model.pt --benchmarks memory \
     --policy-checkpoint checkpoints/stage3/meta_controller_rl.pt \
     --route-policy always --expert-bias --dtype bfloat16 --memory-mode frozen --records records.jsonl
-python scripts/run_eval.py checkpoints/stage1/best_model.pt --benchmarks memory --memory-bench-mode prompt
+uv run scripts/run_eval.py checkpoints/stage1/best_model.pt --benchmarks memory --memory-bench-mode prompt
 ```
 
 The engine's confidence is the critic score when verified, the geometric-mean token probability otherwise, and 0 after an abstention (`confidence_source` says which). Metrics: accuracy, error rate, coverage, answered error rate, confident-error rate (wrong with confidence ≥ 0.8; not a hallucination rate), ECE, Brier, AURC. TruthfulQA is a lexical proxy (`truthfulness_proxy`), MMLU reads the first standalone letter of at most 10 new tokens, HumanEval runs code in Docker without network when available (else a resource-limited subprocess that is not a security boundary). Benchmarks run under `frozen_memory()` by default; the memory benchmark (`evaluation/memory_bench.py`) is stateful within its own namespace and has a `prompt` mode that prepends all facts as a recent-text-buffer baseline. Reports carry p50/p95 latency, mean `compute_units`, peak GPU memory, artifact versions and optional per-example records.
 
-Tests: `python -m pytest tests -q` (deterministic diagnostics; episodic/semantic tests skip without mamba-ssm/faiss).
+Tests: `uv run pytest -q` (deterministic diagnostics; episodic/semantic tests skip without mamba-ssm/faiss).
 
 ## Architecture Overview
 
@@ -490,7 +490,7 @@ KV caching is implemented in `BaseMoEModel` for efficient inference. When adding
 
 3. **RTX 3060 cuBLAS Bug**: Ampere GPUs have kernel bug with large vocab matrices at seq_len ≥5. Automatic workaround applied in `train.py`, `train_evo.py`, `inference.py` and `inference_evo.py`.
 
-4. **mamba-ssm Dependency**: Requires CUDA-capable GPU for compilation and runtime. CPU-only systems cannot use episodic memory. Package imports are lazy, so Stage 1, the tokenizer and basic inference need neither mamba-ssm nor faiss (`pip install -e .[memory]` adds them).
+4. **mamba-ssm Dependency**: Requires CUDA-capable GPU for compilation and runtime. CPU-only systems cannot use episodic memory. Package imports are lazy, so Stage 1, the tokenizer and basic inference need neither mamba-ssm nor faiss (`uv sync --extra memory` adds them).
 
 5. **Lexical Scoring**: The Stage 3 reward and the TruthfulQA runner compare text lexically (`scoring.answer_correct`: normalized phrase match without negation words, or word F1 ≥ 0.5). They reject negated answers but misjudge paraphrases and verbose correct answers.
 

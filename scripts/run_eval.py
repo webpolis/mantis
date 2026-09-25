@@ -212,7 +212,7 @@ def main():
                 else:
                     datasets[n] = load_hub_dataset(n, args.limit)
         except ImportError:
-            print("Error: real benchmarks need the 'datasets' library (pip install datasets), or pass --demo")
+            print("Error: real benchmarks need the 'datasets' library (uv sync), or pass --demo")
             return 1
 
     print(f"\n{'='*80}")

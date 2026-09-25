@@ -730,7 +730,7 @@ def validate_stage1_args(args):
         if args.pretokenized:
             return "Cannot use --pretokenized with --hf-dataset"
         if not DATASETS_AVAILABLE:
-            return "HuggingFace datasets requires 'datasets' library. Install with: pip install datasets"
+            return "HuggingFace datasets requires 'datasets' library. Install with: uv sync"
         if args.streaming and args.val_split:
             return "--val-split not supported with --streaming. Use --hf-val-split instead."
         if args.streaming and not args.steps_per_epoch:
@@ -767,7 +767,7 @@ def validate_stage1_args(args):
     if args.stride and not 0 < args.stride <= args.seq_len:
         return f"--stride must be between 1 and --seq-len ({args.seq_len}), got {args.stride}"
     if args.pretokenized and not DATASETS_AVAILABLE:
-        return "--pretokenized requires 'datasets' library. Install with: pip install datasets"
+        return "--pretokenized requires 'datasets' library. Install with: uv sync"
     return None
 
 

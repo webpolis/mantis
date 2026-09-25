@@ -263,12 +263,12 @@ Generate 3 partitioned datasets by complexity tier, then train with `train_evo.p
 
 ```bash
 # 1. Generate partitioned datasets (compact v2 format)
-python scripts/gen_evo_dataset.py --worlds 5000 --max-epoch CAMBRIAN  --output data/evo_bio.txt --compact --workers 8
-python scripts/gen_evo_dataset.py --worlds 5000 --max-epoch ECOSYSTEM --output data/evo_eco.txt --compact --workers 8 --enable-agents
-python scripts/gen_evo_dataset.py --worlds 5000  --output data/evo_intel.txt --compact --workers 8 --enable-agents
+uv run scripts/gen_evo_dataset.py --worlds 5000 --max-epoch CAMBRIAN  --output data/evo_bio.txt --compact --workers 8
+uv run scripts/gen_evo_dataset.py --worlds 5000 --max-epoch ECOSYSTEM --output data/evo_eco.txt --compact --workers 8 --enable-agents
+uv run scripts/gen_evo_dataset.py --worlds 5000  --output data/evo_intel.txt --compact --workers 8 --enable-agents
 
 # 2. Train with curriculum (tiny model, single GPU, 12GB VRAM)
-python train_evo.py \
+uv run train_evo.py \
     --bio data/evo_bio.txt --eco data/evo_eco.txt --intel data/evo_intel.txt \
     --model-size tiny --seq-len 2048 --batch-size 8 \
     --steps-per-epoch 1000 --epochs 20 \
@@ -276,7 +276,7 @@ python train_evo.py \
     --mixed-precision --val-split 0.1
 
 # 3. Generate from trained model
-python inference_evo.py checkpoints/evo_train/best_model.pt \
+uv run inference_evo.py checkpoints/evo_train/best_model.pt \
     --new-world --seed 42 --max-ticks 100
 ```
 
@@ -296,11 +296,11 @@ For quick iteration without curriculum mixing, `train.py` works with a single ev
 
 ```bash
 # Generate single dataset
-python scripts/gen_evo_dataset.py --worlds 10000 --max-generations 200 \
+uv run scripts/gen_evo_dataset.py --worlds 10000 --max-generations 200 \
     --output data/evo_train.txt --workers 8 --seed 42 --compact
 
 # Train (no per-token weighting, no curriculum)
-python train.py --stage 1 data/evo_train.txt \
+uv run train.py --stage 1 data/evo_train.txt \
     --model-size tiny --seq-len 2048 --stride 1024 --batch-size 8 \
     --gradient-accumulation-steps 4 --learning-rate 5e-4 \
     --warmup-steps 2000 --epochs 10 --mixed-precision --val-split 0.1
@@ -314,7 +314,7 @@ Agent blocks carry one line per representative agent (up to 20 per species) with
 
 ```bash
 # Agent-enabled with longer sequences (24GB GPU)
-python train_evo.py \
+uv run train_evo.py \
     --bio data/evo_bio.txt --eco data/evo_eco.txt --intel data/evo_intel.txt \
     --model-size tiny --seq-len 4096 --batch-size 4 \
     --steps-per-epoch 1000 --epochs 20 \
@@ -444,15 +444,15 @@ Tick-by-tick generation with `---` separator detection. Designed as an importabl
 
 ```bash
 # CLI: generate a new world
-python inference_evo.py checkpoints/evo_train/best_model.pt \
+uv run inference_evo.py checkpoints/evo_train/best_model.pt \
     --new-world --seed 42 --max-ticks 100
 
 # CLI: continue from partial trace
-python inference_evo.py checkpoints/evo_train/best_model.pt \
+uv run inference_evo.py checkpoints/evo_train/best_model.pt \
     --continue trace.txt --max-ticks 50
 
 # CLI: save to file
-python inference_evo.py checkpoints/evo_train/best_model.pt \
+uv run inference_evo.py checkpoints/evo_train/best_model.pt \
     --new-world --seed 0 --output generated_world.txt
 ```
 
@@ -478,7 +478,7 @@ for tick in engine.continue_trace(existing_trace, max_ticks=10):
 With a Stage 3 policy trained on the same evolution backbone, every tick runs through `MANTISInferenceEngine.generate()`: the meta-controller picks the gates, retrieved history is prepended as trace text, and the critic can reject the tick. The policy checkpoint records the Stage 2 memory, semantic store and Stage 4 critic paths; the explicit flags override them.
 
 ```bash
-python inference_evo.py checkpoints/evo_train/best_model.pt \
+uv run inference_evo.py checkpoints/evo_train/best_model.pt \
     --new-world --seed 42 --max-ticks 100 \
     --policy-checkpoint checkpoints/evo_policy/meta_controller_rl.pt \
     --memory-checkpoint checkpoints/evo_memory/memory_system_final.pt \
