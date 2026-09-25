@@ -165,12 +165,12 @@ uv run train.py --stage 1 data/train.txt --val-file data/val.txt
 
 | Size | Parameters (active) | Query/KV heads | Controller | Critic | Use Case | Training VRAM |
 |------|-----------|------|------|------|----------|-------------|
-| `micro` | ~3M (dense) | 4/4 | 0.6M | 2.2M | Ultra-fast testing | ~0.4GB |
-| `tiny` | ~55M (~30M) | 8/4 | 2.4M | 14M | Development/debugging | ~1.4GB |
-| `small` | ~435M (~234M) | 32/8 | 18M | 45M | Experimentation | ~9GB (~6GB with `--gradient-checkpointing --use-8bit-optimizer`) |
-| `base` | ~6.7B (~1.9B) | 32/8 | 106M | 80M | Production | ~127GB (~88GB with `--gradient-checkpointing --use-8bit-optimizer`) |
+| `micro` | ~3M (dense) | 4/4 | 0.6M | 2.2M | Ultra-fast testing | ~0.7GB |
+| `tiny` | ~55M (~30M) | 8/4 | 2.4M | 14M | Development/debugging | ~1.9GB |
+| `small` | ~435M (~234M) | 32/8 | 18M | 45M | Experimentation | ~10GB (~7GB with `--gradient-checkpointing --use-8bit-optimizer`) |
+| `base` | ~6.7B (~1.9B) | 32/8 | 106M | 80M | Production | ~128GB (~89GB with `--gradient-checkpointing --use-8bit-optimizer`) |
 
-The controller and critic scale with the preset, so a `micro` full-system run is a micro-size system. VRAM comes from `mantis/training/vram_estimator.py` for FP16 mixed precision, batch size 1 and `--seq-len 512`.
+Parameter counts are for the 512-token evolution tokenizer; the default 32K BPE vocabulary adds `32768 × d_model` tied embedding parameters (8M for `micro`, 134M for `base`). The controller and critic scale with the preset, so a `micro` full-system run is a micro-size system. VRAM comes from `mantis/training/vram_estimator.py` for FP16 mixed precision, batch size 1, `--seq-len 512` and the 32K vocabulary.
 
 ```bash
 # Specify size with --model-size
@@ -478,7 +478,7 @@ uv run inference.py checkpoints/stage1/best_model.pt --prompt "Hello"
 
 ## Evolution Simulation
 
-The 512-token tokenizer is built for the protocol of `mantis/simulation`, an ecological simulator that writes evolving ecosystems as text. A model trained on these traces continues a world tick by tick. [EVOLUTION_SIM_OVERVIEW.md](EVOLUTION_SIM_OVERVIEW.md) covers the simulator, the protocol and the training settings.
+`MANTISTokenizer`, a fixed 512-token trie tokenizer (`--tokenizer mantis`), is built for the protocol of `mantis/simulation`, an ecological simulator that writes evolving ecosystems as text. A model trained on these traces continues a world tick by tick. [EVOLUTION_SIM_OVERVIEW.md](EVOLUTION_SIM_OVERVIEW.md) covers the simulator, the protocol and the training settings.
 
 ```bash
 # 1. Generate three datasets, capped at increasing epochs
@@ -578,16 +578,23 @@ Full list: `python train.py --help`
 
 ### Tokenizer Management
 
+Stage 1 trains a byte-level BPE tokenizer (the GPT-2 / Llama scheme, via HuggingFace `tokenizers`) on the training data when no `--tokenizer-path` is given, and saves it next to the checkpoints. Every later stage, resume and inference loads that saved copy; checkpoints and pre-tokenized datasets record its fingerprint and refuse a different one.
+
 ```bash
-# First run: Creates tokenizer
+# First run: trains the tokenizer on the data (--vocab-size 32768, first --tokenizer-train-docs 100000 documents)
 uv run train.py --stage 1 data/train.txt --val-split 0.1
 # → Saves to checkpoints/train/tokenizer
 
-# Later runs: Reuse for consistency
+# Later runs: reuse it
 uv run train.py --stage 1 data/new.txt \
     --tokenizer-path checkpoints/train/tokenizer \
     --val-split 0.1
+
+# Evolution traces: the fixed 512-token trie tokenizer of the simulation protocol
+uv run train.py --stage 1 data/evo.txt --tokenizer mantis --val-split 0.1
 ```
+
+`scripts/preprocess_data.py` trains and saves the tokenizer the same way (`tokenizer/` next to `--output`), and `train.py --pretokenized` finds it there.
 
 ---
 
@@ -636,7 +643,7 @@ mantis/
 ├── configs/          # model_config (presets: micro/tiny/small/base)
 ├── utils/            # checkpoints (schema, model and tokenizer loading, fingerprints)
 ├── data.py           # Documents, EOS, packing, leak-free splits
-├── tokenizer.py      # MANTISTokenizer (trie-based, 512 tokens, byte fallback)
+├── tokenizer.py      # BPETokenizer (byte-level BPE trained on the data), MANTISTokenizer (evolution trie, 512 tokens)
 evaluation/           # benchmarks, metrics, evaluation harness
 ├── benchmarks.py     # MMLU, TruthfulQA, HumanEval, GSM8K
 ├── memory_bench.py   # Synthetic multi-session memory benchmark
@@ -672,7 +679,7 @@ web/                  # Simulation playground (Flask server, React client)
 - No trained weights (architecture only); no benchmark, throughput or calibration result exists
 - True attention is limited to the preset window (8K); memory extends what the generator can see only as far as retrieval recall and the evidence budget allow
 - Episodic memory needs a CUDA-capable GPU (mamba-ssm). Stage 2 always needs one. Stage 3 and the full engine need one only when they load a Stage 2 memory checkpoint
-- The 512-token tokenizer makes natural-language sequences several times longer than a subword vocabulary would; a general-language tokenizer is not evaluated
+- The BPE tokenizer is trained per run from a document sample; two runs on different data are not token-compatible
 - Retention is by retrieval hits and overflow, not learned from what later queries need; no atomic facts or conflict resolution
 
 ---

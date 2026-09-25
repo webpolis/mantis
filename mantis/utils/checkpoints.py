@@ -59,11 +59,11 @@ def load_tokenizer(checkpoint_path: str, checkpoint: Dict, tokenizer_path: Optio
     directory next to the checkpoint, else the built-in vocabulary. The result
     must match the fingerprint recorded in the checkpoint.
     """
-    from mantis.tokenizer import MANTISTokenizer
+    from mantis.tokenizer import MANTISTokenizer, load_tokenizer as load_saved
 
     path = tokenizer_path or os.path.join(os.path.dirname(checkpoint_path), 'tokenizer')
     if os.path.isdir(path):
-        tokenizer = MANTISTokenizer.load(path)
+        tokenizer = load_saved(path)
     elif tokenizer_path:
         raise FileNotFoundError(f"Tokenizer not found: {tokenizer_path}")
     else:

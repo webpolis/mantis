@@ -23,7 +23,9 @@ uv run train.py --stage 1 \
     --streaming \
     --steps-per-epoch 1000
 
-# Local file with auto-split validation (convenient)
+# Local file with auto-split validation (convenient). Without --tokenizer-path, Stage 1 trains a
+# byte-level BPE tokenizer on the data (--vocab-size, --tokenizer-train-docs); --tokenizer mantis
+# selects the fixed evolution-format tokenizer instead
 uv run train.py --stage 1 data/train.txt --val-split 0.1
 
 # Production: Pre-tokenized dataset with separate validation
@@ -121,6 +123,7 @@ uv run train_evo.py --bio data/evo_bio.txt \
 ```
 
 **Key differences from `train.py`**:
+- Always uses `MANTISTokenizer`, the fixed 512-token trie tokenizer of the simulation protocol
 - Uses `EvoWorldDataset` (world-boundary-aware chunking, never crosses `\n\n` boundaries)
 - Per-token loss weights via `tokenizer.compute_loss_weights()`, computed once per whole world (protocol markers set weight for subsequent tokens); ignored labels get weight 0
 - `--val-split` holds out whole worlds per partition
@@ -284,7 +287,7 @@ mantis/
 │   └── model_config.py  # Presets: micro/tiny/small/base
 ├── utils/checkpoints.py # Checkpoint schema, model/tokenizer loading
 ├── data.py              # Documents, EOS, packing, leak-free splits
-└── tokenizer.py         # MANTISTokenizer (trie-based, 512 tokens, byte fallback)
+└── tokenizer.py         # BPETokenizer (byte-level BPE trained on the data), MANTISTokenizer (evolution trie), load_tokenizer
 
 evaluation/              # Evaluation harness
 ├── benchmarks.py        # MMLU, TruthfulQA (proxy), HumanEval (docker sandbox), GSM8K
@@ -372,7 +375,7 @@ Model sizes are defined in `mantis/configs/model_config.py`:
 
 `get_large_config()` (~71B, 16 experts) and `get_extmem_config()` (32K windows) exist too, but `--model-size` does not offer them.
 
-**Vocabulary**: All models use 512 tokens (custom domain-specific trie tokenizer, synced at runtime via `len(tokenizer)`).
+**Vocabulary**: `vocab_size` follows the tokenizer (`len(tokenizer)`). Stage 1 trains a byte-level BPE tokenizer on the data (`--vocab-size 32768`, `--tokenizer-train-docs 100000`) unless `--tokenizer-path` names a saved one or `--tokenizer mantis` selects the fixed 512-token evolution trie tokenizer. Both share the special ids (pad 0, eos 1, bos 2, unk 3) and one interface; `load_tokenizer(path)` reads the class from `config.json`. Byte-level BPE never emits `<unk>`. `train_evo.py` and `inference_evo.py` always use the trie tokenizer (its protocol markers drive the loss weights).
 
 **Critical alignment requirements** (checked by `MANTISConfig.validate()`, which runs at construction and after each preset):
 - `MetaControllerConfig.d_model` must match `BaseMoEConfig.d_model`
@@ -499,7 +502,7 @@ KV caching is implemented in `BaseMoEModel` for efficient inference. When adding
 
 5. **Lexical Scoring**: The Stage 3 reward and the TruthfulQA runner compare text lexically (`scoring.answer_correct`: normalized phrase match without negation words, or word F1 ≥ 0.5). They reject negated answers but misjudge paraphrases and verbose correct answers.
 
-6. **Tokenizer**: The 512-token vocabulary makes natural-language sequences several times longer than a subword vocabulary would, so per-token costs and context coverage are not comparable with subword models. A general-language tokenizer is future work.
+6. **Tokenizer**: The BPE vocabulary is learned per run from the first `--tokenizer-train-docs` documents, so checkpoints from different corpora are not token-compatible; reuse `--tokenizer-path` to continue on new data.
 
 ## Important Notes
 

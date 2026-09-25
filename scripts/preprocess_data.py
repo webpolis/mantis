@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import itertools
 import json
 import os
 import sys
@@ -30,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datasets import Dataset, Features, Sequence, Value
 from mantis.data import encode_documents, iter_documents, pack_windows
-from mantis.tokenizer import MANTISTokenizer
+from mantis.tokenizer import BPETokenizer, MANTISTokenizer, load_tokenizer
 
 
 def _windows(input_file, tokenizer, seq_len, stride, source_mtime):
@@ -133,9 +134,16 @@ Examples:
 
     # Tokenizer
     parser.add_argument('--tokenizer', type=str,
-                       help='Path to existing tokenizer. If not provided, creates new tokenizer')
+                       help='Existing tokenizer directory. Without it, one is created per --tokenizer-type')
+    parser.add_argument('--tokenizer-type', choices=['bpe', 'mantis'], default='bpe',
+                       help='Tokenizer to create: byte-level BPE trained on the input (default) or the '
+                            'fixed trie tokenizer of the evolution format')
+    parser.add_argument('--vocab-size', type=int, default=32768,
+                       help='BPE vocabulary size (default: 32768)')
+    parser.add_argument('--tokenizer-train-docs', type=int, default=100_000,
+                       help='Documents the BPE tokenizer is trained on, 0 for all (default: 100000)')
     parser.add_argument('--tokenizer-save', type=str,
-                       help='Path to save tokenizer (only used when creating new tokenizer)')
+                       help='Where to save a created tokenizer (default: tokenizer/ next to --output)')
 
     # Sequence parameters
     parser.add_argument('--seq-len', type=int, default=512,
@@ -163,20 +171,20 @@ Examples:
         print(f"Error: --stride must be between 1 and --seq-len ({args.seq_len})")
         return
 
-    # Load or create tokenizer
     if args.tokenizer:
-        print(f"Loading tokenizer from {args.tokenizer}...")
-        tokenizer = MANTISTokenizer.load(args.tokenizer)
-        print(f"Loaded vocabulary: {len(tokenizer):,} tokens")
+        tokenizer = load_tokenizer(args.tokenizer)
+        print(f"Loaded {type(tokenizer).__name__} from {args.tokenizer}: {len(tokenizer):,} tokens")
     else:
-        print("Creating new tokenizer...")
-        tokenizer = MANTISTokenizer()
-        print(f"Vocabulary size: {len(tokenizer):,} tokens")
-
-        # Save tokenizer if requested
-        if args.tokenizer_save:
-            print(f"Saving tokenizer to {args.tokenizer_save}...")
-            tokenizer.save(args.tokenizer_save)
+        if args.tokenizer_type == 'mantis':
+            tokenizer = MANTISTokenizer()
+        else:
+            docs = f"{args.tokenizer_train_docs:,}" if args.tokenizer_train_docs else "all"
+            print(f"Training a {args.vocab_size:,}-token BPE tokenizer on {docs} documents of {args.input}...")
+            texts = itertools.islice(iter_documents(args.input), args.tokenizer_train_docs or None)
+            tokenizer = BPETokenizer.train(texts, args.vocab_size)
+        save_path = args.tokenizer_save or os.path.join(os.path.dirname(args.output.rstrip('/')), 'tokenizer')
+        tokenizer.save(save_path)
+        print(f"Tokenizer saved: {save_path} ({len(tokenizer):,} tokens)")
 
     # Preprocess training data
     preprocess_dataset(

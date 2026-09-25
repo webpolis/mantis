@@ -3,7 +3,8 @@ Unified Training Script for MANTIS
 
 Supports:
 - Single-GPU and multi-GPU training (via HuggingFace Accelerate)
-- MANTIS trie tokenizer (blank-line separated documents, one EOS per document)
+- Byte-level BPE tokenizer trained on the data (or the trie tokenizer of the
+  evolution format with --tokenizer mantis); blank-line separated documents, one EOS each
 - Pre-tokenized datasets (recommended for large-scale training)
 - HuggingFace datasets (direct from Hub with streaming support)
 - Auto-split validation (convenience mode) or pre-split validation (production mode)
@@ -73,6 +74,7 @@ except Exception:
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, IterableDataset, DataLoader
+import itertools
 import json
 import math
 import argparse
@@ -89,8 +91,10 @@ warnings.filterwarnings('ignore', message='.*lr_scheduler.step.*optimizer.step.*
 
 from mantis.models import BaseMoEModel
 from mantis.configs.model_config import get_micro_config, get_tiny_config, get_small_config, get_base_config
-from mantis.tokenizer import MANTISTokenizer
-from mantis.data import encode_documents, pack_windows, tokenize_file, num_windows, split_at_document, split_packed
+from mantis.tokenizer import BPETokenizer, MANTISTokenizer, load_tokenizer
+from mantis.data import (
+    encode_documents, iter_documents, pack_windows, tokenize_file, num_windows, split_at_document, split_packed,
+)
 from mantis.utils.checkpoints import compat_load, check_tokenizer, save_training_checkpoint, restore_training_state
 from mantis.training.common import (
     build_accelerator, build_optimizer, warmup_cosine_schedule, report_schedule, round_steps_to_accumulation,
@@ -266,22 +270,44 @@ def _check_pretokenized(dataset_path, tokenizer):
     return seq_len, prep.get('stride', seq_len)
 
 
-def load_or_create_tokenizer(tokenizer_path=None):
-    """
-    Load an existing tokenizer, or create the built-in one when no path is given.
-    """
-    if tokenizer_path:
-        if not os.path.isdir(tokenizer_path):
-            raise FileNotFoundError(f"Tokenizer not found: {tokenizer_path}")
-        print(f"Loading tokenizer from {tokenizer_path}...")
-        tokenizer = MANTISTokenizer.load(tokenizer_path)
-        print(f"Loaded vocabulary: {len(tokenizer):,} tokens")
+def iter_training_texts(args, limit):
+    """Documents of the selected data source, capped at `limit` (0 = all), for tokenizer training."""
+    if args.hf_dataset:
+        # A split slice such as "train[:10%]" only works without streaming
+        hf = load_dataset(args.hf_dataset, name=args.hf_config, split=args.hf_train_split or "train",
+                          streaming=args.streaming)
+        texts = (example[args.hf_text_column] for example in hf)
     else:
-        print("Creating new tokenizer...")
-        tokenizer = MANTISTokenizer()
-        print(f"Vocabulary size: {len(tokenizer):,} tokens")
+        texts = iter_documents(args.train_file)
+    return itertools.islice(texts, limit or None)
 
-    return tokenizer
+
+def load_or_create_tokenizer(args, accelerator):
+    """
+    Load the tokenizer at --tokenizer-path, or create one: a byte-level BPE
+    trained on the training data (main process trains, the others load its
+    copy from the output directory) or the evolution-format trie tokenizer.
+    """
+    if args.tokenizer_path:
+        if not os.path.isdir(args.tokenizer_path):
+            raise FileNotFoundError(f"Tokenizer not found: {args.tokenizer_path}")
+        tokenizer = load_tokenizer(args.tokenizer_path)
+        if accelerator.is_main_process:
+            print(f"Loaded {type(tokenizer).__name__} from {args.tokenizer_path}: {len(tokenizer):,} tokens")
+        return tokenizer
+
+    if args.tokenizer == 'mantis':
+        return MANTISTokenizer()
+
+    save_path = os.path.join(args.output_dir, 'tokenizer')
+    if accelerator.is_main_process:
+        docs = f"{args.tokenizer_train_docs:,}" if args.tokenizer_train_docs else "all"
+        print(f"Training a {args.vocab_size:,}-token BPE tokenizer on {docs} training documents...")
+        tokenizer = BPETokenizer.train(iter_training_texts(args, args.tokenizer_train_docs), args.vocab_size)
+        tokenizer.save(save_path)
+        print(f"Tokenizer saved: {save_path} ({len(tokenizer):,} tokens)")
+    accelerator.wait_for_everyone()
+    return load_tokenizer(save_path)
 
 
 def build_datasets(args, tokenizer, seq_len, is_main):
@@ -473,21 +499,21 @@ def pipeline_plan(config, seq_len, args):
 
 
 def train(args):
-    tokenizer = load_or_create_tokenizer(args.tokenizer_path)
+    accelerator, use_deepspeed = build_accelerator(args)
+    is_main = accelerator.is_main_process
+    from accelerate.utils import set_seed
+    set_seed(42)
+
+    tokenizer = load_or_create_tokenizer(args, accelerator)
 
     # Sequence length: pretokenized data fixes it at preprocessing time
     seq_len = args.seq_len
     if args.pretokenized:
         seq_len, _ = _check_pretokenized(args.train_file, tokenizer)
-        if seq_len != args.seq_len:
+        if seq_len != args.seq_len and is_main:
             print(f"⚠️  Pretokenized data has seq_len={seq_len}, overriding --seq-len={args.seq_len}")
 
     config, preloaded_checkpoint = resolve_model_config(args, tokenizer, seq_len)
-
-    accelerator, use_deepspeed = build_accelerator(args)
-    is_main = accelerator.is_main_process
-    from accelerate.utils import set_seed
-    set_seed(42)
 
     placement = None
     if args.pipeline:
@@ -603,10 +629,7 @@ def train(args):
                 print(f"✓ Best validation loss: {best_val_loss:.4f}")
 
     if is_main:
-        os.makedirs(args.output_dir, exist_ok=True)
-        tokenizer_save_path = os.path.join(args.output_dir, 'tokenizer')
-        tokenizer.save(tokenizer_save_path)
-        print(f"Tokenizer saved: {tokenizer_save_path}")
+        tokenizer.save(os.path.join(args.output_dir, 'tokenizer'))
 
     def save(name, epoch, epoch_step, **extra):
         """Save on the main process after all ranks reach this point."""
@@ -756,6 +779,7 @@ STAGE1_ONLY_FLAGS = {
     'hf_dataset': None, 'pretokenized': False, 'streaming': False, 'val_file': None,
     'val_split': None, 'mixed_precision': None, 'deepspeed': False, 'cpu_offload': False,
     'use_8bit_optimizer': False, 'gradient_checkpointing': False, 'auto_batch': False, 'pipeline': False,
+    'tokenizer': 'bpe', 'vocab_size': 32768, 'tokenizer_train_docs': 100_000,
 }
 
 
@@ -814,6 +838,11 @@ def validate_stage1_args(args):
         if args.hf_train_split or args.hf_val_split or args.hf_config or args.hf_text_column != 'text':
             return "HuggingFace-specific arguments require --hf-dataset"
 
+    if args.pretokenized and not args.tokenizer_path:
+        sibling = os.path.join(os.path.dirname(args.train_file.rstrip('/')), 'tokenizer')
+        if not os.path.isdir(sibling):
+            return f"--tokenizer-path required with --pretokenized (preprocess_data.py saves one at {sibling})"
+        args.tokenizer_path = sibling
     if args.resume:
         if not os.path.exists(args.resume):
             return f"Checkpoint not found: {args.resume}"
@@ -968,7 +997,15 @@ Examples:
 
     # Tokenizer
     parser.add_argument('--tokenizer-path', type=str,
-                        help='Path to existing tokenizer directory. If not provided, uses the built-in vocabulary')
+                        help='Existing tokenizer directory (saved by a previous run or preprocess_data.py). '
+                             'Without it, Stage 1 creates one per --tokenizer')
+    parser.add_argument('--tokenizer', choices=['bpe', 'mantis'], default='bpe',
+                        help='Tokenizer to create: byte-level BPE trained on the data (default) or the '
+                             'fixed 512-token trie tokenizer of the evolution format')
+    parser.add_argument('--vocab-size', type=int, default=32768,
+                        help='BPE vocabulary size including the 4 special tokens (default: 32768)')
+    parser.add_argument('--tokenizer-train-docs', type=int, default=100_000,
+                        help='Documents the BPE tokenizer is trained on, 0 for all (default: 100000)')
 
     # Resumption
     parser.add_argument('--resume', type=str,

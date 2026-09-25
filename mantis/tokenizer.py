@@ -1,10 +1,17 @@
 """
-MANTIS Tokenizer — Trie-Based Domain-Specific Tokenizer
+MANTIS Tokenizers
 
-Custom tokenizer for the MANTIS ecological evolution simulation format.
-Uses trie-based longest-match tokenization with ~300 domain tokens plus a
-UTF-8 byte fallback, padded to 512 for tensor core alignment. No GPT-2 / BPE
-dependency. Every string round-trips losslessly through encode/decode.
+Two tokenizers with one interface (encode, decode, stream_decoder,
+non_generable_ids, fingerprint, save/load, len):
+
+- BPETokenizer: byte-level BPE (the GPT-2 / Llama scheme) trained on the
+  training corpus with HuggingFace `tokenizers`. The default for general text.
+- MANTISTokenizer: trie-based tokenizer for the ecological evolution
+  simulation format, ~300 domain tokens plus a UTF-8 byte fallback, padded to
+  512. Its protocol markers drive the per-token loss weights of train_evo.py.
+
+`load_tokenizer(path)` reads the class name from the saved config.json.
+Every string round-trips losslessly through either tokenizer.
 
 Numbers are always tokenized digit-by-digit for consistent encoding.
 All protocol markers, body plans, traits, and domain keywords are
@@ -38,7 +45,7 @@ Vocabulary (~300 tokens, padded to 512):
     Byte fallback (161): <0x00>-<0x1F>, <0x7F>-<0xFF> for any other character
 """
 
-from typing import List, Union, Optional, Dict, Set
+from typing import Iterable, List, Union, Optional, Dict, Set
 import codecs
 import hashlib
 import json
@@ -504,18 +511,15 @@ class MANTISTokenizer:
                 for t in text
             ]
 
-        ids = self._encode_single(text)
+        return self._finish(self._encode_single(text), add_special_tokens, max_length, truncation, padding)
 
+    def _finish(self, ids, add_special_tokens, max_length, truncation, padding):
         if add_special_tokens:
             ids = [self.bos_token_id] + ids + [self.eos_token_id]
-
         if truncation and max_length is not None and len(ids) > max_length:
             ids = ids[:max_length]
-
         if padding and max_length is not None:
-            while len(ids) < max_length:
-                ids.append(self.pad_token_id)
-
+            ids = ids + [self.pad_token_id] * (max_length - len(ids))
         return ids
 
     def decode(
@@ -682,3 +686,122 @@ class StreamDecoder:
         flushed = self._bytes.decode(b"", final=True)
         self._bytes.reset()
         return flushed + self._tok.decode([token_id], skip_special_tokens=self._skip)
+
+
+# =============================================================================
+# BPETokenizer
+# =============================================================================
+
+SPECIAL_TOKENS = ["<pad>", "<eos>", "<bos>", "<unk>"]
+
+
+class BPETokenizer:
+    """
+    Byte-level BPE over the GPT-2 pre-tokenization regex, trained on the
+    corpus with HuggingFace `tokenizers`. Every byte is in the alphabet, so
+    <unk> is never produced.
+    """
+
+    def __init__(self, backend):
+        self._tok = backend
+        self.pad_token_id = backend.token_to_id("<pad>")
+        self.eos_token_id = backend.token_to_id("<eos>")
+        self.bos_token_id = backend.token_to_id("<bos>")
+        self.unk_token_id = backend.token_to_id("<unk>")
+        self.vocab_size = backend.get_vocab_size()
+
+    @classmethod
+    def train(cls, texts: Iterable[str], vocab_size: int, length: Optional[int] = None) -> "BPETokenizer":
+        """Learn the merges from an iterable of documents."""
+        from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+        backend = Tokenizer(models.BPE())
+        backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        backend.decoder = decoders.ByteLevel()
+        trainer = trainers.BpeTrainer(
+            vocab_size=vocab_size,
+            special_tokens=SPECIAL_TOKENS,
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+            show_progress=False,
+        )
+        backend.train_from_iterator(texts, trainer=trainer, length=length)
+        return cls(backend)
+
+    _finish = MANTISTokenizer._finish
+
+    def encode(
+        self,
+        text: Union[str, List[str]],
+        add_special_tokens: bool = False,
+        max_length: int = None,
+        truncation: bool = True,
+        padding: bool = False,
+    ) -> Union[List[int], List[List[int]]]:
+        if isinstance(text, list):
+            return [self._finish(e.ids, add_special_tokens, max_length, truncation, padding)
+                    for e in self._tok.encode_batch(text, add_special_tokens=False)]
+        ids = self._tok.encode(text, add_special_tokens=False).ids
+        return self._finish(ids, add_special_tokens, max_length, truncation, padding)
+
+    def decode(self, token_ids: Union[List[int], torch.Tensor], skip_special_tokens: bool = True) -> str:
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.tolist()
+        return self._tok.decode(token_ids, skip_special_tokens=skip_special_tokens)
+
+    def batch_decode(self, token_ids, skip_special_tokens: bool = True) -> List[str]:
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.tolist()
+        return self._tok.decode_batch(token_ids, skip_special_tokens=skip_special_tokens)
+
+    def stream_decoder(self, skip_special_tokens: bool = True) -> "BPEStreamDecoder":
+        return BPEStreamDecoder(self, skip_special_tokens)
+
+    @property
+    def non_generable_ids(self) -> List[int]:
+        return [self.pad_token_id, self.bos_token_id, self.unk_token_id]
+
+    def has_protocol_tokens(self) -> bool:
+        return False
+
+    def fingerprint(self) -> str:
+        return hashlib.sha256(self._tok.to_str().encode("utf-8")).hexdigest()[:16]
+
+    def __len__(self) -> int:
+        return self.vocab_size
+
+    def save(self, path: str):
+        os.makedirs(path, exist_ok=True)
+        self._tok.save(os.path.join(path, "tokenizer.json"))
+        with open(os.path.join(path, "config.json"), "w") as f:
+            json.dump({"tokenizer_class": "BPETokenizer", "vocab_size": self.vocab_size}, f, indent=2)
+
+    @classmethod
+    def load(cls, path: str) -> "BPETokenizer":
+        from tokenizers import Tokenizer
+        return cls(Tokenizer.from_file(os.path.join(path, "tokenizer.json")))
+
+
+class BPEStreamDecoder:
+    """Holds back tokens whose bytes do not yet form a complete UTF-8 character."""
+
+    def __init__(self, tokenizer: BPETokenizer, skip_special_tokens: bool = True):
+        self._tok = tokenizer
+        self._skip = skip_special_tokens
+        self._pending: List[int] = []
+
+    def push(self, token_id: int) -> str:
+        self._pending.append(token_id)
+        text = self._tok.decode(self._pending, skip_special_tokens=self._skip)
+        if text.endswith("\ufffd"):
+            return ""
+        self._pending = []
+        return text
+
+
+TOKENIZER_CLASSES = {"MANTISTokenizer": MANTISTokenizer, "BPETokenizer": BPETokenizer}
+
+
+def load_tokenizer(path: str):
+    """Load whichever tokenizer was saved at `path` (config.json names the class)."""
+    with open(os.path.join(path, "config.json")) as f:
+        name = json.load(f)["tokenizer_class"]
+    return TOKENIZER_CLASSES[name].load(path)
