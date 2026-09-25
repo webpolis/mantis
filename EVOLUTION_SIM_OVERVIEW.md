@@ -286,8 +286,9 @@ python inference_evo.py checkpoints/evo_train/best_model.pt \
 - **`EvoWorldDataset`**: World-boundary-aware chunking (splits on `\n\n`, never crosses worlds)
 - **`CurriculumDataset`**: IterableDataset mixing partitions with token-budget proportions that shift across training
 - **Weighted cross-entropy**: Per-token loss weights from `tokenizer.compute_loss_weights()` (protocol markers set weight)
-- **`--steps-per-epoch`** is required (IterableDataset has no `__len__`)
+- **`--steps-per-epoch`** is required for training (IterableDataset has no `__len__`)
 - Schedule presets: `default` (gradual shift), `linear`, `bio-only`
+- **Token cache**: each partition is tokenized and weighted once into `--cache-dir` (default `data/.evo_cache`), keyed by file path, size, mtime and tokenizer fingerprint, then memory-mapped so DDP ranks share it. `--prepare-data-only` builds the caches and exits, so a CPU box can prepare data before a GPU run
 
 ### Alternative: Single-file training with `train.py`
 
@@ -429,9 +430,9 @@ Perplexity alone is insufficient. Track:
 | Size          | Experts   | Strategy                  | Use case              |
 | ------------- | --------- | ------------------------- | --------------------- |
 | Micro (3M)    | Dense     | Single GPU                | Pipeline sanity check |
-| Tiny (57M)    | 4 experts | Single GPU                | Development iteration |
-| Small (454M)  | 4 experts | Single GPU or DDP         | Experimentation       |
-| Base (6.8B)   | 8 experts | DDP + ZeRO-2 (`--deepspeed`) | Production target  |
+| Tiny (55M)    | 4 experts | Single GPU                | Development iteration |
+| Small (435M)  | 4 experts | Single GPU or DDP         | Experimentation       |
+| Base (6.7B)   | 8 experts | DDP + ZeRO-2 (`--deepspeed`) | Production target  |
 
 ### What the trained model can do
 
@@ -471,3 +472,19 @@ for tick in engine.continue_trace(existing_trace, max_ticks=10):
 ```
 
 `EvoInferenceEngine` decodes through the shared loop in `mantis/inference/generation.py`. The KV cache carries across ticks, and when it fills, the loop re-encodes the latest half-window.
+
+### Full-engine inference
+
+With a Stage 3 policy trained on the same evolution backbone, every tick runs through `MANTISInferenceEngine.generate()`: the meta-controller picks the gates, retrieved history is prepended as trace text, and the critic can reject the tick. The policy checkpoint records the Stage 2 memory, semantic store and Stage 4 critic paths; the explicit flags override them.
+
+```bash
+python inference_evo.py checkpoints/evo_train/best_model.pt \
+    --new-world --seed 42 --max-ticks 100 \
+    --policy-checkpoint checkpoints/evo_policy/meta_controller_rl.pt \
+    --memory-checkpoint checkpoints/evo_memory/memory_system_final.pt \
+    --semantic-store checkpoints/evo_memory/semantic_memory \
+    --critic-checkpoint checkpoints/evo_critic/critic_best.pt \
+    --memory-dir runtime/evo --namespace world-42
+```
+
+The Python API takes the same arguments. `engine.last_result` holds the route, evidence, confidence and cost of the last yielded tick; `engine.close()` saves the runtime memory. A critic rejection ends the run instead of writing a refusal into the trace. `--route-policy always` opens every available gate for an ablation. The README's Evolution Simulation section describes the training data each stage needs.

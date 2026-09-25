@@ -480,6 +480,7 @@ python train_evo.py \
     --bio data/evo_bio.txt --eco data/evo_eco.txt --intel data/evo_intel.txt \
     --model-size tiny --seq-len 2048 --batch-size 8 \
     --steps-per-epoch 1000 --epochs 20 --mixed-precision --val-split 0.1
+# Partitions are tokenized once into data/.evo_cache (--cache-dir); --prepare-data-only builds the cache and exits
 
 # 3. Generate a new world
 python inference_evo.py checkpoints/evo_train/best_model.pt --new-world --seed 42 --max-ticks 100
@@ -617,8 +618,8 @@ python train.py --stage 1 data/train.txt --val-split 0.1  # Auto-detects
 ```
 mantis/
 ├── models/           # base_moe, meta_controller, critic, ssm
-├── memory/           # episodic, semantic, consolidation (lifecycle)
-├── training/         # common, pretrain, memory_train, rl_train, critic_train, sft, scoring
+├── memory/           # episodic, semantic, consolidation (lifecycle), provenance (source → trust)
+├── training/         # common, pretrain, memory_train, rl_train, critic_train, sft, scoring, vram_estimator
 ├── inference/        # generation (shared decode loop), prompting (evidence budget), engine
 ├── simulation/       # Ecological simulator that generates evolution training data
 ├── configs/          # model_config (presets: micro/tiny/small/base)
@@ -659,7 +660,7 @@ web/                  # Simulation playground (Flask server, React client)
 **Current Limitations**:
 - No trained weights (architecture only); no benchmark, throughput or calibration result exists
 - True attention is limited to the preset window (8K); memory extends what the generator can see only as far as retrieval recall and the evidence budget allow
-- Episodic memory needs a CUDA-capable GPU (mamba-ssm), so Stage 2, Stage 3 and the full engine do too
+- Episodic memory needs a CUDA-capable GPU (mamba-ssm). Stage 2 always needs one. Stage 3 and the full engine need one only when they load a Stage 2 memory checkpoint
 - The 512-token tokenizer makes natural-language sequences several times longer than a subword vocabulary would; a general-language tokenizer is not evaluated
 - Retention is by retrieval hits and overflow, not learned from what later queries need; no atomic facts or conflict resolution
 

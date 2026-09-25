@@ -247,21 +247,21 @@ def get_micro_config() -> MANTISConfig:
 
 
 def get_tiny_config() -> MANTISConfig:
-    """Tiny model for rapid testing (~57M parameters, ~32M active)."""
+    """Tiny model for rapid testing (~55M parameters, ~30M active)."""
     return _sized_config(d_model=512, n_layers=6, n_heads=8, n_kv_heads=4, d_ff=2048, n_experts=4, top_k=2,
                          controller_layers=2, controller_d_ff=1024,
                          critic_d_model=512, critic_layers=4, critic_heads=8, critic_d_ff=2048)
 
 
 def get_small_config() -> MANTISConfig:
-    """Small model for experimentation (~454M parameters, ~252M active)."""
+    """Small model for experimentation (~435M parameters, ~234M active)."""
     return _sized_config(d_model=1024, n_layers=12, n_heads=32, n_kv_heads=8, d_ff=4096, n_experts=4, top_k=2,
                          controller_layers=4, controller_d_ff=2048,
                          critic_d_model=768, critic_layers=6, critic_heads=12, critic_d_ff=3072)
 
 
 def get_base_config() -> MANTISConfig:
-    """Base model (~6.8B parameters, ~2B active)."""
+    """Base model (~6.7B parameters, ~1.9B active)."""
     return MANTISConfig()
 
 

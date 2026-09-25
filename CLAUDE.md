@@ -123,6 +123,7 @@ python train_evo.py --bio data/evo_bio.txt \
 - `CurriculumDataset` is an endless stream; partitions are addressed by name, and each schedule entry sets token shares that follow training progress (micro-steps done / planned)
 - `--steps-per-epoch` defines an epoch (required); the LR schedule and curriculum both follow it
 - Three schedule presets: `default` (gradual shift), `linear`, `bio-only`
+- Each partition is tokenized once into a memory-mapped cache under `--cache-dir` (default `data/.evo_cache`), keyed by file path, size, mtime and tokenizer fingerprint; `--prepare-data-only` builds the caches and exits
 
 ## Inference Commands
 
@@ -257,7 +258,7 @@ mantis/
 │   ├── meta_controller.py  # RL-trainable routing controller
 │   ├── critic.py        # Hallucination detection model
 │   └── ssm.py           # State-space model for episodic memory
-├── memory/              # Memory systems
+├── memory/              # Memory systems (provenance.py maps source → trust)
 │   ├── episodic.py      # SSM-keyed recent interactions with provenance and hit counts
 │   ├── semantic.py      # FAISS-based long-term memory (namespaces, trust, tombstones, fingerprint)
 │   └── consolidation.py # Lifecycle: overflow queue, periodic promotion, persistence
@@ -268,7 +269,8 @@ mantis/
 │   ├── rl_train.py      # Stage 3: RL meta-controller training (+ supervised route search)
 │   ├── critic_train.py  # Stage 4: Critic training with calibration split
 │   ├── sft.py           # Stage 5: instruction / evidence dataset in the engine's prompt format
-│   └── scoring.py       # Lexical answer correctness shared by rewards and evaluation
+│   ├── scoring.py       # Lexical answer correctness shared by rewards and evaluation
+│   └── vram_estimator.py  # Analytic parameter and VRAM estimate per preset
 ├── inference/           # Generation engine
 │   ├── generation.py    # Shared decode loop (cache, window, sampling, prefill reuse)
 │   ├── prompting.py     # Query formats, evidence block with source ids, budgeted selection
