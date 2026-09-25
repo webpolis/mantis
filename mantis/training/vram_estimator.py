@@ -21,14 +21,16 @@ def estimate_model_params(config):
     D = config.d_model
     L = config.n_layers
     H = config.n_heads
+    KV = getattr(config, 'n_kv_heads', H)
     F = config.d_ff
     E = config.n_experts
 
     # Token embeddings (lm_head is tied; RoPE has no parameters)
     embed_params = V * D
 
-    # Per-layer attention: qkv Linear(D, 3D) + out Linear(D, D), with biases
-    attn_params = 4 * D * D + 4 * D
+    # Per-layer attention: q Linear(D, D) + kv Linear(D, 2 * KV * D/H) + out Linear(D, D), with biases
+    kv_dim = 2 * KV * (D // H)
+    attn_params = 2 * D * D + D * kv_dim + 2 * D + kv_dim
 
     # Per-layer norms: attn_norm + ff_norm, each LayerNorm(D) = weight(D) + bias(D)
     norm_params = 4 * D

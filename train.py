@@ -26,6 +26,9 @@ Local files (production mode):
 Stages 2-4 take an optional JSONL file instead of text (see mantis/training/*):
    python train.py --stage 2 data/memory.jsonl --resume ckpt.pt --tokenizer-path tok/
 
+Stage 5 fine-tunes the base model on instruction/evidence JSONL in the engine's chat format:
+   python train.py --stage 5 data/sft.jsonl --resume ckpt.pt --tokenizer-path tok/ --val-split 0.1
+
 HuggingFace datasets (no download):
    python train.py --hf-dataset roneneldan/TinyStories --hf-val-split validation --streaming --steps-per-epoch 1000
 
@@ -235,7 +238,11 @@ def resolve_model_config(args, tokenizer, seq_len):
             'base': get_base_config
         }[args.model_size]()
         config.base_moe.max_seq_len = seq_len
+    # The verifier reads the base model's hidden states, so its input budget
+    # cannot exceed the context window selected for this training run.
+    config.critic.max_seq_len = min(config.critic.max_seq_len, config.base_moe.max_seq_len)
     config.base_moe.vocab_size = len(tokenizer)
+    config.validate()
     return config, checkpoint
 
 
@@ -284,6 +291,20 @@ def load_or_create_tokenizer(tokenizer_path=None):
 def build_datasets(args, tokenizer, seq_len, is_main):
     """Return (train_dataset, val_dataset_or_None) for the selected data source."""
     stride = args.stride or seq_len
+
+    if args.stage == 5:
+        from mantis.training.sft import SFTDataset, load_sft_records, split_records
+        records = load_sft_records(args.train_file)
+        if is_main:
+            print(f"Loaded {len(records):,} instruction records from {args.train_file}")
+        val_records = None
+        if args.val_file:
+            val_records = load_sft_records(args.val_file)
+        elif args.val_split:
+            records, val_records = split_records(records, args.val_split)
+        train = SFTDataset(records, tokenizer, seq_len)
+        val = SFTDataset(val_records, tokenizer, seq_len) if val_records else None
+        return train, val
 
     if args.hf_dataset:
         if is_main:
@@ -503,7 +524,13 @@ def train(args):
     best_val_loss = float('inf')
     epochs_without_improvement = 0
 
-    if args.resume:
+    if args.resume and args.stage == 5:
+        # Adaptation starts a fresh optimization from the Stage 1 weights
+        accelerator.unwrap_model(model).load_state_dict(preloaded_checkpoint['model_state_dict'])
+        config.inference.prompt_format = 'chat'
+        if is_main:
+            print("✓ Loaded base weights; prompts use the chat format from now on")
+    elif args.resume:
         checkpoint = preloaded_checkpoint
         accelerator.unwrap_model(model).load_state_dict(checkpoint['model_state_dict'])
         state = restore_training_state(
@@ -611,7 +638,11 @@ def train(args):
             epoch_loss += lm_loss.item()
             epoch_steps += 1
             global_step += 1
-            pbar.set_postfix({'loss': f'{lm_loss.item():.4f}', 'lr': f'{scheduler.get_last_lr()[0]:.2e}'})
+            postfix = {'loss': f'{lm_loss.item():.4f}', 'lr': f'{scheduler.get_last_lr()[0]:.2e}'}
+            if output['expert_load'].numel():
+                # Largest top-k dispatch share of any expert in any layer (1/n_experts is balanced)
+                postfix['max_load'] = f"{output['expert_load'].max().item():.2f}"
+            pbar.set_postfix(postfix)
 
             if stepped and val_loader is not None and args.eval_every and optimizer_step % args.eval_every == 0:
                 val_loss = run_validation()
@@ -667,9 +698,28 @@ def train(args):
 
 STAGE1_ONLY_FLAGS = {
     'hf_dataset': None, 'pretokenized': False, 'streaming': False, 'val_file': None,
-    'val_split': None, 'mixed_precision': False, 'deepspeed': False, 'cpu_offload': False,
+    'val_split': None, 'mixed_precision': None, 'deepspeed': False, 'cpu_offload': False,
     'use_8bit_optimizer': False, 'gradient_checkpointing': False, 'auto_batch': False,
 }
+
+
+def validate_sft_args(args):
+    """Stage 5 needs the Stage 1 model, its tokenizer and an instruction JSONL file."""
+    if not args.resume or not args.tokenizer_path:
+        return ("Stage 5 requires the Stage 1 model and tokenizer:\n"
+                "  --resume checkpoints/stage1/best_model.pt --tokenizer-path checkpoints/stage1/tokenizer")
+    if not args.train_file:
+        return "Stage 5 requires a JSONL file of {\"query\", \"response\", \"evidence\"?} records"
+    for path in (args.resume, args.tokenizer_path, args.train_file, args.val_file):
+        if path and not os.path.exists(path):
+            return f"Not found: {path}"
+    if args.hf_dataset or args.pretokenized or args.streaming:
+        return "Stage 5 reads a JSONL file: --hf-dataset, --pretokenized and --streaming do not apply"
+    if args.val_split and args.val_file:
+        return "Cannot use both --val-split and --val-file"
+    if args.val_split and not 0 < args.val_split < 1:
+        return f"--val-split must be between 0 and 1, got {args.val_split}"
+    return None
 
 
 def validate_stage1_args(args):
@@ -805,13 +855,18 @@ Examples:
   python train.py --stage 3 data/qa.jsonl --resume ckpt/best_model.pt --tokenizer-path ckpt/tokenizer \\
       --memory-checkpoint ckpt/memory_system_final.pt --semantic-store ckpt/semantic_memory \\
       --critic-checkpoint ckpt/critic_best.pt
+
+  # STAGE 5: teach the generator the runtime prompt format (roles + evidence block)
+  # JSONL lines of {"query": ..., "response": ..., "evidence": [...]}; loss on response tokens only
+  python train.py --stage 5 data/sft.jsonl --resume ckpt/best_model.pt --tokenizer-path ckpt/tokenizer \\
+      --val-split 0.1 --epochs 3 --mixed-precision bf16 --output-dir checkpoints/stage5
         """
     )
 
     # Data
     parser.add_argument('train_file', type=str, nargs='?',
                        help='Stage 1: text file (blank-line separated documents) or pre-tokenized dataset '
-                            'directory. Stages 2-4: optional JSONL file.')
+                            'directory. Stages 2-4: optional JSONL file. Stage 5: instruction JSONL file.')
     parser.add_argument('--val-file', type=str,
                        help='Validation data: text file or pre-tokenized dataset directory')
     parser.add_argument('--val-split', type=float,
@@ -854,15 +909,18 @@ Examples:
                         help='Model size: micro (3M), tiny (57M), small (454M), base (6.8B) (default: tiny)')
 
     # Training Stage
-    parser.add_argument('--stage', type=int, choices=[1, 2, 3, 4], default=1,
+    parser.add_argument('--stage', type=int, choices=[1, 2, 3, 4, 5], default=1,
                         help='1=Base MoE pre-training (default), 2=Memory fine-tuning, '
-                             '3=RL meta-controller training, 4=Critic training')
+                             '3=RL meta-controller training, 4=Critic training, '
+                             '5=Generator adaptation (instruction/evidence SFT in the chat prompt format)')
 
     # Stage 3 (RL) specific options
     parser.add_argument('--rl-episodes', type=int, default=50000,
                         help='Number of RL episodes for stage 3 (default: 50000)')
     parser.add_argument('--rl-batch-size', type=int, default=256,
                         help='Episodes collected per PPO update in stage 3 (default: 256)')
+    parser.add_argument('--rl-supervised-episodes', type=int, default=0,
+                        help='Stage 3: supervised route-search warm start episodes before PPO (default: 0)')
     parser.add_argument('--memory-checkpoint', type=str,
                         help='Stage 3: Stage 2 output (memory_system_*.pt) enabling episodic memory')
     parser.add_argument('--semantic-store', type=str,
@@ -900,7 +958,8 @@ Examples:
     parser.add_argument('--gradient-accumulation-steps', type=int, default=1,
                         help='Gradient accumulation steps. Effective batch per GPU = batch_size × accumulation_steps. '
                              'Essential for mixed VRAM GPUs (e.g., 12GB + 6GB) (default: 1)')
-    parser.add_argument('--mixed-precision', action='store_true', help='Use mixed precision (FP16)')
+    parser.add_argument('--mixed-precision', nargs='?', const='fp16', choices=['fp16', 'bf16'], default=None,
+                        help='Mixed precision: fp16 (bare flag) or bf16 (Ampere and newer)')
     parser.add_argument('--gradient-checkpointing', action='store_true',
                         help='Enable gradient checkpointing (trades compute for memory, essential for large models)')
     parser.add_argument('--use-8bit-optimizer', action='store_true',
@@ -916,13 +975,16 @@ Examples:
 
     args = parser.parse_args()
 
-    error = validate_stage1_args(args) if args.stage == 1 else validate_later_stage_args(args)
+    validators = {1: validate_stage1_args, 5: validate_sft_args}
+    error = validators.get(args.stage, validate_later_stage_args)(args)
     if error:
         print(f"Error: {error}")
         return
 
     if args.stage == 1 and args.learning_rate is None:
         args.learning_rate = 3e-4
+    if args.stage == 5 and args.learning_rate is None:
+        args.learning_rate = compat_load(args.resume)['config'].training.sft_lr
 
     if args.streaming and args.num_workers > 0:
         print(f"\n⚠️  Streaming mode detected: setting num_workers=0 (was {args.num_workers})")
@@ -933,12 +995,13 @@ Examples:
         os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, args.gpu_ids))
 
     titles = {1: "Base MoE Pre-training", 2: "Memory Fine-tuning",
-              3: "RL Training (Meta-Controller Optimization)", 4: "Critic Training"}
+              3: "RL Training (Meta-Controller Optimization)", 4: "Critic Training",
+              5: "Generator Adaptation (instruction + evidence SFT)"}
     print(f"\n{'='*80}")
     print(f"STAGE {args.stage}: {titles[args.stage]}")
     print(f"{'='*80}\n")
 
-    if args.stage == 1:
+    if args.stage in (1, 5):
         train(args)
     elif args.stage == 2:
         from mantis.training.memory_train import train_memory_stage

@@ -1,173 +1,221 @@
 """
-Memory Consolidation Process
+Memory Consolidation Lifecycle
 
-Transfers high-importance memories from episodic to semantic storage.
-Mimics human sleep consolidation.
+Moves episodic entries into semantic memory:
+
+- An entry that would overflow the episodic buffer is written to semantic
+  memory before the buffer releases it. Failed writes leave it in the buffer.
+- A periodic cycle promotes entries that retrieval has already found useful
+  (hit count >= `min_hits`) or that carry an `important` flag.
+- Stopping flushes the queue; `persist_dir` checkpoints both stores after
+  every cycle that wrote something.
 """
 
+import hashlib
+import queue
 import threading
 import time
-from typing import Dict, List, Optional
+from collections import OrderedDict
+from typing import Dict, List, Optional, Tuple
 
-import torch
-import torch.nn as nn
-
-from .episodic import EpisodicMemory, group_similar
+from ..inference.prompting import render_entry
+from .episodic import EpisodicMemory
 from .semantic import SemanticMemory
 
 
 class MemoryConsolidator:
-    """
-    Background process for consolidating episodic to semantic memory.
+    """Periodic episodic -> semantic transfer with synchronous overflow writes."""
 
-    Runs periodically to:
-    1. Identify high-importance episodic memories
-    2. Group similar memories
-    3. Store each group's representative text in semantic memory
-    4. Remove from the episodic buffer only the entries that were stored
-    """
+    RECENT_TEXTS = 10_000
 
     def __init__(
         self,
         episodic_memory: EpisodicMemory,
         semantic_memory: SemanticMemory,
-        base_model: nn.Module,
         tokenizer,
-        consolidation_interval: int = 3600,  # 1 hour
-        importance_threshold: float = 0.7,
-        similarity_threshold: float = 0.8,
-        min_consolidation_size: int = 5,
+        consolidation_interval: int = 600,
+        min_hits: int = 1,
+        queue_size: int = 256,
+        persist_dir: Optional[str] = None,
     ):
         if tokenizer is None:
-            raise ValueError("MemoryConsolidator needs the tokenizer to decode and encode facts")
+            raise ValueError("MemoryConsolidator needs the tokenizer to render entries")
         self.episodic = episodic_memory
         self.semantic = semantic_memory
-        self.model = base_model
         self.tokenizer = tokenizer
         self.interval = consolidation_interval
-        self.importance_threshold = importance_threshold
-        self.similarity_threshold = similarity_threshold
-        self.min_consolidation_size = min_consolidation_size
+        self.min_hits = min_hits
+        self.persist_dir = persist_dir
 
+        self._queue: 'queue.Queue[List[Dict]]' = queue.Queue(maxsize=queue_size)
         self._stop = threading.Event()
+        self._paused = threading.Event()
         self._run_lock = threading.Lock()
+        self._store_lock = threading.Lock()
+        self._recent: 'OrderedDict[str, None]' = OrderedDict()
+        for entry in semantic_memory.entries.values():
+            meta = entry['metadata']
+            origin = meta.get('origin', '')
+            if origin.startswith('episodic:'):
+                digest = self._entry_key(meta.get('namespace', 'default'), origin[9:])
+                self._recent[digest] = None
+                if len(self._recent) > self.RECENT_TEXTS:
+                    self._recent.popitem(last=False)
         self.thread: Optional[threading.Thread] = None
 
         self.stats = {
-            'total_consolidated': 0,
-            'last_consolidation': None,
-            'consolidations_count': 0
+            'stored': 0, 'duplicates': 0, 'failures': 0, 'overflow_stored': 0,
+            'cycles': 0, 'last_cycle': None, 'queue_pending': 0,
         }
+        episodic_memory.on_overflow = self.enqueue
+
+    # ---------------------------------------------------------------- thread
 
     def start(self):
-        """Start background consolidation thread."""
-        if self.thread is not None and self.thread.is_alive():
-            print("Consolidator already running")
+        """Start the background thread (queue drain + periodic cycles)."""
+        if self.running:
             return
         self._stop.clear()
-        self.thread = threading.Thread(target=self._consolidate_loop, daemon=True)
+        self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
-        print(f"Memory consolidation started (interval: {self.interval}s)")
 
     def stop(self):
-        """Stop background consolidation, waiting for an in-progress cycle to finish."""
+        """Stop the thread and flush everything still queued."""
         self._stop.set()
         if self.thread is not None:
             self.thread.join()
             self.thread = None
-        print("Memory consolidation stopped")
+        self.flush()
 
     @property
     def running(self) -> bool:
         return self.thread is not None and self.thread.is_alive()
 
-    def _consolidate_loop(self):
-        """Main consolidation loop; wakes immediately when stopped."""
-        while not self._stop.wait(self.interval):
+    def pause(self):
+        """Suspend periodic cycles (queued evictions are still written)."""
+        self._paused.set()
+
+    def resume(self):
+        self._paused.clear()
+
+    def _loop(self):
+        next_cycle = time.time() + self.interval
+        while not self._stop.is_set():
             try:
-                self.consolidate()
-            except Exception as e:
-                print(f"Consolidation error: {e}")
+                entries = self._queue.get(timeout=1.0)
+            except queue.Empty:
+                entries = None
+            if entries is not None:
+                self._store_evicted(entries)
+            if time.time() >= next_cycle:
+                next_cycle = time.time() + self.interval
+                if not self._paused.is_set():
+                    try:
+                        self.consolidate()
+                    except Exception as e:
+                        print(f"Consolidation error: {e}")
+
+    # ----------------------------------------------------------------- queue
+
+    def enqueue(self, entries: List[Dict]) -> None:
+        """Preserve overflow entries before the episodic buffer drops them."""
+        self._store_evicted(entries)
+
+    def flush(self) -> None:
+        """Write every queued eviction now."""
+        while True:
+            try:
+                entries = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            self._store_evicted(entries)
+
+    def _store_evicted(self, entries: List[Dict]) -> None:
+        stored, failed = self.store_entries(entries)
+        self.stats['overflow_stored'] += len(stored)
+        self.stats['queue_pending'] = self._queue.qsize()
+        if stored:
+            self.persist()
+        if failed:
+            raise RuntimeError(f"Could not preserve {len(failed)} evicted episodic entries")
+
+    # ----------------------------------------------------------------- store
+
+    @staticmethod
+    def _entry_key(namespace: str, entry_id) -> str:
+        return hashlib.sha1(f"{namespace}\0{entry_id}".encode('utf-8')).hexdigest()
+
+    def store_entries(self, entries: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+        """
+        Write each entry as its own semantic record, provenance attached.
+
+        Returns:
+            (stored, failed) entry lists. A retried write of the same episodic
+            entry counts as stored but does not make a second semantic copy.
+        """
+        stored, failed = [], []
+        with self._store_lock:
+            for entry in entries:
+                try:
+                    text = render_entry(entry, self.tokenizer)
+                    if not text:
+                        failed.append(entry)
+                        continue
+                    namespace = entry['metadata'].get('namespace', 'default')
+                    digest = self._entry_key(namespace, entry['id'])
+                    if digest in self._recent:
+                        self.stats['duplicates'] += 1
+                        stored.append(entry)
+                        continue
+                    self.semantic.add(entry['embedding'], text, {
+                        **entry['metadata'],
+                        'origin': f"episodic:{entry['id']}",
+                        'hits': entry['hits'],
+                        'consolidated_at': time.time(),
+                    })
+                    self._recent[digest] = None
+                    if len(self._recent) > self.RECENT_TEXTS:
+                        self._recent.popitem(last=False)
+                    stored.append(entry)
+                    self.stats['stored'] += 1
+                except Exception as e:
+                    failed.append(entry)
+                    self.stats['failures'] += 1
+                    print(f"Error consolidating entry {entry.get('id')}: {e}")
+        return stored, failed
 
     def consolidate(self) -> Dict:
         """
-        Run one consolidation cycle (serialized with any other cycle).
+        Promote useful entries now (serialized with any other cycle).
 
-        Returns:
-            Dict with consolidation statistics
+        Only entries whose own write succeeded leave the episodic buffer.
         """
         with self._run_lock:
-            if self.episodic.size() < self.min_consolidation_size:
-                return {'status': 'skipped', 'reason': 'insufficient_memories'}
-
-            candidates = self.episodic.get_high_importance(self.importance_threshold)
-            if not candidates:
-                return {'status': 'skipped', 'reason': 'no_important_memories'}
-
-            groups = group_similar(candidates, self.similarity_threshold)
-            stored: List[Dict] = []
-            failed = 0
-
-            for group in groups:
-                try:
-                    fact = self._summarize_group(group)
-                    if not fact:
-                        continue
-                    self.semantic.add(
-                        self._encode_fact(fact),
-                        fact,
-                        metadata={
-                            'consolidated_from': len(group),
-                            'importance': sum(e['importance'] for e in group) / len(group),
-                            'timestamp': time.time(),
-                        }
-                    )
-                    stored.extend(group)
-                except Exception as e:
-                    failed += 1
-                    print(f"Error consolidating group: {e}")
-
+            candidates = self.episodic.candidates(self.min_hits)
+            stored, failed = self.store_entries(candidates)
             self.episodic.remove(stored)
-
-            self.stats['total_consolidated'] += len(stored)
-            self.stats['last_consolidation'] = time.time()
-            self.stats['consolidations_count'] += 1
-
+            self.stats['cycles'] += 1
+            self.stats['last_cycle'] = time.time()
+            if stored:
+                self.persist()
             return {
-                'status': 'success',
+                'status': 'success' if candidates else 'skipped',
                 'candidates': len(candidates),
-                'groups': len(groups),
                 'consolidated': len(stored),
-                'failed_groups': failed,
+                'failed': len(failed),
                 'episodic_remaining': self.episodic.size(),
-                'semantic_total': self.semantic.size()
+                'semantic_total': self.semantic.size(),
             }
 
-    def _summarize_group(self, group: List[Dict]) -> str:
-        """
-        Represent a group of similar memories by its longest interaction's text.
-        """
-        longest = max(group, key=lambda e: len(e['tokens']))
-        return self.tokenizer.decode(longest['tokens']).strip()
-
-    @torch.no_grad()
-    def _encode_fact(self, fact: str) -> torch.Tensor:
-        """
-        Encode a fact exactly like the inference engine encodes queries
-        (mean-pooled base-model hidden state).
-
-        Returns:
-            (d_model,) embedding
-        """
-        token_ids = self.tokenizer.encode(fact)[-self.model.max_seq_len:]
-        device = next(self.model.parameters()).device
-        tokens = torch.tensor([token_ids], dtype=torch.long, device=device)
-        return self.model.encode(tokens).squeeze(0).cpu()
+    def persist(self) -> None:
+        """Checkpoint both stores under persist_dir (no-op without one)."""
+        if not self.persist_dir:
+            return
+        import os
+        os.makedirs(self.persist_dir, exist_ok=True)
+        self.episodic.save(os.path.join(self.persist_dir, 'episodic.pt'))
+        self.semantic.save(os.path.join(self.persist_dir, 'semantic'))
 
     def get_stats(self) -> Dict:
-        """Get consolidation statistics."""
-        return self.stats.copy()
-
-    def trigger_consolidation(self) -> Dict:
-        """Run one consolidation cycle now (waits for a background cycle in progress)."""
-        return self.consolidate()
+        return {**self.stats, 'queue_pending': self._queue.qsize(),
+                'episodic': dict(self.episodic.stats), 'semantic': dict(self.semantic.stats)}

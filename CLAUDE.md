@@ -6,12 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 MANTIS (Metacognitive Adaptive Network with Tiered Inference Strategies) is a research prototype LLM architecture exploring hallucination mitigation and long-context memory through metacognitive routing and hierarchical memory systems. The architecture consists of:
 
-- **Base MoE Model**: Sparse Mixture-of-Experts transformer (~6.8B total, ~2B active parameters)
-- **Three-tier memory**: Attention (8K) → Episodic SSM → Semantic FAISS
-- **Meta-controller**: RL-trainable routing with 5 decision gates
-- **Critic model**: Integrated hallucination detection
+- **Base MoE Model**: Sparse Mixture-of-Experts transformer with grouped-query attention (~6.7B total, ~1.9B active parameters)
+- **Three-tier memory**: Attention (8K) → Episodic SSM retrieval keys → Semantic FAISS with namespaces and trust levels
+- **Meta-controller**: RL-trainable routing with 5 decision gates (bypass, episodic, semantic, expert bias, verification)
+- **Critic model**: Verification head over the frozen backbone's hidden states, with one evidence-recovery round before abstention
 
-**Status**: Complete architecture implementation but no trained models.
+**Status**: Complete architecture implementation but no trained models. `ARCHITECTURE_REVIEW.md` records the reliability review the implementation now follows and the measurement gates before a large training run.
 
 ## Training Commands
 
@@ -50,9 +50,9 @@ python train.py --stage 1 data/train.txt \
     --val-split 0.1
 ```
 
-### Stages 2-4 (OPTIONAL)
+### Stages 2-5 (OPTIONAL)
 
-Each takes the Stage 1 model and an optional JSONL file (demo data without it). Stage 1-only flags are rejected.
+Stages 2-4 take the Stage 1 model and an optional JSONL file (demo data without it); Stage 1-only flags are rejected. Stage 5 fine-tunes the base model itself and accepts the Stage 1 flags.
 
 ```bash
 # Stage 2: memory fine-tuning. JSONL: {"query", "context"}
@@ -61,21 +61,32 @@ python train.py --stage 2 data/memory.jsonl \
     --tokenizer-path checkpoints/stage1/tokenizer \
     --epochs 5 --output-dir checkpoints/stage2
 
-# Stage 4: critic training. JSONL: {"query", "response", "facts"?, "label"}
+# Stage 4: critic training. JSONL: {"query", "response", "evidence"? (str or list), "label"}
+# Splits train/calibration/validation; fits the score temperature; reports Brier and ECE
 python train.py --stage 4 data/critic.jsonl \
     --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
     --output-dir checkpoints/critic
 
 # Stage 3: RL routing policy. JSONL: {"query", "answer"}. Each optional component enables its gate.
+# --rl-supervised-episodes runs a route-search warm start on frozen memory before PPO.
 python train.py --stage 3 data/qa.jsonl \
     --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
     --memory-checkpoint checkpoints/stage2/memory_system_final.pt \
     --semantic-store checkpoints/stage2/semantic_memory \
     --critic-checkpoint checkpoints/critic/critic_best.pt \
-    --rl-episodes 50000 --output-dir checkpoints/stage3
+    --rl-supervised-episodes 2000 --rl-episodes 50000 --output-dir checkpoints/stage3
+
+# Stage 5: generator adaptation (SFT in the engine's chat prompt format). JSONL: {"query", "response", "evidence"?}
+# --resume gives weights only; the checkpoint records prompt_format='chat'
+python train.py --stage 5 data/sft.jsonl \
+    --resume checkpoints/stage1/best_model.pt \
+    --tokenizer-path checkpoints/stage1/tokenizer \
+    --val-split 0.1 --epochs 3 --mixed-precision bf16 --output-dir checkpoints/stage5
 ```
+
+`--mixed-precision` alone means FP16; `--mixed-precision bf16` selects BF16 (train.py and train_evo.py).
 
 ## Evolution Curriculum Training
 
@@ -136,7 +147,22 @@ python inference.py checkpoints/stage1/best_model.pt \
     --quantize int8
 ```
 
-All decode loops share `mantis/inference/generation.py`: KV cache, banned tokens (pad, bos, unk, reserved), and a context window of `max_seq_len`. When the cache fills, the latest half-window is re-encoded from scratch.
+All decode loops share `mantis/inference/generation.py`: KV cache, banned tokens (pad, bos, unk, reserved), and a context window of `max_seq_len`. When the cache fills, the latest half-window is re-encoded from scratch. `generate_tokens(prefill=(past_key_values, last_logits))` continues from an existing prefill, and `hidden_out=[...]` collects the final hidden state of every processed token; the engine uses both so a query is encoded once and its memory write needs no extra pass.
+
+### Full Engine
+
+```python
+from mantis.inference.engine import MANTISInferenceEngine
+
+engine = MANTISInferenceEngine.from_checkpoints(
+    policy_checkpoint="checkpoints/stage3/meta_controller_rl.pt",  # records base/memory/store/critic paths
+    memory_dir="runtime/memory", dtype="bfloat16")
+engine.ingest(text, namespace="alice", source="user")          # chunked to the window
+result = engine.generate("...", namespace="alice")             # evidence=[...] gives oracle evidence
+with engine.frozen_memory():                                   # evaluation: no writes, no consolidation
+    ...
+engine.close()                                                 # flush consolidation, save memory_dir
+```
 
 ### Evolution Inference
 
@@ -193,7 +219,17 @@ python scripts/run_eval.py checkpoints/stage1/best_model.pt --all \
     --policy-checkpoint checkpoints/stage3/meta_controller_rl.pt
 ```
 
-Confidence is the geometric-mean probability of generated tokens. TruthfulQA counts a response as truthful when it is closer (token F1) to a true reference than to any false one. HumanEval runs generated code in a resource-limited subprocess, which is not a security sandbox.
+```bash
+# Ablation controls and the synthetic multi-session memory benchmark
+python scripts/run_eval.py checkpoints/stage1/best_model.pt --benchmarks memory \
+    --policy-checkpoint checkpoints/stage3/meta_controller_rl.pt \
+    --route-policy always --expert-bias --dtype bfloat16 --memory-mode frozen --records records.jsonl
+python scripts/run_eval.py checkpoints/stage1/best_model.pt --benchmarks memory --memory-bench-mode prompt
+```
+
+The engine's confidence is the critic score when verified, the geometric-mean token probability otherwise, and 0 after an abstention (`confidence_source` says which). Metrics: accuracy, error rate, coverage, answered error rate, confident-error rate (wrong with confidence ≥ 0.8; not a hallucination rate), ECE, Brier, AURC. TruthfulQA is a lexical proxy (`truthfulness_proxy`), MMLU reads the first standalone letter of at most 10 new tokens, HumanEval runs code in Docker without network when available (else a resource-limited subprocess that is not a security boundary). Benchmarks run under `frozen_memory()` by default; the memory benchmark (`evaluation/memory_bench.py`) is stateful within its own namespace and has a `prompt` mode that prepends all facts as a recent-text-buffer baseline. Reports carry p50/p95 latency, mean `compute_units`, peak GPU memory, artifact versions and optional per-example records.
+
+Tests: `python -m pytest tests -q` (deterministic diagnostics; episodic/semantic tests skip without mamba-ssm/faiss).
 
 ## Architecture Overview
 
@@ -207,18 +243,21 @@ mantis/
 │   ├── critic.py        # Hallucination detection model
 │   └── ssm.py           # State-space model for episodic memory
 ├── memory/              # Memory systems
-│   ├── episodic.py      # SSM-based short-term memory (8K tokens)
-│   ├── semantic.py      # FAISS-based long-term memory (1M+ entries)
-│   └── consolidation.py # Memory transfer logic
+│   ├── episodic.py      # SSM-keyed recent interactions with provenance and hit counts
+│   ├── semantic.py      # FAISS-based long-term memory (namespaces, trust, tombstones, fingerprint)
+│   └── consolidation.py # Lifecycle: overflow queue, periodic promotion, persistence
 ├── training/            # Training pipelines
 │   ├── common.py        # Accelerator, optimizer, LR schedule shared by train.py/train_evo.py
 │   ├── pretrain.py      # Standalone single-GPU Stage 1 trainer (train.py is the main path)
 │   ├── memory_train.py  # Stage 2: Memory fine-tuning
-│   ├── rl_train.py      # Stage 3: RL meta-controller training
-│   └── critic_train.py  # Stage 4: Critic training
+│   ├── rl_train.py      # Stage 3: RL meta-controller training (+ supervised route search)
+│   ├── critic_train.py  # Stage 4: Critic training with calibration split
+│   ├── sft.py           # Stage 5: instruction / evidence dataset in the engine's prompt format
+│   └── scoring.py       # Lexical answer correctness shared by rewards and evaluation
 ├── inference/           # Generation engine
-│   ├── generation.py    # Shared decode loop (cache, window, sampling)
-│   └── engine.py        # Dynamic routing and generation
+│   ├── generation.py    # Shared decode loop (cache, window, sampling, prefill reuse)
+│   ├── prompting.py     # Query formats, evidence block with source ids, budgeted selection
+│   └── engine.py        # Dynamic routing, retrieval, verification, memory writes
 ├── simulation/          # Ecological simulator for evolution training data (see its CLAUDE.md)
 ├── configs/             # Configuration management
 │   └── model_config.py  # Presets: micro/tiny/small/base
@@ -227,8 +266,10 @@ mantis/
 └── tokenizer.py         # MANTISTokenizer (trie-based, 512 tokens, byte fallback)
 
 evaluation/              # Evaluation harness
-├── benchmarks.py        # MMLU, TruthfulQA, HumanEval, GSM8K
-└── metrics.py           # Accuracy, F1, hallucination rate
+├── benchmarks.py        # MMLU, TruthfulQA (proxy), HumanEval (docker sandbox), GSM8K
+├── memory_bench.py      # Synthetic multi-session memory benchmark (memory vs prompt baseline)
+└── metrics.py           # Accuracy, error/coverage, confident-error rate, ECE, Brier, AURC
+tests/                   # Deterministic diagnostics (pytest)
 
 train_evo.py             # Evolution curriculum training (weighted loss, partition mixing)
 inference_evo.py         # Evolution tick-by-tick inference (importable for web apps)
@@ -249,61 +290,64 @@ web/                     # Simulation playground: Flask + Socket.IO server, Reac
 
 Sparse MoE transformer with:
 - 8 experts, top-2 routing (dense feedforward when `n_experts == 1`, e.g. micro)
-- Load balancing loss, weighted by `load_balance_weight`
-- Scales from 3M (micro, dense) to 6.8B parameters (base)
+- Load balancing loss (top-1 assignments), weighted by `load_balance_weight`; the output's `expert_load` (n_moe_layers, n_experts) reports top-k dispatch fractions, the work actually sent to each expert
+- Grouped-query attention: `n_kv_heads` KV heads shared by `n_heads` query heads; the cache is `(batch, n_kv_heads, seq, d_head)`
+- Scales from 3M (micro, dense) to 6.7B parameters (base)
 - Pre-norm transformer backbone with rotary positional embeddings and `scaled_dot_product_attention`
 - `max_seq_len` is the attention window; new models set it to the training `--seq-len`
+- `return_hidden=True` returns only the final normalized hidden states (`last_hidden`)
+- The per-expert Python loop is reference code; profile before replacing it with grouped GEMMs
 
 **Important**: The model uses `top_k=2` sparse routing by default. When modifying expert selection, ensure load balancing loss is maintained to prevent expert collapse.
 
-**Meta-controller integration**: When `expert_weights` are provided by the meta-controller, they are applied as additive bias to the learned gate logits (not as replacement routing). This allows the meta-controller to influence expert selection while preserving learned routing patterns.
+**Meta-controller integration**: `expert_weights` is `(batch, n_layers, n_experts)`, one bounded bias vector per layer, added to that layer's gate logits. The controller produces `expert_bias_scale * tanh(raw)` from a zero-initialized head, and the engine applies it only when `InferenceConfig.expert_bias` is on (off by default). Whether learned routing survives depends on the bias magnitude, so treat it as an ablation.
 
 #### MetaController (`mantis/models/meta_controller.py`)
 
 RL-trainable routing controller with 5 gates:
-1. **Early exit**: Skip processing for simple queries
+1. **Bypass**: Skip the optional components (memory reads, expert bias, verification) and decode from the query's cached prefill. The backbone still runs at full depth
 2. **Episodic memory**: Access recent context (8K tokens)
 3. **Semantic memory**: Retrieve long-term facts (1M+ entries)
-4. **Expert selection**: Additive bias to MoE routing (raw logits, not probabilities)
+4. **Expert bias**: Bounded per-layer additive bias to MoE routing, off by default
 5. **Verification**: Trigger critic model
 
-A residual MLP over the pooled query embedding and a state summary. Trained with PPO in Stage 3 as a stochastic policy: gates 1-3 and 5 are Bernoulli, and gate 4 is a Gaussian around its raw logits. Deterministic inference thresholds gate probabilities (`InferenceConfig.routing_threshold`) and uses the Gaussian mean as the routing bias. A gate whose component is missing stays 0 and adds nothing to the policy log-probability.
+A residual MLP over the pooled query embedding and a state summary (query next-token entropy and top-1 probability, context fill, memory fill; these measure query predictability, not answer correctness). Trained with PPO in Stage 3 as a stochastic policy: gates 1-3 and 5 are Bernoulli, and gate 4 is a Gaussian over the raw bias before `tanh`. Deterministic inference thresholds gate probabilities (`InferenceConfig.routing_threshold`) and uses the Gaussian mean. `log_prob` takes a 5-entry action mask: gates whose component is missing, gates the bypass path ignored, and an unused expert bias add nothing. `InferenceConfig.route_policy` (`learned | always | never | bypass`) and `generate(force_gates=...)` replace the policy for ablations and route search.
 
 #### Memory Systems
 
 **Episodic Memory** (`mantis/memory/episodic.py`):
-- Mamba SSM using mamba-ssm library (CUDA-optimized)
-- 8K token window
-- L2 cache in memory hierarchy
-- The engine stores every query and response; retrieval returns token IDs, which the engine decodes into context
-- Entries have unique IDs; thread-safe operations with locking and snapshots
+- Mamba SSM (mamba-ssm library, CUDA-optimized) encodes each interaction independently into a 256-d retrieval key; it is learned retrieval, not a recurrent state carried across turns
+- Entries hold role-labelled token segments (`query`/`response` or `document`), the key, a pooled `d_model` embedding for reranking, a hit count and metadata (`namespace`, `source`, `trust`, `verified`, `timestamp`); full hidden states are not kept
+- `add(hidden, segments, metadata)` takes the hidden states the engine already computed during decoding; at capacity the oldest entry goes to `on_overflow` (the consolidator) before it is dropped
+- `retrieve(query_hidden, top_k, namespace, exclude_ids)` returns entry dicts with a `score` and increments hits; `candidates(min_hits)` feeds consolidation; `save`/`load` persist the buffer
+- The engine stores every answered interaction with provenance and never stores an abstention; input beyond the window is ingested as document chunks (`engine.ingest`)
 
 **Semantic Memory** (`mantis/memory/semantic.py`):
-- FAISS vector database with stable IDs; eviction tombstones IDs and the index rebuilds when >20% are stale
-- IVF serves exact search until 10K entries, then trains with a cluster count sized to the data
+- FAISS vector database with stable IDs; eviction and `delete()` tombstone IDs, searches over-fetch by a bounded amount, and the index rebuilds off-thread with an atomic swap when >20% are stale
+- IVF serves exact search until 10K entries, then trains IVF-PQ with a cluster count sized to the data; retrieval is approximate from then on and `recall_at_k()` measures it against exact search
+- Metadata: `namespace` (per caller; Stage 2 facts live in `global`), `source` → `trust` (user/external/stage2 = 2, verified model = 1, unverified = 0), `superseded_by` (via `supersede()`; superseded entries stay as records but are not retrieved). `retrieve_with_metadata(namespaces=, min_trust=, exclude_ids=)` filters; the engine's `min_evidence_trust` (default 1) keeps unverified generated claims out of the facts prompt
+- `embedding_fingerprint` (tokenizer + full-backbone hash from `model_fingerprint()`) is saved with the store and checked by `from_checkpoints`; new Stage 2, 3, and 4 checkpoints are checked against the same backbone identity
 - Optional projection (trained in Stage 2) applied before L2-normalized indexing
-- 1M+ entries capacity
-- L3 cache in memory hierarchy
-- **WARNING**: Stores embeddings in RAM (12GB+ for 1M entries). Limit to ~100K entries on 16GB RAM systems.
+- **WARNING**: Keeps full FP32 vectors in RAM (8.2GB for 1M entries at d_model 2048, before text and index). Limit to ~100K entries on 16GB RAM systems.
 
 **Consolidation** (`mantis/memory/consolidation.py`):
-- Background transfer from episodic → semantic
-- Uses importance scoring and similarity grouping; stores each group's decoded text
-- Encodes facts using base model embeddings, like queries
-- Removes only entries whose semantic write succeeded
+- `from_checkpoints` builds and starts it when both memories exist; `engine.close()` stops it, flushes the queue and saves `memory_dir`
+- Every evicted episodic entry is written to semantic memory as its own record (text, stored pooled embedding, provenance, `origin: episodic:<id>`) through a bounded queue; a full queue writes synchronously. Nothing is summarized away
+- The periodic cycle (`consolidation_interval`) promotes entries with `hits >= consolidation_min_hits` or `metadata['important']`, and removes from the buffer only those whose write succeeded
+- `pause()`/`resume()` back `engine.frozen_memory()`; `get_stats()` reports stored, duplicates, failures, queue lag
 
 #### Critic Model (`mantis/models/critic.py`)
 
-~155M-parameter verification model (12-layer encoder) for hallucination detection via consistency checking. Trained in Stage 4. Used when meta-controller triggers verification gate; inputs are truncated to its `max_seq_len` budget.
+Small encoder (6 layers; ~80M parameters at `base`) over the frozen base model's final hidden states of `[evidence; query; response]` (evidence first so the causal backbone lets response tokens see it). `build_input` gives the response 50%, the evidence 35% and the query 15% of `max_seq_len`, then redistributes leftover capacity in that order. One correctness head; `temperature` (a buffer fitted in Stage 4 on a calibration split) scales the logit. `verify(base_model, query_ids, response_ids, evidence_ids)` returns the calibrated probability. The engine passes the same evidence lines the generator saw, retries retrieval once with the draft when the score is below `verification_confidence_threshold` (`verification_retries`), and abstains if it still fails.
 
 ### Model Configuration
 
 Model sizes are defined in `mantis/configs/model_config.py`:
 
-- **micro**: ~3M parameters (dense, not MoE) - ultra-fast testing
-- **tiny**: ~57M parameters, ~32M active (4 experts) - development/debugging
-- **small**: ~454M parameters, ~252M active (4 experts) - experimentation
-- **base**: ~6.8B parameters, ~2B active (8 experts) - production target
+- **micro**: ~3M parameters (dense, not MoE), controller 0.6M, critic 2.2M - ultra-fast testing
+- **tiny**: ~55M parameters, ~30M active (4 experts, 8/4 heads), controller 2.4M, critic 14M - development/debugging
+- **small**: ~435M parameters, ~234M active (4 experts, 32/8 heads), controller 18M, critic 45M - experimentation
+- **base**: ~6.7B parameters, ~1.9B active (8 experts, 32/8 heads), controller 106M, critic 80M - production target
 
 `get_large_config()` (~71B, 16 experts) and `get_extmem_config()` (32K windows) exist too, but `--model-size` does not offer them.
 
@@ -314,9 +358,11 @@ Model sizes are defined in `mantis/configs/model_config.py`:
 - `MetaControllerConfig.n_experts` must match `BaseMoEConfig.n_experts`
 - `SemanticMemoryConfig.dimension` must match `BaseMoEConfig.d_model`
 - `EpisodicMemoryConfig.d_model` must match `BaseMoEConfig.d_model`
-- `d_model / n_heads` must be an even integer (RoPE)
+- `d_model / n_heads` must be an even integer (RoPE); `n_kv_heads` must divide `n_heads`
+- `CriticConfig.max_seq_len` cannot exceed `BaseMoEConfig.max_seq_len` (the critic reads base hidden states)
+- `InferenceConfig.route_policy` and `prompt_format` must be known values
 
-Add new model sizes through `_sized_config()`, which aligns these fields. Mismatches raise `ValueError`.
+Add new model sizes through `_sized_config()`, which aligns these fields and sizes the controller and critic. Mismatches raise `ValueError`. `InferenceConfig` holds the engine knobs: `bypass_uncertainty_threshold`, `verification_confidence_threshold`, `verification_retries`, `expert_bias`, `route_policy`, `prompt_format`, `episodic_top_k`/`semantic_top_k`, `min_evidence_trust`, `remember`. `TrainingConfig` holds the Stage 3 reward weights plus `latency_budget_s`, `abstain_reward`, `correctness_f1_threshold`, and `sft_lr` for Stage 5.
 
 ### Training Pipeline
 
@@ -337,12 +383,17 @@ MANTIS uses a staged training pipeline:
    - Requires Stage 1 checkpoint (config and tokenizer)
 
 4. **Stage 3 (OPTIONAL)**: RL training
-   - Trains meta-controller routing policy and state encoder with PPO
-   - Optimizes accuracy/latency/compute trade-offs
+   - Trains meta-controller routing policy and state encoder with PPO; optional supervised route-search warm start on frozen memory
+   - Reward: lexical correctness (`mantis/training/scoring.py`; abstentions get `abstain_reward`), latency over `latency_budget_s`, measured `compute_units` beyond a query-only answer, calibration of the final confidence
+   - Training episodes write to memory (sequential, stateful); validation runs under `frozen_memory()` and reports accuracy, coverage, answered error rate, p95 latency, mean compute
    - Requires Stage 1 checkpoint; Stage 2 and Stage 4 outputs enable their gates
    - Saves `meta_controller_rl.pt`, which records component paths; `MANTISInferenceEngine.from_checkpoints(policy_checkpoint=...)` rebuilds the full engine
 
-Stages 2 and 4 depend only on Stage 1. Training is implemented in `mantis/training/` with separate modules per stage.
+5. **Stage 5 (OPTIONAL)**: Generator adaptation
+   - Fine-tunes the base model on {"query", "response", "evidence"?} JSONL in the engine's chat format (`mantis/training/sft.py`, built with `mantis/inference/prompting.py`); loss on response tokens only
+   - Runs through the Stage 1 `train()` loop; `--resume` supplies weights only; the checkpoint records `prompt_format='chat'`
+
+Stages 2, 4 and 5 depend only on Stage 1. Training is implemented in `mantis/training/` with separate modules per stage.
 
 ## Development Guidelines
 
@@ -394,28 +445,29 @@ Cannot combine both. HuggingFace datasets use `--hf-val-split` instead.
 
 ### Inference Engine
 
-Full MANTIS inference needs the base model and meta-controller; episodic memory, semantic memory and the critic are optional, and each enables its gate. `MANTISInferenceEngine.from_checkpoints()` builds the engine from saved artifacts; routing thresholds come from `InferenceConfig`. `generate()` returns only the completion.
+Full MANTIS inference needs the base model and meta-controller; episodic memory, semantic memory and the critic are optional, and each enables its gate. `MANTISInferenceEngine.from_checkpoints(..., dtype=, memory_dir=)` builds the engine from saved artifacts, checks the semantic store's embedding fingerprint, and starts the consolidator when both memories exist; call `close()` to flush it. `generate()` returns only the completion plus metadata: `path` (`bypass`/`full`), `confidence` and `confidence_source` (`critic`/`token_likelihood`/`abstained`), `critic_score`, `abstained`, `verification_rounds`, `evidence` (source ids and scores), `timings` per component, `cost` (token counts) and `compute_units` (token × parameter products over backbone, critic and SSM).
 
 For basic generation (Stage 1 only), use `inference.py` which provides simplified inference without memory systems.
 
 Production inference engine is in `mantis/inference/engine.py` and coordinates:
-1. Query encoding
-2. Uncertainty estimation
-3. Meta-controller routing
-4. Memory retrieval (episodic/semantic)
-5. Generation with expert routing
-6. Optional critic verification
+1. Query encoding, once (cache and hidden states are reused); input beyond the window is ingested into memory first
+2. Query predictability features and meta-controller routing (or a fixed `route_policy`)
+3. Bypass: decode from the cached prefill, nothing else
+4. Full path: retrieve candidates from the open tiers in the caller's namespace (+ `global`), rerank (tier score + word F1), fit them into the evidence budget with a share per tier, prepend them with source ids (`mantis/inference/prompting.py`); reuse the prefill when there is no evidence and no expert bias
+5. Optional critic verification with the same evidence; on rejection, one more retrieval round conditioned on query + draft, then abstention
+6. Episodic write of the answered interaction with provenance, from the hidden states decoding already produced (never abstentions; disabled under `frozen_memory()`)
 
 ### KV Caching
 
 KV caching is implemented in `BaseMoEModel` for efficient inference. When adding new attention mechanisms, ensure:
-- Cache shape: `(batch, n_heads, seq_len, d_head)`, keys stored after RoPE
+- Cache shape: `(batch, n_kv_heads, seq_len, d_head)`, keys stored after RoPE (the `base` preset's 8K cache is 0.375 GiB in 16-bit precision)
 - Cache is optional (training doesn't use it)
 - Cache grows incrementally during generation; `generation.py` re-encodes the latest half-window when it would exceed `max_seq_len`
+- A prefill can only be reused when the prompt tokens and `expert_weights` are unchanged; prepending evidence or changing the bias alters every hidden state
 
 ### Known Issues
 
-1. **Semantic Memory Scaling**: RAM-based storage limits to ~100K entries on 16GB systems. Disk-backed storage planned.
+1. **Semantic Memory Scaling**: RAM-based storage (full FP32 vectors plus the index) limits to ~100K entries on 16GB systems. Disk-backed storage planned. Each IVF rebuild retrains the codebooks over all live vectors.
 
 2. **TextDataset Memory**: Not true streaming, loads all tokens into RAM. Use `--pretokenized` or `--streaming` for large datasets.
 
@@ -423,11 +475,16 @@ KV caching is implemented in `BaseMoEModel` for efficient inference. When adding
 
 4. **mamba-ssm Dependency**: Requires CUDA-capable GPU for compilation and runtime. CPU-only systems cannot use episodic memory. Package imports are lazy, so Stage 1, the tokenizer and basic inference need neither mamba-ssm nor faiss (`pip install -e .[memory]` adds them).
 
+5. **Lexical Scoring**: The Stage 3 reward and the TruthfulQA runner compare text lexically (`scoring.answer_correct`: normalized phrase match without negation words, or word F1 ≥ 0.5). They reject negated answers but misjudge paraphrases and verbose correct answers.
+
+6. **Tokenizer**: The 512-token vocabulary makes natural-language sequences several times longer than a subword vocabulary would, so per-token costs and context coverage are not comparable with subword models. A general-language tokenizer is future work.
+
 ## Important Notes
 
-- **No trained weights**: This is a research prototype with architecture only. Full training of the `base` preset on 2-5T tokens needs roughly 50K-130K A100 GPU-hours.
-- **Validation required**: Design claims (reduced hallucinations, extended context) are unvalidated and require large-scale training + evaluation.
-- **True attention limited to 8K**: Not 1M despite claims. Memory systems extend context, but base attention is 8K max.
+- **No trained weights**: This is a research prototype with architecture only. Full training of the `base` preset on 2-5T tokens needs roughly 50K-125K A100 GPU-hours by a parameter-dominated estimate (6 × 1.9B active × tokens at 125 TFLOPS sustained), before attention overhead, auxiliary training, evaluation and failed runs.
+- **Validation required**: Design claims (reduced hallucinations, extended context, lower cost) are unvalidated. The review's gates: beat ordinary retrieval on the memory benchmark, lower measured cost at comparable quality, lower answered-error rate at matched coverage; run the ablation ladder (`run_eval.py --route-policy`, `--expert-bias`, `--memory-bench-mode prompt`) before scaling.
+- **True attention limited to the preset window (8K)**: Memory systems extend what the generator can see only as far as retrieval recall and the evidence budget allow; a 1M-entry store is datastore capacity, not context.
+- **Bypass is not depth reduction**: Gate 1 skips memory reads, expert bias and verification; the backbone always runs at full depth.
 - Always use `--tokenizer-path` when resuming training to ensure vocabulary consistency.
 - When using `--resume`, the model config is loaded from checkpoint, not CLI args (except vocab_size which syncs with tokenizer).
 - Gradient accumulation steps should divide evenly into steps_per_epoch to prevent stale gradients leaking across epochs.

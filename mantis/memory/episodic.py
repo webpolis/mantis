@@ -1,27 +1,37 @@
 """
 Episodic Memory System
 
-SSM-based compression of recent interactions into continuous state vectors.
+Recent interactions, each encoded by the SSM into a compact retrieval key.
 """
 
 import threading
 import time
+from collections import deque
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
-from typing import Dict, Iterable, List, Optional
-from collections import deque
+
 from ..models.ssm import EpisodicMemorySSM
+from .provenance import trust_level
+
+Segments = Sequence[Tuple[str, torch.Tensor]]
 
 
 class EpisodicMemory:
     """
-    Manages recent interaction history using SSM compression.
+    Bounded buffer of recent interactions.
 
-    Each entry stores its token IDs, the base-model hidden states it was built
-    from, the compressed SSM state and an importance score. Entries carry a
-    unique, monotonically increasing `id`. All reads and writes of the buffer
-    hold a lock; readers work on snapshots.
+    Each entry keeps its token IDs (as role-labelled segments), a compact SSM
+    state used as the retrieval key, the pooled base-model embedding used for
+    reranking against semantic evidence, a retrieval hit count, provenance
+    metadata (namespace, source, trust, timestamp) and a unique id. Full
+    hidden-state tensors are not retained.
+
+    The buffer holds at most `max_entries`. Adding beyond that evicts the
+    oldest entry, which is handed to `on_overflow` first, so the consolidator
+    can write it to semantic memory before it disappears. All reads and
+    writes hold a lock; readers work on snapshots.
     """
 
     def __init__(
@@ -35,51 +45,66 @@ class EpisodicMemory:
         self.device = device
         self.max_entries = max_entries
         self.context_window = context_window
+        self.on_overflow: Optional[Callable[[List[Dict]], None]] = None
+        self._add_lock = threading.Lock()
         self._lock = threading.Lock()
         self._next_id = 0
-        self.entries: deque = deque(maxlen=max_entries)
+        self.entries: deque = deque()
+        self.stats = {'writes': 0, 'evictions': 0}
 
     @torch.no_grad()
-    def _encode(self, embeddings: torch.Tensor) -> torch.Tensor:
+    def _encode(self, hidden: torch.Tensor) -> torch.Tensor:
         """(seq_len, d_model) or (d_model,) -> (d_state,) SSM state."""
-        if embeddings.dim() == 1:
-            embeddings = embeddings.unsqueeze(0)
-        return self.ssm.encode_sequence(embeddings.unsqueeze(0).to(self.device)).squeeze(0).cpu()
+        if hidden.dim() == 1:
+            hidden = hidden.unsqueeze(0)
+        return self.ssm.encode_sequence(hidden.unsqueeze(0).to(self.device).float()).squeeze(0).cpu()
 
     def add(
         self,
-        tokens: torch.Tensor,
-        embeddings: torch.Tensor,
-        metadata: Optional[Dict] = None
+        hidden: torch.Tensor,
+        segments: Segments,
+        metadata: Optional[Dict] = None,
     ) -> int:
         """
-        Add a new interaction to episodic memory.
+        Add an interaction.
 
         Args:
-            tokens: (seq_len,) token ids
-            embeddings: (seq_len, d_model) base-model hidden states for `tokens`
-            metadata: Optional metadata (user_id, source, ...)
+            hidden: (seq_len, d_model) base-model final hidden states of the
+                concatenated segment tokens (the last `context_window` are used)
+            segments: (role, token_ids) pairs, e.g. [('query', ...), ('response', ...)]
+            metadata: provenance: namespace, source, trust, verified, ...
 
         Returns:
             The entry id
         """
-        tokens = tokens[-self.context_window:].cpu()
-        embeddings = embeddings[-self.context_window:].detach().cpu()
-        state = self._encode(embeddings)
-
+        hidden = hidden[-self.context_window:].detach().float().cpu()
+        tokens = torch.cat([torch.as_tensor(ids).long().cpu() for _, ids in segments])
+        metadata = {'namespace': 'default', 'source': 'interaction', 'timestamp': time.time(), **(metadata or {})}
+        metadata['trust'] = trust_level(metadata)
         entry = {
-            'tokens': tokens,
-            'embeddings': embeddings,
-            'state': state,
-            # Mean hidden-state norm as an importance proxy
-            'importance': embeddings.norm(dim=-1).mean().item(),
-            'metadata': metadata or {},
+            'segments': [(role, torch.as_tensor(ids).long().cpu()) for role, ids in segments],
+            'tokens': tokens[-self.context_window:],
+            'state': self._encode(hidden),
+            'embedding': hidden.mean(dim=0),
+            'hits': 0,
+            'metadata': metadata,
             'created': time.time(),
         }
-        with self._lock:
-            entry['id'] = self._next_id
-            self._next_id += 1
-            self.entries.append(entry)
+        with self._add_lock:
+            with self._lock:
+                evicted = list(self.entries)[:max(0, len(self.entries) + 1 - self.max_entries)]
+            # Preserve the old entries before removing their only copy. The
+            # hook writes outside the buffer lock so persistence can snapshot it.
+            if evicted and self.on_overflow is not None:
+                self.on_overflow(evicted)
+            with self._lock:
+                entry['id'] = self._next_id
+                self._next_id += 1
+                for _ in evicted:
+                    self.entries.popleft()
+                self.entries.append(entry)
+                self.stats['writes'] += 1
+                self.stats['evictions'] += len(evicted)
         return entry['id']
 
     def snapshot(self) -> List[Dict]:
@@ -89,52 +114,50 @@ class EpisodicMemory:
 
     def retrieve(
         self,
-        query_embedding: torch.Tensor,
+        query_hidden: torch.Tensor,
         top_k: int = 3,
-    ) -> List[torch.Tensor]:
+        namespace: Optional[str] = None,
+        exclude_ids: Iterable[int] = (),
+    ) -> List[Dict]:
         """
-        Retrieve the token IDs of the most similar stored interactions.
+        Most similar stored interactions (by SSM-state cosine), most similar first.
 
         Args:
-            query_embedding: (d_model,) pooled query or (seq_len, d_model) hidden states
-            top_k: Number of memories to retrieve
+            query_hidden: (seq_len, d_model) query hidden states or a (d_model,) pooled vector
+            top_k: Number of entries to return
+            namespace: Only entries of this namespace (None = all)
+            exclude_ids: Entry ids to skip (e.g. evidence already used)
 
         Returns:
-            List of (seq_len,) token tensors, most similar first
+            Entry dicts (snapshots) with an extra 'score'; each hit increments the entry's hit count
         """
-        entries = self.snapshot()
+        excluded = set(exclude_ids)
+        entries = [e for e in self.snapshot()
+                   if e['id'] not in excluded and (namespace is None or e['metadata'].get('namespace') == namespace)]
         if not entries:
             return []
 
-        query_state = self._encode(query_embedding.detach())
+        query_state = self._encode(query_hidden.detach())
         states = torch.stack([e['state'] for e in entries])
         scores = F.cosine_similarity(states, query_state.unsqueeze(0), dim=-1)
         top = torch.topk(scores, min(top_k, len(entries))).indices.tolist()
-        return [entries[i]['tokens'] for i in top]
+        hits = []
+        with self._lock:
+            for i in top:
+                entries[i]['hits'] += 1
+                hits.append({**entries[i], 'score': float(scores[i])})
+        return hits
 
-    def get_high_importance(self, threshold: float = 0.7) -> List[Dict]:
-        """
-        Get high-importance memories for consolidation.
-
-        Args:
-            threshold: Importance threshold (0-1) after min-max normalization
-
-        Returns:
-            List of high-importance entries (snapshot)
-        """
-        entries = self.snapshot()
-        if not entries:
-            return []
-
-        scores = torch.tensor([e['importance'] for e in entries])
-        scores = (scores - scores.min()) / (scores.max() - scores.min() + 1e-8)
-        return [e for e, s in zip(entries, scores.tolist()) if s >= threshold]
+    def candidates(self, min_hits: int = 1) -> List[Dict]:
+        """Entries retrieved at least `min_hits` times, or marked important: consolidation candidates."""
+        return [e for e in self.snapshot() if e['hits'] >= min_hits or e['metadata'].get('important')]
 
     def remove(self, entries_to_remove: Iterable[Dict]) -> None:
         """Remove entries (matched by id) from the buffer."""
         ids = {e['id'] for e in entries_to_remove}
-        with self._lock:
-            self.entries = deque((e for e in self.entries if e['id'] not in ids), maxlen=self.max_entries)
+        with self._add_lock:
+            with self._lock:
+                self.entries = deque(e for e in self.entries if e['id'] not in ids)
 
     def size(self) -> int:
         """Return number of stored memories."""
@@ -143,55 +166,23 @@ class EpisodicMemory:
 
     def clear(self) -> None:
         """Clear all memories."""
+        with self._add_lock:
+            with self._lock:
+                self.entries.clear()
+
+    # ------------------------------------------------------------ persistence
+
+    def save(self, path: str) -> None:
+        """Save the buffer (entries and id counter) to a torch file."""
         with self._lock:
-            self.entries.clear()
+            torch.save({'entries': list(self.entries), 'next_id': self._next_id, 'stats': dict(self.stats)}, path)
 
-    def get_state_summary(self) -> torch.Tensor:
-        """
-        Get summary of episodic memory state.
-
-        Returns:
-            (d_state,) aggregated state vector, weighted toward recent entries
-        """
-        entries = self.snapshot()
-        if not entries:
-            return torch.zeros(self.ssm.d_state)
-
-        states = torch.stack([e['state'] for e in entries])
-        weights = torch.exp(-0.1 * torch.arange(len(states), 0, -1))
-        weights = weights / weights.sum()
-        return (states * weights.unsqueeze(-1)).sum(dim=0)
-
-
-def group_similar(entries: List[Dict], threshold: float = 0.8) -> List[List[Dict]]:
-    """
-    Group similar memory entries for consolidation.
-
-    Args:
-        entries: List of memory entries
-        threshold: Similarity threshold for grouping
-
-    Returns:
-        List of groups (each group is a list of similar entries)
-    """
-    if not entries:
-        return []
-
-    states = torch.stack([e['state'] for e in entries])
-    similarities = F.cosine_similarity(states.unsqueeze(1), states.unsqueeze(0), dim=-1)
-
-    # Greedy clustering
-    used = set()
-    groups = []
-    for i in range(len(entries)):
-        if i in used:
-            continue
-        group = [entries[i]]
-        used.add(i)
-        for j in range(i + 1, len(entries)):
-            if j not in used and similarities[i, j] >= threshold:
-                group.append(entries[j])
-                used.add(j)
-        groups.append(group)
-
-    return groups
+    def load(self, path: str) -> int:
+        """Restore a buffer saved with save(); returns the number of entries."""
+        data = torch.load(path, map_location='cpu', weights_only=False)
+        with self._add_lock:
+            with self._lock:
+                self.entries = deque(data['entries'])
+                self._next_id = max(data['next_id'], self._next_id)
+                self.stats.update(data.get('stats', {}))
+                return len(self.entries)

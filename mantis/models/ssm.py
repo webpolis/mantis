@@ -6,7 +6,6 @@ Uses mamba-ssm for efficient selective state space computation.
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Optional, Tuple
 
 from mamba_ssm import Mamba

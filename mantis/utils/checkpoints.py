@@ -6,6 +6,7 @@ optimizer/scheduler/AMP-scaler state, RNG state and the exact training position
 (completed epochs plus micro-batches consumed in the current epoch).
 """
 
+import hashlib
 import os
 import pickle
 import random
@@ -71,9 +72,29 @@ def load_tokenizer(checkpoint_path: str, checkpoint: Dict, tokenizer_path: Optio
     return tokenizer
 
 
-def load_base_model(checkpoint_path: str, device: str = 'cpu', tokenizer_path: Optional[str] = None):
+def model_fingerprint(model, tokenizer) -> str:
+    """
+    Identity of the tokenizer and all backbone weights that produce memory
+    embeddings. Hash one tensor at a time to avoid duplicating the model in RAM.
+    """
+    digest = hashlib.sha256(tokenizer.fingerprint().encode())
+    for name, tensor in model.state_dict().items():
+        digest.update(name.encode())
+        digest.update(str(tuple(tensor.shape)).encode())
+        digest.update(tensor.detach().float().cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()[:16]
+
+
+DTYPES = {'float32': torch.float32, 'float16': torch.float16, 'bfloat16': torch.bfloat16}
+
+
+def load_base_model(checkpoint_path: str, device: str = 'cpu', tokenizer_path: Optional[str] = None,
+                    dtype: Optional[str] = None):
     """
     Load a Stage 1 base model in eval mode.
+
+    Args:
+        dtype: Serving dtype ('float32', 'float16', 'bfloat16'); None keeps the saved float32
 
     Returns:
         (model, tokenizer, checkpoint_dict)
@@ -93,6 +114,12 @@ def load_base_model(checkpoint_path: str, device: str = 'cpu', tokenizer_path: O
 
     model = BaseMoEModel.from_config(config.base_moe)
     model.load_state_dict(checkpoint['model_state_dict'])
+    if dtype:
+        if dtype != 'float32':
+            # Preserve the checkpoint's identity before serving precision
+            # rounds its weights differently from the Stage 2 index builder.
+            model._source_fingerprint = model_fingerprint(model, tokenizer)
+        model.to(DTYPES[dtype])
     model.to(device).eval()
     return model, tokenizer, checkpoint
 

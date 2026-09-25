@@ -471,11 +471,14 @@ def train(args):
             global_step += 1
             train_dataset.progress = (epoch * steps_per_epoch + epoch_steps) / total_micro_steps
 
-            pbar.set_postfix({
+            postfix = {
                 'w_loss': f'{w_loss.item():.4f}',
                 'raw': f'{raw_loss.item():.4f}',
                 'prog': f'{train_dataset.progress:.0%}',
-            })
+            }
+            if output['expert_load'].numel():
+                postfix['max_load'] = f"{output['expert_load'].max().item():.2f}"
+            pbar.set_postfix(postfix)
 
         completed_epochs = epoch + 1
         avg_loss = epoch_loss / epoch_steps if epoch_steps > 0 else 0
@@ -592,7 +595,8 @@ def main():
     # Performance
     parser.add_argument('--gradient-accumulation-steps', type=int, default=1,
                         help='Gradient accumulation steps (default: 1)')
-    parser.add_argument('--mixed-precision', action='store_true', help='Use FP16 mixed precision')
+    parser.add_argument('--mixed-precision', nargs='?', const='fp16', choices=['fp16', 'bf16'], default=None,
+                        help='Mixed precision: fp16 (bare flag) or bf16 (Ampere and newer)')
     parser.add_argument('--gradient-checkpointing', action='store_true',
                         help='Enable gradient checkpointing')
     parser.add_argument('--use-8bit-optimizer', action='store_true',

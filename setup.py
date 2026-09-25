@@ -12,7 +12,8 @@ with open('README.md', 'r', encoding='utf-8') as f:
 setup(
     name='mantis',
     version='1.0.0',
-    author='Claude (Anthropic) & Gemini (Google)',
+    author='Nicolás Iglesias',
+    author_email='nfiglesias@gmail.com',
     description='Metacognitive Adaptive Network with Tiered Inference Strategies - A novel LLM architecture for mitigating hallucination',
     long_description=long_description,
     long_description_content_type='text/markdown',

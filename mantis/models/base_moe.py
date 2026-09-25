@@ -2,7 +2,8 @@
 Mixture-of-Experts Base Model for MANTIS Architecture
 
 Implements a sparse MoE transformer with top-k routing, load balancing,
-rotary positional embeddings and a projected key/value cache.
+rotary positional embeddings, grouped-query attention and a projected
+key/value cache.
 """
 
 import torch
@@ -35,14 +36,24 @@ def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch
 
 
 class CausalSelfAttention(nn.Module):
-    """Multi-head causal self-attention with RoPE and a (batch, heads, seq, d_head) KV cache."""
+    """
+    Causal self-attention with RoPE and grouped-query attention.
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
+    `n_kv_heads` key/value heads are shared by `n_heads` query heads, so the
+    (batch, n_kv_heads, seq, d_head) cache is n_heads / n_kv_heads times
+    smaller than a full multi-head cache.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, dropout: float = 0.1):
         super().__init__()
+        if n_heads % n_kv_heads != 0:
+            raise ValueError(f"n_kv_heads ({n_kv_heads}) must divide n_heads ({n_heads})")
         self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
         self.d_head = d_model // n_heads
         self.dropout = dropout
-        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.kv_proj = nn.Linear(d_model, 2 * n_kv_heads * self.d_head)
         self.out = nn.Linear(d_model, d_model)
 
     def forward(
@@ -54,9 +65,10 @@ class CausalSelfAttention(nn.Module):
         use_cache: bool,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         batch, seq_len, d_model = x.shape
-        q, k, v = (
-            self.qkv(x)
-            .view(batch, seq_len, 3, self.n_heads, self.d_head)
+        q = self.q_proj(x).view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
+        k, v = (
+            self.kv_proj(x)
+            .view(batch, seq_len, 2, self.n_kv_heads, self.d_head)
             .permute(2, 0, 3, 1, 4)
         )
         cos, sin = rope
@@ -72,6 +84,7 @@ class CausalSelfAttention(nn.Module):
             attn_mask=attn_mask,
             dropout_p=self.dropout if self.training else 0.0,
             is_causal=attn_mask is None,
+            enable_gqa=self.n_kv_heads != self.n_heads,
         )
         out = out.transpose(1, 2).reshape(batch, seq_len, d_model)
         return self.out(out), ((k, v) if use_cache else None)
@@ -94,6 +107,9 @@ class Expert(nn.Module):
 class MoELayer(nn.Module):
     """
     Mixture-of-Experts layer with top-k routing and load balancing.
+
+    The per-expert Python loop is the readable reference implementation;
+    profile before replacing it with grouped GEMMs.
     """
 
     def __init__(
@@ -119,26 +135,27 @@ class MoELayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        expert_weights: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        expert_bias: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass with top-k expert routing.
 
         Args:
             x: (batch, seq_len, d_model)
-            expert_weights: Optional (batch, n_experts) raw logits from the
-                meta-controller, added as a bias to the learned gate logits
+            expert_bias: Optional (batch, n_experts) bias from the meta-controller,
+                added to the learned gate logits for every token of the sequence
 
         Returns:
             output: (batch, seq_len, d_model)
             load_balance_loss: scalar
+            dispatch_load: (n_experts,) fraction of top-k assignments per expert
         """
         batch_size, seq_len, d_model = x.shape
         x_flat = x.reshape(-1, d_model)
 
         gate_logits = self.gate(x_flat).float()
-        if expert_weights is not None:
-            bias = expert_weights.float().unsqueeze(1).expand(-1, seq_len, -1)
+        if expert_bias is not None:
+            bias = expert_bias.float().unsqueeze(1).expand(-1, seq_len, -1)
             gate_logits = gate_logits + bias.reshape(-1, self.n_experts)
         gate_probs = F.softmax(gate_logits, dim=-1)
 
@@ -153,7 +170,9 @@ class MoELayer(nn.Module):
             expert_out = expert(x_flat[token_idx]) * top_k_probs[token_idx, slot].unsqueeze(-1)
             output.index_add_(0, token_idx, expert_out.to(output.dtype))
 
-        return output.view(batch_size, seq_len, d_model), self._compute_load_balance_loss(gate_probs)
+        dispatch = torch.bincount(top_k_indices.reshape(-1), minlength=self.n_experts).float()
+        dispatch = dispatch / top_k_indices.numel()
+        return output.view(batch_size, seq_len, d_model), self._compute_load_balance_loss(gate_probs), dispatch
 
     def _compute_load_balance_loss(self, gate_probs: torch.Tensor) -> torch.Tensor:
         """
@@ -163,6 +182,10 @@ class MoELayer(nn.Module):
         where f_i = fraction of tokens dispatched to expert i (hard routing)
               P_i = mean routing probability for expert i (soft)
               N = number of experts
+
+        f_i counts top-1 assignments only; `dispatch_load` in forward() reports
+        the load over all top-k slots, which is the work actually sent to each
+        expert.
         """
         top1 = gate_probs.argmax(dim=-1)
         f = torch.bincount(top1, minlength=self.n_experts).float() / top1.numel()
@@ -177,6 +200,7 @@ class TransformerBlock(nn.Module):
         self,
         d_model: int,
         n_heads: int,
+        n_kv_heads: int,
         d_ff: int,
         n_experts: int = 8,
         top_k: int = 2,
@@ -187,7 +211,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.use_moe = use_moe
 
-        self.attn = CausalSelfAttention(d_model, n_heads, dropout)
+        self.attn = CausalSelfAttention(d_model, n_heads, n_kv_heads, dropout)
         self.attn_norm = nn.LayerNorm(d_model)
 
         if use_moe:
@@ -203,7 +227,7 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         rope: Tuple[torch.Tensor, torch.Tensor],
         attn_mask: Optional[torch.Tensor] = None,
-        expert_weights: Optional[torch.Tensor] = None,
+        expert_bias: Optional[torch.Tensor] = None,
         past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
     ):
@@ -211,18 +235,19 @@ class TransformerBlock(nn.Module):
         Returns:
             output: (batch, seq_len, d_model)
             load_balance_loss: scalar tensor, or None for dense blocks
-            present_kv: (key, value) each (batch, heads, total_len, d_head), or None
+            dispatch_load: (n_experts,) tensor, or None for dense blocks
+            present_kv: (key, value) each (batch, kv_heads, total_len, d_head), or None
         """
         attn_out, present_kv = self.attn(self.attn_norm(x), rope, attn_mask, past_kv, use_cache)
         x = x + self.dropout(attn_out)
 
         normed = self.ff_norm(x)
         if self.use_moe:
-            ff_out, load_loss = self.ff(normed, expert_weights)
+            ff_out, load_loss, dispatch = self.ff(normed, expert_bias)
         else:
-            ff_out, load_loss = self.ff(normed), None
+            ff_out, load_loss, dispatch = self.ff(normed), None, None
         x = x + self.dropout(ff_out)
-        return x, load_loss, present_kv
+        return x, load_loss, dispatch, present_kv
 
 
 class BaseMoEModel(nn.Module):
@@ -239,6 +264,7 @@ class BaseMoEModel(nn.Module):
         d_model: int = 2048,
         n_layers: int = 24,
         n_heads: int = 32,
+        n_kv_heads: int = 8,
         d_ff: int = 8192,
         n_experts: int = 8,
         top_k: int = 2,
@@ -250,6 +276,7 @@ class BaseMoEModel(nn.Module):
 
         self.d_model = d_model
         self.max_seq_len = max_seq_len
+        self.n_layers = n_layers
         self.n_experts = n_experts
         self.top_k = top_k
         self.gradient_checkpointing = False
@@ -260,7 +287,7 @@ class BaseMoEModel(nn.Module):
 
         use_moe = n_experts > 1
         self.layers = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, d_ff, n_experts, top_k, dropout,
+            TransformerBlock(d_model, n_heads, n_kv_heads, d_ff, n_experts, top_k, dropout,
                              load_balance_weight, use_moe=use_moe)
             for _ in range(n_layers)
         ])
@@ -279,6 +306,7 @@ class BaseMoEModel(nn.Module):
             d_model=config.d_model,
             n_layers=config.n_layers,
             n_heads=config.n_heads,
+            n_kv_heads=config.n_kv_heads,
             d_ff=config.d_ff,
             n_experts=config.n_experts,
             top_k=config.top_k,
@@ -355,16 +383,22 @@ class BaseMoEModel(nn.Module):
             attention_mask: Optional (batch, seq_len), 1 = token, 0 = padding.
                 Not needed for right-padded batches (causal attention already
                 keeps real tokens from seeing later padding).
-            expert_weights: Optional (batch, n_experts) from meta-controller
-            return_hidden: Return hidden states
+            expert_weights: Optional (batch, n_layers, n_experts) gate-logit bias
+                from the meta-controller, one row per layer
+            return_hidden: Also return the final (normalized) hidden states
             past_key_values: Per-layer (key, value) cache from a previous call
             use_cache: Return the updated cache as `past_key_values`
 
         Returns:
-            Dict with logits, load_balance_loss, optional hidden states and cache
+            Dict with logits, load_balance_loss, expert_load (n_layers, n_experts)
+            top-k dispatch fractions, optional last_hidden and cache
         """
         batch_size, seq_len = input_ids.shape
         past_len = self.cache_len(past_key_values)
+        if expert_weights is not None and expert_weights.shape[1:] != (self.n_layers, self.n_experts):
+            raise ValueError(
+                f"expert_weights must be (batch, {self.n_layers}, {self.n_experts}), got {tuple(expert_weights.shape)}"
+            )
 
         positions = torch.arange(past_len, past_len + seq_len, device=input_ids.device)
         rope = self.rotary(positions)
@@ -373,24 +407,24 @@ class BaseMoEModel(nn.Module):
         x = self.dropout(self.token_embedding(input_ids))
 
         total_load_loss = x.new_zeros(())
-        hidden_states = [] if return_hidden else None
+        expert_load = []
         present_key_values = [] if use_cache else None
 
         for i, layer in enumerate(self.layers):
             layer_past = past_key_values[i] if past_key_values else None
+            layer_bias = expert_weights[:, i] if expert_weights is not None else None
 
             if self.gradient_checkpointing and self.training:
-                x, load_loss, present_kv = torch.utils.checkpoint.checkpoint(
-                    layer, x, rope, attn_mask, expert_weights, None, False,
+                x, load_loss, dispatch, present_kv = torch.utils.checkpoint.checkpoint(
+                    layer, x, rope, attn_mask, layer_bias, None, False,
                     use_reentrant=False
                 )
             else:
-                x, load_loss, present_kv = layer(x, rope, attn_mask, expert_weights, layer_past, use_cache)
+                x, load_loss, dispatch, present_kv = layer(x, rope, attn_mask, layer_bias, layer_past, use_cache)
 
             if load_loss is not None:
                 total_load_loss = total_load_loss + load_loss
-            if return_hidden:
-                hidden_states.append(x)
+                expert_load.append(dispatch.detach())
             if use_cache:
                 present_key_values.append(present_kv)
 
@@ -400,9 +434,9 @@ class BaseMoEModel(nn.Module):
         output = {
             'logits': logits,
             'load_balance_loss': total_load_loss,
+            'expert_load': torch.stack(expert_load) if expert_load else x.new_zeros((0, self.n_experts)),
         }
         if return_hidden:
-            output['hidden_states'] = hidden_states
             output['last_hidden'] = x
         if use_cache:
             output['past_key_values'] = present_key_values

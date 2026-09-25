@@ -4,14 +4,13 @@ Meta-Controller for MANTIS Architecture
 Residual MLP policy that outputs routing decisions for dynamic query processing.
 """
 
-import math
-
 import torch
 import torch.nn as nn
 from torch.distributions import Bernoulli, Normal
 from typing import Dict, Tuple
 
-GATES = ('early_exit', 'episodic', 'semantic', 'verification')
+GATES = ('bypass', 'episodic', 'semantic', 'verification')
+EXPERT = len(GATES)  # index of the expert-bias flag in an action mask
 
 
 class ResidualMLPBlock(nn.Module):
@@ -36,17 +35,20 @@ class MetaController(nn.Module):
     """
     Routing policy over a pooled query embedding plus a state summary.
 
-    The meta-controller analyzes query complexity and outputs 5 routing gates:
-    - Early Exit: Skip deep processing for simple queries
+    The meta-controller reads the query and outputs 5 routing decisions:
+    - Bypass: skip the optional components (memory reads, expert bias,
+      verification). The backbone still runs at full depth.
     - Episodic Access: Query recent interaction history
     - Semantic Retrieval: Access long-term knowledge base
-    - Expert Selection: Additive bias on the MoE gate logits
+    - Expert Bias: bounded, layer-specific additive bias on the MoE gate logits
     - Verification: Trigger critic model for fact-checking
 
     The input is one vector per query, so the network is a stack of residual
-    MLP blocks. As a policy, gates are Bernoulli and the expert bias is a
-    diagonal Gaussian around `expert_weights`; deterministic routing uses the
-    gate probabilities against a threshold and the Gaussian mean.
+    MLP blocks. As a policy, gates are Bernoulli and the raw expert bias is a
+    diagonal Gaussian around `expert_raw`; the applied bias is
+    `expert_bias_scale * tanh(raw)`, zero at initialization, so it cannot
+    overwhelm the pretrained gate logits. Deterministic routing thresholds the
+    gate probabilities and uses the Gaussian mean.
     """
 
     def __init__(
@@ -56,13 +58,17 @@ class MetaController(nn.Module):
         d_ff: int = 4096,
         dropout: float = 0.1,
         n_experts: int = 8,
-        state_dim: int = 128
+        n_moe_layers: int = 24,
+        state_dim: int = 128,
+        expert_bias_scale: float = 2.0,
     ):
         super().__init__()
 
         self.d_model = d_model
         self.n_experts = n_experts
+        self.n_moe_layers = n_moe_layers
         self.state_dim = state_dim
+        self.expert_bias_scale = expert_bias_scale
 
         self.embedding = nn.Linear(d_model + state_dim, d_model)
         self.dropout = nn.Dropout(dropout)
@@ -70,18 +76,19 @@ class MetaController(nn.Module):
         self.final_norm = nn.LayerNorm(d_model)
 
         self.gate_head = nn.Linear(d_model, len(GATES))
-        self.expert_selector = nn.Linear(d_model, n_experts)
-        self.expert_log_std = nn.Parameter(torch.full((n_experts,), math.log(0.5)))
+        self.expert_selector = nn.Linear(d_model, n_moe_layers * n_experts)
+        self.expert_log_std = nn.Parameter(torch.full((n_moe_layers * n_experts,), -1.0))
 
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize weights with small random values."""
+        """Xavier init everywhere; the expert selector starts at zero (no routing shift)."""
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+        nn.init.zeros_(self.expert_selector.weight)
 
     def forward(
         self,
@@ -97,9 +104,9 @@ class MetaController(nn.Module):
 
         Returns:
             Dict with:
-                - early_exit / episodic / semantic / verification: (batch, 1) probabilities
+                - bypass / episodic / semantic / verification: (batch, 1) probabilities
                 - gate_logits: (batch, 4) logits of those gates, in GATES order
-                - expert_weights: (batch, n_experts) raw logits used as additive gate bias
+                - expert_raw: (batch, n_moe_layers * n_experts) Gaussian mean of the raw bias
         """
         x = self.embedding(torch.cat([query_embedding, state_summary], dim=-1))
         x = self.dropout(x)
@@ -110,8 +117,13 @@ class MetaController(nn.Module):
         gate_logits = self.gate_head(h)
         decisions = {gate: torch.sigmoid(gate_logits[:, i:i + 1]) for i, gate in enumerate(GATES)}
         decisions['gate_logits'] = gate_logits
-        decisions['expert_weights'] = self.expert_selector(h)
+        decisions['expert_raw'] = self.expert_selector(h)
         return decisions
+
+    def expert_bias(self, expert_raw: torch.Tensor) -> torch.Tensor:
+        """(batch, n_moe_layers * n_experts) raw -> (batch, n_moe_layers, n_experts) bounded bias."""
+        bias = self.expert_bias_scale * torch.tanh(expert_raw)
+        return bias.view(-1, self.n_moe_layers, self.n_experts)
 
     def act(
         self,
@@ -131,46 +143,48 @@ class MetaController(nn.Module):
 
         Returns:
             gate_actions: (batch, 4) float {0, 1}
-            expert_bias: (batch, n_experts) bias applied to the MoE gate logits
+            expert_raw: (batch, n_moe_layers * n_experts) raw bias action (see expert_bias())
         """
         probs = torch.sigmoid(decisions['gate_logits'])
-        mean = decisions['expert_weights']
+        mean = decisions['expert_raw']
         if sample:
             gate_actions = torch.bernoulli(probs)
-            expert_bias = Normal(mean, self.expert_log_std.exp()).sample()
+            expert_raw = Normal(mean, self.expert_log_std.exp()).sample()
         else:
             gate_actions = (probs > threshold).float()
-            expert_bias = mean
-        return gate_actions * gate_mask, expert_bias
+            expert_raw = mean
+        return gate_actions * gate_mask, expert_raw
 
     def log_prob(
         self,
         decisions: Dict[str, torch.Tensor],
         gate_actions: torch.Tensor,
-        expert_bias: torch.Tensor,
-        gate_mask: torch.Tensor,
+        expert_raw: torch.Tensor,
+        action_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Log-probability (batch,) of taken actions. Masked gates contribute
-        nothing; the expert bias only counts when the base model has experts.
+        Log-probability (batch,) of the actions that affected the outcome.
+
+        `action_mask` is (batch, 5): one flag per gate plus the expert-bias
+        flag. A masked gate (missing component, or ignored because the bypass
+        path was taken) contributes nothing, and so does the expert bias when
+        it was not applied.
         """
         gate_lp = Bernoulli(logits=decisions['gate_logits']).log_prob(gate_actions)
-        log_prob = (gate_lp * gate_mask).sum(dim=-1)
-        if self.n_experts > 1:
-            dist = Normal(decisions['expert_weights'], self.expert_log_std.exp())
-            log_prob = log_prob + dist.log_prob(expert_bias).sum(dim=-1)
-        return log_prob
+        log_prob = (gate_lp * action_mask[:, :EXPERT]).sum(dim=-1)
+        dist = Normal(decisions['expert_raw'], self.expert_log_std.exp())
+        return log_prob + dist.log_prob(expert_raw).sum(dim=-1) * action_mask[:, EXPERT]
 
 
 class StateSummaryEncoder(nn.Module):
     """
     Encodes current state into a fixed-size summary for meta-controller input.
 
-    State includes:
-    - Previous uncertainty estimates
+    State features are query-side signals, not answer correctness estimates:
+    - Query predictability: mean next-token entropy over the query
     - Context length indicator
-    - Recent memory access patterns
-    - Average confidence scores
+    - Memory fill / availability
+    - Mean top-1 next-token probability over the query
     """
 
     def __init__(self, state_dim: int = 128):

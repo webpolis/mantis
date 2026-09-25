@@ -9,7 +9,6 @@ import importlib
 
 _EXPORTS = {
     'EpisodicMemory': 'mantis.memory.episodic',
-    'group_similar': 'mantis.memory.episodic',
     'SemanticMemory': 'mantis.memory.semantic',
     'MemoryConsolidator': 'mantis.memory.consolidation',
 }

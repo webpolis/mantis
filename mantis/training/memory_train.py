@@ -10,7 +10,8 @@ the Stage 1 base model frozen:
   retrieve its context (InfoNCE over in-batch negatives).
 
 Afterwards every context is written to a semantic memory store with the
-trained projection, ready for Stage 3 and inference.
+trained projection (namespace 'global', source 'stage2', tagged with the base
+model's embedding fingerprint), ready for Stage 3 and inference.
 """
 
 import json
@@ -26,7 +27,7 @@ from tqdm import tqdm
 from mantis.memory.semantic import SemanticMemory
 from mantis.models.base_moe import BaseMoEModel
 from mantis.models.ssm import EpisodicMemorySSM
-from mantis.utils.checkpoints import load_base_model
+from mantis.utils.checkpoints import load_base_model, model_fingerprint
 
 DEMO_PAIRS = [
     ("Who is the main character?",
@@ -131,6 +132,7 @@ def train_memory_stage(args):
         raise ValueError("Contrastive training needs at least 2 query-context pairs")
 
     max_len = base_model.max_seq_len
+    fingerprint = model_fingerprint(base_model, tokenizer)
     # In-batch negatives need at least two pairs per batch
     batch_size = max(2, min(args.batch_size, len(pairs)))
     num_steps = args.steps_per_epoch or 100
@@ -144,6 +146,7 @@ def train_memory_stage(args):
             'config': config,
             'tokenizer_fingerprint': tokenizer.fingerprint(),
             'base_checkpoint': os.path.abspath(args.resume),
+            'embedding_fingerprint': fingerprint,
             'loss': loss,
         }, path)
 
@@ -196,12 +199,14 @@ def train_memory_stage(args):
         index_type=config.semantic_memory.index_type,
         use_gpu=config.semantic_memory.use_gpu,
         projection=projection,
+        embedding_fingerprint=fingerprint,
     )
     contexts = list(dict.fromkeys(c for _, c in pairs))
     for i in range(0, len(contexts), 32):
         chunk = contexts[i:i + 32]
         hidden, mask = embed_batch(base_model, tokenizer, chunk, max_len, device)
-        semantic_memory.add_batch(pooled(hidden, mask), chunk)
+        semantic_memory.add_batch(pooled(hidden, mask), chunk,
+                                  [{'namespace': 'global', 'source': 'stage2'} for _ in chunk])
     store_path = os.path.join(args.output_dir, "semantic_memory")
     semantic_memory.save(store_path)
 

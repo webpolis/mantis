@@ -41,7 +41,7 @@ def build_accelerator(args):
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision='fp16' if args.mixed_precision else 'no',
+        mixed_precision=args.mixed_precision or 'no',
         deepspeed_plugin=deepspeed_plugin,
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
         dataloader_config=DataLoaderConfiguration(use_seedable_sampler=True),

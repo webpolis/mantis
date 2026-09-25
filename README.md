@@ -9,12 +9,14 @@ A novel LLM architecture exploring hallucination mitigation and long-context mem
 ![MANTIS Architecture Diagram](mantis_architecture.png)
 
 **Components**:
-- **Three-tier memory**: Attention (8K) → Episodic SSM → Semantic FAISS
-- **Meta-controller**: RL-trainable routing with 5 decision gates
-- **MoE base model**: ~6.8B total, ~2B active parameters (8 experts, top-2)
-- **Critic model**: Integrated hallucination detection
+- **Three-tier memory**: Attention (8K window in the `base` preset) → Episodic SSM retrieval keys → Semantic FAISS store with namespaces and trust levels
+- **Meta-controller**: RL-trainable routing with 5 decision gates (bypass, episodic, semantic, expert bias, verification)
+- **MoE base model**: ~6.7B total, ~1.9B active parameters (8 experts, top-2, grouped-query attention)
+- **Critic model**: verification head over the frozen base model's hidden states, with one bounded evidence-recovery round before abstaining
 
-**Design Goals** (unvalidated): Reduced hallucinations via verification • Extended context via hierarchical memory • Efficiency via sparse experts • Lower latency via early-exit
+**Design Goals** (unvalidated): Reduced hallucinations via evidence-grounded verification • Extended context via hierarchical memory • Efficiency via sparse experts • Lower cost via bypassing retrieval and verification on predictable queries
+
+[ARCHITECTURE_REVIEW.md](ARCHITECTURE_REVIEW.md) records a reliability review of the design and the measurements it must pass before a large training run.
 
 ---
 
@@ -39,7 +41,7 @@ python train.py --stage 1 \
 
 ## Training Pipeline
 
-MANTIS trains in four stages, but they do not form a chain. Only Stage 1 trains the base model. Stages 2–4 each train a separate component and leave the base model unchanged, which is why all of them pass the Stage 1 checkpoint to `--resume`. Stage 3 then picks up the Stage 2 and Stage 4 outputs through their own flags:
+MANTIS trains in five stages, but they do not form a chain. Only Stages 1 and 5 train the base model. Stages 2–4 each train a separate component and leave the base model unchanged, which is why all of them pass the Stage 1 checkpoint to `--resume`. Stage 3 then picks up the Stage 2 and Stage 4 outputs through their own flags:
 
 ```mermaid
 flowchart LR
@@ -47,20 +49,23 @@ flowchart LR
     S2["Stage 2<br/>Memory fine-tuning<br/>episodic SSM + semantic store"]
     S4["Stage 4<br/>Critic training<br/>critic_best.pt"]
     S3["Stage 3<br/>RL routing policy<br/>meta_controller_rl.pt"]
+    S5["Stage 5<br/>Generator adaptation (SFT)<br/>best_model.pt (chat format)"]
     S1 -- "--resume (frozen base)" --> S2
-    S1 -- "--resume (config + tokenizer)" --> S4
+    S1 -- "--resume (frozen base)" --> S4
     S1 -- "--resume (frozen base)" --> S3
+    S1 -- "--resume (weights only)" --> S5
     S2 -. "--memory-checkpoint<br/>--semantic-store" .-> S3
     S4 -. "--critic-checkpoint" .-> S3
 ```
 
-The dotted inputs are optional. Without them, Stage 3 keeps the matching gates closed. Run Stages 2 and 4 in any order, then Stage 3.
+The dotted inputs are optional. Without them, Stage 3 keeps the matching gates closed. Run Stages 2, 4 and 5 in any order, then Stage 3. A Stage 5 checkpoint can replace the Stage 1 checkpoint as the base for Stages 2–4, so the memory, critic and policy are trained against the generator that will answer.
 
 **What you need**:
 - Basic LLM: Stage 1 only
 - + Long context: Stage 1 + 2
 - + Adaptive routing: Stage 1 + 3
-- Full MANTIS: all 4 stages
+- + A generator that follows instructions and cites evidence: Stage 1 + 5
+- Full MANTIS: all 5 stages
 
 ---
 
@@ -69,7 +74,8 @@ The dotted inputs are optional. Without them, Stage 3 keeps the matching gates c
 **What it trains**: Foundation transformer model with Mixture-of-Experts
 - Standard next-token prediction
 - Top-2 routing over 4 experts (`tiny`, `small`) or 8 (`base`); `micro` is dense
-- Load balancing loss
+- Load balancing loss (top-1 based); `expert_load` in the model output reports the top-2 dispatch per layer
+- Grouped-query attention (`n_kv_heads` per preset)
 - No memory systems (added in Stage 2)
 - No meta-controller (added in Stage 3)
 
@@ -155,14 +161,14 @@ python train.py --stage 1 data/train.txt --val-file data/val.txt
 
 ### Model Sizes
 
-| Size | Parameters (active) | Use Case | Training VRAM |
-|------|-----------|----------|-------------|
-| `micro` | ~3M (dense) | Ultra-fast testing | ~0.4GB |
-| `tiny` | ~57M (~32M) | Development/debugging | ~1.4GB |
-| `small` | ~454M (~252M) | Experimentation | ~8GB |
-| `base` | ~6.8B (~2B) | Production | ~106GB (~64GB with `--gradient-checkpointing --use-8bit-optimizer`) |
+| Size | Parameters (active) | Query/KV heads | Controller | Critic | Use Case | Training VRAM |
+|------|-----------|------|------|------|----------|-------------|
+| `micro` | ~3M (dense) | 4/4 | 0.6M | 2.2M | Ultra-fast testing | ~0.4GB |
+| `tiny` | ~55M (~30M) | 8/4 | 2.4M | 14M | Development/debugging | ~1.4GB |
+| `small` | ~435M (~234M) | 32/8 | 18M | 45M | Experimentation | ~8GB |
+| `base` | ~6.7B (~1.9B) | 32/8 | 106M | 80M | Production | ~104GB (~63GB with `--gradient-checkpointing --use-8bit-optimizer`) |
 
-VRAM comes from `mantis/training/vram_estimator.py` for FP16 mixed precision, batch size 1 and `--seq-len 512`.
+The controller and critic scale with the preset, so a `micro` full-system run is a micro-size system. VRAM comes from `mantis/training/vram_estimator.py` for FP16 mixed precision, batch size 1 and `--seq-len 512`.
 
 ```bash
 # Specify size with --model-size
@@ -199,7 +205,7 @@ python train.py --stage 1 data/train.txt \
 ### Memory Optimization
 
 ```bash
-# Basic: Mixed precision (2x memory savings)
+# Basic: Mixed precision (2x memory savings); `--mixed-precision bf16` on Ampere or newer
 python train.py --stage 1 data/train.txt --mixed-precision --val-split 0.1
 
 # Advanced: Gradient checkpointing (40% memory, 30% slower)
@@ -313,16 +319,16 @@ python train.py --stage 2 data/memory.jsonl \
     --output-dir checkpoints/stage2
 ```
 
-**Note**: Without a data file, Stage 2 uses an 8-pair demo set. Build real pairs from long-context datasets (QuALITY, NarrativeQA, etc.). Stage 1-only flags such as `--hf-dataset` or `--mixed-precision` are rejected.
+**Note**: Without a data file, Stage 2 uses an 8-pair demo set. Build real pairs from long-context datasets (QuALITY, NarrativeQA, etc.). Stage 1-only flags such as `--hf-dataset` or `--mixed-precision` are rejected. The store records a fingerprint of the base model's tokenizer and full backbone weights; the engine refuses a store built by a different model. Stage 2 contexts land in the shared `global` namespace with full trust.
 
 ---
 
 ## Stage 4: Critic Training (OPTIONAL)
 
-**What it trains**: The critic that scores whether a response is correct. A trained critic enables the verification gate in Stage 3 and in the full engine.
+**What it trains**: The critic that scores whether a response is correct given the evidence. It is a small encoder over the frozen Stage 1 model's hidden states of `[evidence; query; response]`, so it starts from the backbone's language knowledge. Data is split into train, calibration and validation parts; a temperature fitted on the calibration part makes the score a calibrated probability, and the run reports validation accuracy, Brier score and ECE. A trained critic enables the verification gate in Stage 3 and in the full engine.
 
 ```bash
-# JSONL lines of {"query": ..., "response": ..., "facts": ... (optional), "label": 0 or 1}
+# JSONL lines of {"query": ..., "response": ..., "evidence": "..." or [...] (optional), "label": 0 or 1}
 python train.py --stage 4 data/critic.jsonl \
     --resume checkpoints/stage1/best_model.pt \
     --tokenizer-path checkpoints/stage1/tokenizer \
@@ -330,21 +336,25 @@ python train.py --stage 4 data/critic.jsonl \
     --output-dir checkpoints/critic
 ```
 
+**Note**: Without a data file, Stage 4 uses a demo set whose negatives include mismatched, negated and altered answers. Real training needs near-miss negatives and outputs from the actual generator.
+
 ---
 
 ## Stage 3: RL Training (OPTIONAL)
 
 **What it trains**: Meta-controller routing policy via reinforcement learning
 - 5 decision gates:
-  - Early exit (skip processing for simple queries)
+  - Bypass (skip memory reads, expert bias and verification; the backbone still runs at full depth)
   - Episodic memory access
   - Semantic memory retrieval
-  - Expert selection (MoE routing)
+  - Expert bias (bounded, per layer, off by default until `InferenceConfig.expert_bias` is set)
   - Verification trigger (critic model)
-- PPO (Proximal Policy Optimization)
-- Multi-objective reward: accuracy - 0.3×latency - 0.2×compute + 0.5×calibration
+- PPO (Proximal Policy Optimization); only the actions that affected the outcome enter the log-probability
+- Reward: accuracy − 0.3×latency − 0.2×compute + 0.5×calibration, where accuracy is a lexical match that rejects negated answers and scores abstentions separately, latency is measured against a declared 2 s budget, compute is the measured token-parameter work beyond a query-only answer, and calibration uses the final reported confidence
+- Optional supervised warm start (`--rl-supervised-episodes`): evaluates every gate combination per query on frozen memory and trains toward the best one
+- Validation runs on frozen memory and reports accuracy, coverage, error rate among answered questions, p95 latency and mean compute
 
-**When to use**: After Stage 1 to optimize dynamic routing and efficiency. Each optional component (Stage 2 memory, Stage 2 semantic store, Stage 4 critic) enables its gate; without it the gate stays closed.
+**When to use**: After Stage 1 to optimize dynamic routing and efficiency. Each optional component (Stage 2 memory, Stage 2 semantic store, Stage 4 critic) enables its gate; without it the gate stays closed. Training episodes write to memory, so training is a sequential stateful process.
 
 **Status**: IMPLEMENTED
 
@@ -366,16 +376,31 @@ python train.py --stage 3 data/qa.jsonl \
     --memory-checkpoint checkpoints/stage2/memory_system_final.pt \
     --semantic-store checkpoints/stage2/semantic_memory \
     --critic-checkpoint checkpoints/critic/critic_best.pt \
+    --rl-supervised-episodes 2000 \
     --rl-episodes 100000 \
     --output-dir checkpoints/stage3_full
 ```
 
 **Note**: Without a data file, Stage 3 uses a 10-pair demo set. For production, provide 1000+ query-answer pairs. The saved `meta_controller_rl.pt` records the component paths, so `MANTISInferenceEngine.from_checkpoints(policy_checkpoint=...)` rebuilds the full engine.
 
-**Expected Results**:
-- Improved efficiency via adaptive routing
-- Better accuracy/latency trade-offs
-- Dynamic compute allocation based on query complexity
+**Hypotheses to test** (no results exist yet): lower measured cost at comparable quality than the same backbone with every gate open, and better quality–cost curves than fixed policies. `scripts/run_eval.py --route-policy` runs those controls.
+
+---
+
+## Stage 5: Generator Adaptation (OPTIONAL)
+
+**What it trains**: The base model itself, on instruction data in the prompt format the engine uses at runtime: `User: ... / Assistant:` roles and an `<evidence>` block whose lines carry source identifiers. Stages 2–4 leave the generator frozen, so without this stage better retrieval need not produce better answers. The loss covers response tokens only. Records may include distractor or contradictory evidence and unanswerable questions whose response is an abstention. The saved checkpoint sets `prompt_format = 'chat'` so the engine builds prompts the way the model was trained.
+
+```bash
+# JSONL lines of {"query": ..., "response": ..., "evidence": [...] (optional)}
+python train.py --stage 5 data/sft.jsonl \
+    --resume checkpoints/stage1/best_model.pt \
+    --tokenizer-path checkpoints/stage1/tokenizer \
+    --val-split 0.1 --epochs 3 --mixed-precision bf16 \
+    --output-dir checkpoints/stage5
+```
+
+`--resume` supplies the weights only; the optimizer and schedule start fresh. Stage 1 flags (`--mixed-precision`, `--gradient-checkpointing`, ...) apply.
 
 ---
 
@@ -414,6 +439,24 @@ python inference.py checkpoints/stage1/best_model.pt \
 ```
 
 The model's context window equals the `--seq-len` it was trained with. Longer generations re-encode the most recent half-window when the cache fills.
+
+The full engine (routing, memory, critic) is a Python API:
+
+```python
+from mantis.inference.engine import MANTISInferenceEngine
+
+engine = MANTISInferenceEngine.from_checkpoints(
+    policy_checkpoint="checkpoints/stage3/meta_controller_rl.pt",  # records the component paths
+    memory_dir="runtime/memory",   # runtime memory state, loaded if present and checkpointed
+    dtype="bfloat16",              # serving precision of the backbone
+)
+engine.ingest(open("notes.txt").read(), namespace="alice", source="user")
+result = engine.generate("What did I decide about the venue?", namespace="alice")
+print(result["response"], result["confidence"], result["confidence_source"], result["evidence"])
+engine.close()  # flushes consolidation and saves memory_dir
+```
+
+`generate()` encodes the query once and reuses that prefill for decoding unless evidence is prepended. Input longer than the window is ingested into memory as document chunks. The result reports the path taken, the critic score, whether the engine abstained, the evidence identifiers used, per-component timings, token counts and `compute_units`. `frozen_memory()` disables writes for evaluation.
 
 **RTX 3060 Known Issue**: If you encounter `CUBLAS_STATUS_NOT_INITIALIZED` errors:
 ```bash
@@ -460,7 +503,7 @@ python web/server/app.py   # open http://localhost:5000
 
 | Flag | Description | Example |
 |------|-------------|---------|
-| `--stage` | Training stage (1-4) | `--stage 1` |
+| `--stage` | Training stage (1-5) | `--stage 1` |
 | `--model-size` | Model size (micro/tiny/small/base) | `--model-size small` |
 | `--hf-dataset` | HuggingFace dataset name | `--hf-dataset wikitext` |
 | `--streaming` | Stream without download | `--streaming` |
@@ -468,7 +511,7 @@ python web/server/app.py   # open http://localhost:5000
 | `--val-file` | Separate validation file | `--val-file data/val.txt` |
 | `--resume` | Resume from checkpoint | `--resume ckpt/best_model.pt` |
 | `--tokenizer-path` | Reuse existing tokenizer | `--tokenizer-path ckpt/tokenizer` |
-| `--mixed-precision` | Use FP16 (2x memory save) | `--mixed-precision` |
+| `--mixed-precision` | FP16 (default) or BF16 mixed precision | `--mixed-precision bf16` |
 | `--gradient-checkpointing` | Trade compute for memory | `--gradient-checkpointing` |
 | `--use-8bit-optimizer` | 8-bit AdamW (50% optimizer memory) | `--use-8bit-optimizer` |
 | `--deepspeed` | Enable DeepSpeed ZeRO-2 | `--deepspeed` |
@@ -544,18 +587,20 @@ python train.py --stage 1 data/train.txt --val-split 0.1  # Auto-detects
 ```
 mantis/
 ├── models/           # base_moe, meta_controller, critic, ssm
-├── memory/           # episodic, semantic, consolidation
-├── training/         # common, pretrain, memory_train, rl_train, critic_train
-├── inference/        # generation (shared decode loop), engine
+├── memory/           # episodic, semantic, consolidation (lifecycle)
+├── training/         # common, pretrain, memory_train, rl_train, critic_train, sft, scoring
+├── inference/        # generation (shared decode loop), prompting (evidence budget), engine
 ├── simulation/       # Ecological simulator that generates evolution training data
 ├── configs/          # model_config (presets: micro/tiny/small/base)
-├── utils/            # checkpoints (schema, model and tokenizer loading)
+├── utils/            # checkpoints (schema, model and tokenizer loading, fingerprints)
 ├── data.py           # Documents, EOS, packing, leak-free splits
 ├── tokenizer.py      # MANTISTokenizer (trie-based, 512 tokens, byte fallback)
 evaluation/           # benchmarks, metrics, evaluation harness
 ├── benchmarks.py     # MMLU, TruthfulQA, HumanEval, GSM8K
-├── metrics.py        # Accuracy, F1, hallucination rate, calibration
-train.py              # Main training script (--stage 1/2/3/4)
+├── memory_bench.py   # Synthetic multi-session memory benchmark
+├── metrics.py        # Accuracy, error/coverage, confident errors, calibration
+tests/                # Deterministic diagnostics (cache reuse, budgets, memory lifecycle, scoring)
+train.py              # Main training script (--stage 1/2/3/4/5)
 inference.py          # Text generation script
 train_evo.py          # Evolution curriculum training
 inference_evo.py      # Tick-by-tick evolution generation
@@ -570,52 +615,63 @@ web/                  # Simulation playground (Flask server, React client)
 **Current Status**: Research prototype with complete architecture but **no trained weights**.
 
 **Training Requirements** (for production results):
-- Compute: 2-5T tokens • ~50K-130K A100 GPU-hours for the `base` preset (6 × 2B active parameters × tokens, at ~125 TFLOPS sustained)
+- Compute: 2-5T tokens • ~50K-125K A100 GPU-hours for the `base` preset (6 × 1.9B active parameters × tokens, at ~125 TFLOPS sustained). This is a parameter-dominated estimate; it excludes attention overhead, auxiliary training, evaluation, failed runs and the throughput this MoE implementation reaches in practice
 - Data: High-quality corpus (FineWeb-edu, C4, etc.)
 - Time: Weeks-months for full training
 
-**Evaluation Requirements** (to validate design claims):
-- Benchmarks: MMLU, TruthfulQA, HumanEval, GSM8K
-- Hallucination metrics
-- Baseline comparisons: Use `scripts/run_eval.py`
+**Evaluation Requirements** (to validate design claims), in order:
+1. Ablation ladder on the same backbone: no memory or controller → ordinary retrieval → recent-text buffer → episodic SSM → fixed policy + critic → learned router → expert bias (`scripts/run_eval.py --route-policy`, `--expert-bias`, memory benchmark `--memory-bench-mode prompt` vs `memory`)
+2. Memory gate: beat ordinary retrieval on the memory benchmark at the same generator, context and storage budget
+3. Efficiency gate: lower measured cost (`compute_units`, p95 latency) at comparable quality
+4. Reliability gate: lower error rate among answered questions at matched coverage on held-out sources
+5. Then benchmarks (MMLU, TruthfulQA proxy, HumanEval, GSM8K) and a scale-up
 
 **Current Limitations**:
-- No trained weights (architecture only)
-- True attention limited to 8K (not 1M)
+- No trained weights (architecture only); no benchmark, throughput or calibration result exists
+- True attention is limited to the preset window (8K); memory extends what the generator can see only as far as retrieval recall and the evidence budget allow
 - Episodic memory needs a CUDA-capable GPU (mamba-ssm), so Stage 2, Stage 3 and the full engine do too
+- The 512-token tokenizer makes natural-language sequences several times longer than a subword vocabulary would; a general-language tokenizer is not evaluated
+- Retention is by retrieval hits and overflow, not learned from what later queries need; no atomic facts or conflict resolution
 
 ---
 
 ## Component Details
 
 ### BaseMoEModel
-- Top-2 routing over 4 or 8 experts (dense for `micro`)
-- Load balancing loss
-- Scales from 3M to 6.8B parameters across the CLI presets
+- Top-2 routing over 4 or 8 experts (dense for `micro`); load balancing loss plus per-layer top-2 dispatch statistics
+- Grouped-query attention: the `base` preset's 8K KV cache is 0.375 GiB in 16-bit precision instead of 1.5 GiB
+- Scales from 3M to 6.7B parameters across the CLI presets
 - Pre-norm transformer backbone with rotary positional embeddings
+- Expert bias from the controller is one bounded vector per layer, added to the gate logits
+- Serving precision: `load_base_model(..., dtype=)`, `from_checkpoints(dtype=)`, `run_eval.py --dtype`
 
 ### MetaController
-- 6 residual MLP blocks over the pooled query embedding and a state summary
-- 5 routing gates: early-exit, episodic/semantic memory, expert selection, verification
-- RL-trainable via PPO (Stage 3)
+- Residual MLP blocks (6 at `base`, 2–4 in smaller presets) over the pooled query embedding and a state summary of query predictability, context fill and memory fill
+- 5 routing gates: bypass, episodic/semantic memory, expert bias (`scale * tanh`, zero-initialized, off by default), verification
+- RL-trainable via PPO (Stage 3); a fixed route policy replaces it for ablations
 
 ### Memory Systems
-- **Episodic**: Mamba SSM (mamba-ssm library), 8K token window, L2 cache
-- **Semantic**: FAISS vector DB with stable IDs, 1M+ entries, L3 cache. Evicted IDs are tombstoned, and the index rebuilds when more than 20% are stale
-- **Consolidation**: Background transfer episodic → semantic using base model embeddings
+- **Episodic**: Mamba SSM (mamba-ssm library) encodes each interaction into a 256-d retrieval key; entries keep token segments, a pooled embedding, hit counts and provenance (namespace, source, trust, timestamp), not full hidden states. L2 cache of up to 100 entries
+- **Semantic**: FAISS vector DB with stable IDs, namespaces (per caller plus shared `global`), trust levels by source (unverified generated claims are never cited as facts), supersession links, deletion and an embedding fingerprint. Evicted IDs are tombstoned with bounded over-fetch, and the index rebuilds off-thread when more than 20% are stale. Flat search below 10K entries, approximate IVF-PQ above; `recall_at_k()` measures it
+- **Consolidation**: started by the engine when both memories exist. Every evicted episodic entry is written to semantic memory as its own record before it is dropped; the periodic cycle promotes entries retrieved at least once. `engine.close()` flushes the queue and checkpoints both stores
+- **Retrieval**: hybrid rerank (tier similarity + word F1), an equal token-budget share per tier with leftover flow, source identifiers in the prompt, the same evidence to the critic
 
 ### Critic Model
-- ~155M-parameter verification model: a 12-layer encoder over query, response and retrieved facts
-- Hallucination detection via consistency checking; the engine abstains when the score falls below 0.6
+- Encoder (6 layers, ~80M parameters at `base`) over the frozen base model's hidden states of `[evidence; query; response]`; budget shares 50% response, 35% evidence, 15% query with leftover redistribution
+- One correctness head, temperature-scaled in Stage 4; the engine reports its score as the answer's confidence
+- When the score falls below 0.6 the engine retrieves once more (conditioning on the query and the draft), regenerates and rescores; if it still fails, it abstains and writes nothing to memory
 
 ---
 
 ## Known Issues & Warnings
 
 ### Semantic Memory Scaling
-Stores embeddings in RAM (12GB+ for 1M entries).
+Keeps full FP32 vectors in RAM alongside the index (8.2GB of vectors for 1M entries at `d_model` 2048, before text, metadata and rebuild copies).
 - **Limit**: ~100K entries on 16GB RAM systems
 - **Solution**: Disk-backed storage planned for production
+
+### Evaluation Proxies
+The Stage 3 reward and the TruthfulQA runner score answers lexically (normalized phrase match without negation, or word F1). They reject "Paris is not the capital" for reference "Paris" but misjudge paraphrases and penalize verbose correct answers. Report them as proxies.
 
 ### TextDataset Memory
 Loads all tokens into RAM (2 bytes per token, not true streaming). Text files hold documents separated by blank lines; each document ends with one EOS token.
@@ -647,13 +703,24 @@ python scripts/run_eval.py checkpoints/stage1/best_model.pt \
     --output full_results.json
 ```
 
-**Available Benchmarks**:
-- MMLU (knowledge across 57 subjects)
-- TruthfulQA (hallucination detection)
-- HumanEval (code generation)
-- GSM8K (math reasoning)
+```bash
+# Ablations: fixed route policies, expert bias, serving precision, stateful memory
+python scripts/run_eval.py checkpoints/stage1/best_model.pt --benchmarks memory \
+    --policy-checkpoint checkpoints/stage3/meta_controller_rl.pt \
+    --route-policy always --dtype bfloat16 --records records.jsonl
 
-**Metrics**: Accuracy, hallucination rate, calibration error, pass rate. Confidence is the geometric-mean probability of the generated tokens. TruthfulQA counts a response as truthful when it is closer (token F1) to a true reference than to any false one. HumanEval runs generated code in a resource-limited subprocess, which is not a security sandbox.
+# The same memory benchmark as a recent-text-buffer baseline on the bare model
+python scripts/run_eval.py checkpoints/stage1/best_model.pt --benchmarks memory --memory-bench-mode prompt
+```
+
+**Available Benchmarks**:
+- MMLU (knowledge across 57 subjects; question plus lettered choices, at most 10 new tokens, first standalone letter)
+- TruthfulQA (lexical proxy: closer by word F1 to a true reference than to any false one; not the official judge)
+- HumanEval (code generation; runs in a Docker container without network when Docker is available, else in a resource-limited subprocess that is not a security boundary)
+- GSM8K (math reasoning)
+- memory (synthetic multi-session recall: facts ingested per session, later updates, distractors and unanswerable questions; `--memory-bench-mode memory` uses the engine's memory, `prompt` prepends every fact seen so far)
+
+**Metrics**: accuracy over all questions, error rate, coverage and error rate among answered questions (abstentions count), confident-error rate (wrong with confidence ≥ 0.8), ECE, Brier score, area under the risk–coverage curve, pass rate. The engine's confidence is the critic score when the answer was verified, the geometric-mean token probability otherwise, and 0 after an abstention. Benchmarks run on frozen memory by default (`--memory-mode stateful` to keep writing). Reports include p50/p95 latency, mean `compute_units`, peak GPU memory and artifact versions; `--records` writes per-example routes, evidence identifiers and timings.
 
 ---
 
