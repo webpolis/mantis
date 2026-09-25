@@ -60,6 +60,7 @@ from torch.utils.data import Dataset, IterableDataset, DataLoader, ConcatDataset
 import math
 import argparse
 import random
+import time
 import numpy as np
 import fcntl
 from tqdm import tqdm
@@ -355,8 +356,12 @@ def validate(model, dataloader, accelerator):
     model.eval()
     total_loss = 0.0
     total_tokens = 0
+    started = time.monotonic()
+    total_batches = len(dataloader)
 
-    for batch in tqdm(dataloader, desc="Validating", leave=False, disable=not accelerator.is_main_process):
+    for batch_index, batch in enumerate(tqdm(
+        dataloader, desc="Validating", leave=False, disable=not accelerator.is_main_process
+    ), 1):
         with accelerator.autocast():
             logits = model(batch['input_ids'])['logits']
         labels = batch['labels']
@@ -368,6 +373,12 @@ def validate(model, dataloader, accelerator):
         )
         total_loss += loss.item()
         total_tokens += (labels != -100).sum().item()
+        if not accelerator.is_main_process and batch_index % 500 == 0:
+            print(f"[rank {accelerator.process_index}] Validation: "
+                  f"{batch_index}/{total_batches} batches", flush=True)
+
+    print(f"[rank {accelerator.process_index}] Validation finished: "
+          f"{total_batches} batches in {time.monotonic() - started:.1f}s", flush=True)
 
     return total_loss, total_tokens
 
@@ -510,6 +521,7 @@ def train(args):
 
     def save(name, epoch, **extra):
         accelerator.wait_for_everyone()
+        path = None
         if is_main:
             path = os.path.join(args.output_dir, name)
             save_training_checkpoint(
@@ -528,7 +540,8 @@ def train(args):
                 epochs_without_improvement=epochs_without_improvement,
                 **extra,
             )
-            return path
+        accelerator.wait_for_everyone()
+        return path
 
     if is_main:
         print(f"\n{'='*80}")
@@ -600,9 +613,17 @@ def train(args):
             print(f"\nEpoch {epoch+1} — raw loss: {avg_loss:.4f}, weighted loss: {avg_weighted:.4f}, "
                   f"PPL: {compute_perplexity(avg_loss):.2f} | token shares: {shares}")
 
+        if is_main:
+            print("Saving completed epoch before validation...", flush=True)
+        path = save('last_model.pt', epoch + 1)
+        if path:
+            print(f"✓ Training checkpoint saved: {path}", flush=True)
+
         stop_early = False
         if val_loader is not None:
             raw_sum, raw_tokens = validate(accelerator.unwrap_model(model), val_loader, accelerator)
+            if is_main:
+                print("Waiting for validation results from all ranks...", flush=True)
             gathered_loss = accelerator.gather(torch.tensor([raw_sum], device=accelerator.device)).sum()
             gathered_tokens = accelerator.gather(torch.tensor([float(raw_tokens)], device=accelerator.device)).sum()
             val_loss = (gathered_loss / gathered_tokens).item() if gathered_tokens > 0 else float('inf')
