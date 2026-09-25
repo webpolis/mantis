@@ -66,7 +66,6 @@ import fcntl
 from tqdm import tqdm
 import warnings
 
-torch.set_float32_matmul_precision('high')
 warnings.filterwarnings('ignore', message='.*gemm_and_bias error: CUBLAS_STATUS_NOT_INITIALIZED.*')
 warnings.filterwarnings('ignore', message='.*lr_scheduler.step.*optimizer.step.*')
 
@@ -662,6 +661,8 @@ def train(args):
 
 
 def main():
+    # TF32 matmuls on Ampere and newer; older GPUs keep full FP32
+    torch.set_float32_matmul_precision('high')
     parser = argparse.ArgumentParser(
         description='MANTIS Evolution Curriculum Training',
         formatter_class=argparse.RawDescriptionHelpFormatter,

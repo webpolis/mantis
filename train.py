@@ -80,9 +80,6 @@ from tqdm import tqdm
 import warnings
 import numpy as np
 
-# TF32 matmuls on Ampere and newer; older GPUs keep full FP32
-torch.set_float32_matmul_precision('high')
-
 # Suppress cuBLAS recovery warnings (these are expected when workaround is applied)
 warnings.filterwarnings('ignore', message='.*gemm_and_bias error: CUBLAS_STATUS_NOT_INITIALIZED.*')
 
@@ -801,6 +798,8 @@ def validate_later_stage_args(args):
 
 
 def main():
+    # TF32 matmuls on Ampere and newer; older GPUs keep full FP32
+    torch.set_float32_matmul_precision('high')
     parser = argparse.ArgumentParser(
         description='Train MANTIS Model',
         formatter_class=argparse.RawDescriptionHelpFormatter,
