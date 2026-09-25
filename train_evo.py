@@ -66,8 +66,7 @@ import fcntl
 from tqdm import tqdm
 import warnings
 
-torch.backends.cuda.matmul.allow_tf32 = False
-torch.backends.cudnn.allow_tf32 = False
+torch.set_float32_matmul_precision('high')
 warnings.filterwarnings('ignore', message='.*gemm_and_bias error: CUBLAS_STATUS_NOT_INITIALIZED.*')
 warnings.filterwarnings('ignore', message='.*lr_scheduler.step.*optimizer.step.*')
 
