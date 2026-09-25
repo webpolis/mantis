@@ -11,8 +11,6 @@ MANTIS (Metacognitive Adaptive Network with Tiered Inference Strategies) is a re
 - **Meta-controller**: RL-trainable routing with 5 decision gates (bypass, episodic, semantic, expert bias, verification)
 - **Critic model**: Verification head over the frozen backbone's hidden states, with one evidence-recovery round before abstention
 
-**Status**: Complete architecture implementation but no trained models. `ARCHITECTURE_REVIEW.md` records the reliability review the implementation now follows and the measurement gates before a large training run.
-
 ## Training Commands
 
 ### Stage 1: Base MoE Pre-training (REQUIRED)

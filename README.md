@@ -16,8 +16,6 @@ A novel LLM architecture exploring hallucination mitigation and long-context mem
 
 **Design Goals** (unvalidated): Reduced hallucinations via evidence-grounded verification • Extended context via hierarchical memory • Efficiency via sparse experts • Lower cost via bypassing retrieval and verification on predictable queries
 
-[ARCHITECTURE_REVIEW.md](ARCHITECTURE_REVIEW.md) records a reliability review of the design and the measurements it must pass before a large training run.
-
 ---
 
 ## Quick Start
