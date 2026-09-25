@@ -163,12 +163,20 @@ class MoELayer(nn.Module):
         top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
 
         output = torch.zeros_like(x_flat)
+        unused_expert_term = x_flat.new_zeros(())
         for expert_id, expert in enumerate(self.experts):
             token_idx, slot = (top_k_indices == expert_id).nonzero(as_tuple=True)
             if token_idx.numel() == 0:
+                # ZeRO-2 reduces gradients as hooks fire. Keep every expert in
+                # the graph so ranks with different routes call collectives in
+                # the same order.
+                if self.training:
+                    unused_expert_term = unused_expert_term + expert(x_flat[:1]).sum() * 0
                 continue
             expert_out = expert(x_flat[token_idx]) * top_k_probs[token_idx, slot].unsqueeze(-1)
             output.index_add_(0, token_idx, expert_out.to(output.dtype))
+
+        output = output + unused_expert_term
 
         dispatch = torch.bincount(top_k_indices.reshape(-1), minlength=self.n_experts).float()
         dispatch = dispatch / top_k_indices.numel()

@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from mantis.models.base_moe import MoELayer
 from tests.conftest import DEVICE, seed
 
 
@@ -42,3 +43,21 @@ def test_return_hidden_gives_only_final_hidden(base):
     out = base(torch.randint(4, 300, (1, 5), device=DEVICE), return_hidden=True)
     assert 'hidden_states' not in out
     assert out['last_hidden'].shape == (1, 5, base.d_model)
+
+
+def test_skipped_experts_have_zero_gradients():
+    layer = MoELayer(d_model=8, d_ff=16, n_experts=4, top_k=2, dropout=0).to(DEVICE)
+    layer.train()
+    with torch.no_grad():
+        layer.gate.weight.zero_()
+        layer.gate.bias.copy_(torch.tensor([4., 3., 0., -1.], device=DEVICE))
+
+    output, balance_loss, _ = layer(torch.randn(1, 8, 8, device=DEVICE))
+    (output.sum() + balance_loss).backward()
+
+    for expert in layer.experts:
+        for param in expert.parameters():
+            assert param.grad is not None
+    for expert in layer.experts[2:]:
+        for param in expert.parameters():
+            assert torch.count_nonzero(param.grad) == 0
