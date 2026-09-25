@@ -90,6 +90,19 @@ def test_verified_answer_reports_critic_score(make_engine, critic):
     assert plain['confidence_source'] == 'token_likelihood' and plain['confidence'] == plain['token_likelihood']
 
 
+def test_custom_stop_token_is_reported_outside_response(make_engine, tokenizer, monkeypatch):
+    import mantis.inference.generation as generation
+
+    tokens = iter([tokenizer.vocab['@SP'], tokenizer.vocab['---']])
+    monkeypatch.setattr(generation, 'sample_next_token', lambda *args, **kwargs: next(tokens))
+    engine = make_engine(route_policy='never')
+    result = engine.generate('=EPOCH 1 1000 W0\n', max_length=4, top_k=7,
+                             stop_ids=[tokenizer.vocab['---']])
+    assert result['response'] == '@SP'
+    assert result['stop_token_id'] == tokenizer.vocab['---']
+    assert result['num_tokens'] == 1
+
+
 def test_action_mask_and_expert_bias(make_engine, critic):
     engine = make_engine(critic=critic, route_policy='bypass')
     rollout = engine.generate(QUERY, return_details=True)['rollout']

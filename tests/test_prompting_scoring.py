@@ -44,6 +44,17 @@ def test_prompt_formats(tokenizer):
     assert build_prompt_ids(items, query_ids, tokenizer, 'raw')[-len(query_ids):] == query_ids
 
 
+def test_trace_prompt_preserves_evidence_budget(tokenizer):
+    items = select_evidence([item('E1', 'episodic', '@SP S1 predator 99\n' * 30)],
+                            '@SP S1', 40, tokenizer)
+    query_ids = tokenizer.encode('=EPOCH 1 1000 W7\n')
+    prompt_ids = build_prompt_ids(items, query_ids, tokenizer, 'trace')
+    assert len(prompt_ids) <= 40 + len(query_ids)
+    assert prompt_ids[-len(query_ids):] == query_ids
+    assert '[E1' not in tokenizer.decode(prompt_ids)
+    assert tokenizer.decode(prompt_ids[:-len(query_ids)]).endswith('---\n')
+
+
 def test_word_f1():
     assert word_f1("a b c", "a b c") == 1.0
     assert word_f1("", "") == 1.0

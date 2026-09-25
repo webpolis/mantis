@@ -331,9 +331,10 @@ class MANTISInferenceEngine:
 
     # ------------------------------------------------------------- generation
 
-    def _decode(self, prompt_ids: List[int], max_length: int, temperature: float, top_p: float,
+    def _decode(self, prompt_ids: List[int], max_length: int, temperature: float, top_p: float, top_k: int,
+                stop_ids: Sequence[int],
                 expert_weights: Optional[torch.Tensor], prefill, hidden_rows: Optional[List[torch.Tensor]],
-                cost: Dict) -> Tuple[List[int], List[float]]:
+                cost: Dict) -> Tuple[List[int], List[float], Optional[int]]:
         """
         Generate new tokens (EOS excluded) and their log-probabilities.
 
@@ -343,21 +344,21 @@ class MANTISInferenceEngine:
         tokens, log_probs = [], []
         if prefill is None:
             cost['backbone_tokens'] += min(len(prompt_ids), self.base.max_seq_len)
-        stopped = False
+        stopped = None
         for token, log_prob in generate_tokens(
-            self.base, prompt_ids, max_length, temperature=temperature, top_p=top_p,
-            banned_ids=self.banned_ids, stop_ids=[self.tokenizer.eos_token_id],
+            self.base, prompt_ids, max_length, temperature=temperature, top_k=top_k, top_p=top_p,
+            banned_ids=self.banned_ids, stop_ids=[self.tokenizer.eos_token_id, *stop_ids],
             expert_weights=expert_weights, prefill=prefill, hidden_out=hidden_rows,
         ):
             cost['backbone_tokens'] += 1
-            if token == self.tokenizer.eos_token_id:
-                stopped = True
+            if token == self.tokenizer.eos_token_id or token in stop_ids:
+                stopped = token
                 break
             tokens.append(token)
             log_probs.append(log_prob)
-        if hidden_rows is not None and tokens and not stopped:
+        if hidden_rows is not None and tokens and stopped is None:
             cost['backbone_tokens'] += 1  # the last token's hidden state costs one more step
-        return tokens, log_probs
+        return tokens, log_probs, stopped
 
     def _budget(self, query_len: int, max_length: int) -> int:
         """Evidence tokens that leave room for the query and half a window of generation."""
@@ -412,7 +413,9 @@ class MANTISInferenceEngine:
         evidence: Optional[Sequence[str]] = None,
         force_gates: Optional[Dict[str, bool]] = None,
         explore: bool = False,
-        return_details: bool = False
+        return_details: bool = False,
+        top_k: int = 0,
+        stop_ids: Sequence[int] = (),
     ) -> Dict:
         """
         Generate a response with dynamic routing.
@@ -423,6 +426,9 @@ class MANTISInferenceEngine:
             max_length: Maximum new tokens (default: config)
             temperature: Sampling temperature (default: config)
             top_p: Nucleus sampling parameter (default: config)
+            top_k: Top-k sampling cutoff (0 disables it)
+            stop_ids: Additional token IDs that end the response; the stop
+                token is reported separately and excluded from the response
             namespace: Memory namespace of this caller (plus shared 'global' facts)
             evidence: Oracle evidence texts used instead of retrieval (diagnostics)
             force_gates: Fixed gate decisions by name (route search and ablations);
@@ -511,9 +517,9 @@ class MANTISInferenceEngine:
             prefill, hidden_rows = None, ([] if want_hidden else None)
         else:
             prefill, hidden_rows = query_prefill, (list(hidden) if want_hidden else None)
-        response_ids, log_probs = self._decode(
+        response_ids, log_probs, stop_token_id = self._decode(
             build_prompt_ids(items, query_ids, self.tokenizer, cfg.prompt_format),
-            max_length, temperature, top_p, expert_weights, prefill, hidden_rows, cost,
+            max_length, temperature, top_p, top_k, stop_ids, expert_weights, prefill, hidden_rows, cost,
         )
         timings['generate'] = time.time() - t
 
@@ -535,9 +541,9 @@ class MANTISInferenceEngine:
                     break
                 items = select_evidence(items + more, query, self._budget(len(query_ids), max_length), self.tokenizer)
                 hidden_rows = []
-                response_ids, log_probs = self._decode(
+                response_ids, log_probs, stop_token_id = self._decode(
                     build_prompt_ids(items, query_ids, self.tokenizer, cfg.prompt_format),
-                    max_length, temperature, top_p, expert_weights, None, hidden_rows, cost,
+                    max_length, temperature, top_p, top_k, stop_ids, expert_weights, None, hidden_rows, cost,
                 )
                 critic_score = self._verify(query_ids, response_ids, items, cost)
             abstained = critic_score < cfg.verification_confidence_threshold
@@ -583,6 +589,7 @@ class MANTISInferenceEngine:
             'evidence': [{k: item[k] for k in ('id', 'tier', 'source', 'score')} for item in items],
             'expert_bias_applied': expert_weights is not None,
             'num_tokens': 0 if abstained else len(response_ids),
+            'stop_token_id': stop_token_id,
             'latency': time.time() - start_time,
             'timings': timings,
             'cost': cost,

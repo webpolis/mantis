@@ -485,6 +485,38 @@ python train_evo.py \
 python inference_evo.py checkpoints/evo_train/best_model.pt --new-world --seed 42 --max-ticks 100
 ```
 
+To route **each tick** through episodic and semantic retrieval, the trained
+meta-controller, and critic verification, pass a Stage 3 policy trained against
+the same evolution backbone. Its checkpoint can carry the Stage 2 memory/store
+and Stage 4 critic paths; pass the explicit overrides if those paths moved:
+
+```bash
+python inference_evo.py checkpoints/evo_train/best_model.pt \
+    --new-world --seed 42 --max-ticks 100 \
+    --policy-checkpoint checkpoints/evo_policy/meta_controller_rl.pt \
+    --memory-checkpoint checkpoints/evo_memory/memory_system_final.pt \
+    --semantic-store checkpoints/evo_memory/semantic_memory \
+    --critic-checkpoint checkpoints/evo_critic/critic_best.pt \
+    --memory-dir runtime/evo --namespace world-42
+```
+
+This mode requires all three trained auxiliary artifacts and a raw-format
+evolution generator. The policy chooses which gates run per tick; use
+`--route-policy always` to exercise every available gate in an ablation.
+Retrieved history is prepended as trace text, and generation stops at the
+`---` tick delimiter. An answer rejected by the critic ends the run without
+writing a refusal into the trace. The CLI reports gate counts on stderr.
+
+The Python API accepts the same checkpoint arguments. Inspect
+`engine.last_result` after each yielded tick for route, evidence, confidence,
+and cost; call `engine.close()` to save runtime memory. New runs get a fresh
+memory namespace by default. Reuse `namespace` with `memory_dir` when
+continuing the same world. A long partial trace is ingested before generation.
+Train Stage 2 on evolution context/retrieval pairs, Stage 4 on valid and
+invalid next ticks, and Stage 3 on prefix/next-tick pairs from this same
+backbone before using the full mode. No such trained artifacts are bundled
+with the repository, so its quality and cost benefits remain to be measured.
+
 `web/` holds a browser playground that replays datasets from `data/`, runs the simulator live, or streams a model from `checkpoints/`:
 
 ```bash

@@ -122,7 +122,7 @@ class InferenceConfig:
     verification_retries: int = 1  # Extra retrieve-regenerate-recheck rounds before abstaining
     expert_bias: bool = False      # Gate 4 stays off until it earns its place in ablations
     route_policy: str = 'learned'  # learned | always (every gate open) | never | bypass
-    prompt_format: str = 'raw'     # raw (query only) | chat (roles + evidence block; Stage 5)
+    prompt_format: str = 'raw'     # raw (query only) | chat (Stage 5) | trace (evolution)
     episodic_top_k: int = 3
     semantic_top_k: int = 5
     min_evidence_trust: int = 1    # Semantic entries below this trust level are never cited as facts
@@ -176,7 +176,7 @@ class MANTISConfig:
             )
         if self.inference.route_policy not in ('learned', 'always', 'never', 'bypass'):
             raise ValueError(f"Unknown route_policy: {self.inference.route_policy}")
-        if self.inference.prompt_format not in ('raw', 'chat'):
+        if self.inference.prompt_format not in ('raw', 'chat', 'trace'):
             raise ValueError(f"Unknown prompt_format: {self.inference.prompt_format}")
 
     def save(self, path: str):

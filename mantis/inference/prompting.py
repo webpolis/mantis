@@ -3,10 +3,10 @@ Prompt construction shared by the inference engine, Stage 5 fine-tuning and
 memory rendering: query formatting, evidence blocks with source identifiers,
 and evidence selection under an explicit token budget.
 
-Two prompt formats exist. `raw` feeds the query as-is (Stage 1 models);
-`chat` wraps it in conversation roles and puts evidence in a delimited block
-(the format Stage 5 trains the generator on). Retrieved text is data: it is
-rendered inside its own block, never as instructions.
+`raw` feeds the query as-is (Stage 1 models); `chat` wraps it in conversation
+roles and puts evidence in a delimited block (the format Stage 5 trains the
+generator on). `trace` prepends retrieved history as plain protocol text for
+the evolution model. Retrieved text is data, never instructions.
 """
 
 from collections import Counter
@@ -36,6 +36,8 @@ def render_evidence(item: Dict) -> str:
 
 
 def evidence_block(items: Sequence[Dict], prompt_format: str) -> str:
+    if prompt_format == 'trace':
+        return "".join(_trace_text(item) for item in items)
     lines = "\n".join(render_evidence(item) for item in items)
     if prompt_format == 'chat':
         return f"{EVIDENCE_OPEN}\n{lines}\n{EVIDENCE_CLOSE}\n"
@@ -49,10 +51,25 @@ def item_ids(item: Dict, tokenizer) -> List[int]:
     return item['ids']
 
 
+def _trace_text(item: Dict) -> str:
+    text = item['text'].rstrip()
+    return text + ("\n" if text.endswith('---') else "\n---\n")
+
+
 def build_prompt_ids(items: Sequence[Dict], query_ids: List[int], tokenizer, prompt_format: str) -> List[int]:
-    """Prompt = evidence block (if any), then the formatted query. Mirrors evidence_block() token for token."""
+    """Prompt = budgeted evidence (if any), then the formatted query."""
     if not items:
         return list(query_ids)
+    if prompt_format == 'trace':
+        delimiter = tokenizer.encode("\n---\n")
+        history = []
+        for item in items:
+            limit = len(item_ids(item, tokenizer))
+            ids = tokenizer.encode(_trace_text(item))
+            if len(ids) > limit:
+                ids = tokenizer.encode(item['text'].rstrip())[:max(0, limit - len(delimiter))] + delimiter
+            history.extend(ids)
+        return history + list(query_ids)
     lines = [tid for item in items for tid in item_ids(item, tokenizer)]
     if prompt_format == 'chat':
         return tokenizer.encode(f"{EVIDENCE_OPEN}\n") + lines + tokenizer.encode(f"{EVIDENCE_CLOSE}\n") + list(query_ids)

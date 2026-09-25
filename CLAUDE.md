@@ -178,6 +178,15 @@ python inference_evo.py checkpoints/evo_train/best_model.pt \
 # Generate from custom prompt
 python inference_evo.py checkpoints/evo_train/best_model.pt \
     --prompt "=EPOCH 1 1000 W0"
+
+# Full per-tick routing, retrieval and verification (requires compatible
+# Stage 3 policy, Stage 2 memory/store and Stage 4 critic artifacts)
+python inference_evo.py checkpoints/evo_train/best_model.pt \
+    --new-world --policy-checkpoint checkpoints/evo_policy/meta_controller_rl.pt \
+    --memory-checkpoint checkpoints/evo_memory/memory_system_final.pt \
+    --semantic-store checkpoints/evo_memory/semantic_memory \
+    --critic-checkpoint checkpoints/evo_critic/critic_best.pt \
+    --memory-dir runtime/evo --namespace world-42
 ```
 
 ```python
@@ -188,6 +197,14 @@ engine = EvoInferenceEngine("checkpoints/evo_train/best_model.pt")
 for tick in engine.generate_world(seed=42, temperature=0.7):
     send_to_client(tick)
 ```
+
+With `policy_checkpoint=...` and compatible auxiliary checkpoints,
+`EvoInferenceEngine` uses `MANTISInferenceEngine.generate()` per tick. It
+passes the `---` token as a stop ID, uses the `trace` evidence format, and
+exposes the last route/critic result in `engine.last_result`. Call
+`engine.close()` to persist memory. On critic abstention, it stops rather than
+emitting a non-protocol refusal. The browser playground's model streaming
+path still uses the standalone backbone.
 
 ### RTX 3060 cuBLAS Bug Workaround
 
