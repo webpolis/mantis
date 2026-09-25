@@ -170,6 +170,14 @@ class EpisodicMemory:
             with self._lock:
                 self.entries.clear()
 
+    def delete_namespace(self, namespace: str) -> int:
+        """Remove entries belonging to one namespace; return the number removed."""
+        with self._add_lock:
+            with self._lock:
+                before = len(self.entries)
+                self.entries = deque(e for e in self.entries if e['metadata'].get('namespace') != namespace)
+                return before - len(self.entries)
+
     # ------------------------------------------------------------ persistence
 
     def save(self, path: str) -> None:

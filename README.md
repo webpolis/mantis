@@ -718,7 +718,7 @@ python scripts/run_eval.py checkpoints/stage1/best_model.pt --benchmarks memory 
 - TruthfulQA (lexical proxy: closer by word F1 to a true reference than to any false one; not the official judge)
 - HumanEval (code generation; runs in a Docker container without network when Docker is available, else in a resource-limited subprocess that is not a security boundary)
 - GSM8K (math reasoning)
-- memory (synthetic multi-session recall: facts ingested per session, later updates, distractors and unanswerable questions; `--memory-bench-mode memory` uses the engine's memory, `prompt` prepends every fact seen so far)
+- memory (synthetic multi-session recall: facts ingested per session, later updates, distractors and unanswerable questions; `--memory-bench-mode memory` uses a temporary engine namespace and freezes writes while scoring questions, then deletes the namespace; `prompt` prepends every fact seen so far)
 
 **Metrics**: accuracy over all questions, error rate, coverage and error rate among answered questions (abstentions count), confident-error rate (wrong with confidence ≥ 0.8), ECE, Brier score, area under the risk–coverage curve, pass rate. The engine's confidence is the critic score when the answer was verified, the geometric-mean token probability otherwise, and 0 after an abstention. Benchmarks run on frozen memory by default (`--memory-mode stateful` to keep writing). Reports include p50/p95 latency, mean `compute_units`, peak GPU memory and artifact versions; `--records` writes per-example routes, evidence identifiers and timings.
 

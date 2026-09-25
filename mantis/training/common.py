@@ -2,7 +2,9 @@
 Shared setup for the Stage 1 trainers (train.py and train_evo.py).
 """
 
+import importlib.util
 import math
+import sys
 
 import torch
 
@@ -20,13 +22,26 @@ def build_accelerator(args):
     Returns:
         (accelerator, use_deepspeed)
     """
-    from accelerate import Accelerator, DataLoaderConfiguration, DistributedDataParallelKwargs
+    try:
+        from accelerate import Accelerator, DataLoaderConfiguration, DistributedDataParallelKwargs
+    except ModuleNotFoundError as exc:
+        if exc.name != 'accelerate':
+            raise
+        raise RuntimeError(
+            f"accelerate is missing from {sys.executable}. Install it in the Python environment "
+            "used to launch torchrun (python -m pip install accelerate)."
+        ) from exc
 
     deepspeed_plugin = None
     if args.deepspeed:
         if torch.cuda.device_count() < 2:
             print("Warning: --deepspeed requires multiple GPUs, ignoring flag")
         else:
+            if importlib.util.find_spec('deepspeed') is None:
+                raise RuntimeError(
+                    f"deepspeed is missing from {sys.executable}. Install it in the Python environment "
+                    "used to launch torchrun (python -m pip install deepspeed)."
+                )
             try:
                 from accelerate import DeepSpeedPlugin
                 deepspeed_plugin = DeepSpeedPlugin(

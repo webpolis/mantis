@@ -8,13 +8,15 @@ updates (the old value is not credited), robustness to distractors and
 abstention on unanswerable questions.
 
 Two modes share one dataset:
-- `memory`: each session is ingested into the engine's memory, then the
-  questions run as ordinary queries (memory does the work).
+- `memory`: each session is ingested into a temporary engine namespace, then
+  questions run with writes frozen (memory does the work). The namespace is
+  deleted when scoring ends.
 - `prompt`: every fact seen so far is prepended to the question (the
   "same backbone + recent-text buffer" baseline of the review's ablation
   ladder); works with a bare base model as well.
 """
 
+import contextlib
 import random
 import uuid
 from typing import Dict, List
@@ -145,6 +147,13 @@ class MemoryRecallRunner(BenchmarkRunner):
         """
         sessions, questions = dataset['sessions'], dataset['questions']
         namespace = f"membench-{uuid.uuid4().hex[:8]}"
+        try:
+            return self._run_in_namespace(sessions, questions, namespace)
+        finally:
+            if self.mode == 'memory':
+                self.model.delete_namespace(namespace)
+
+    def _run_in_namespace(self, sessions: List[List[str]], questions: List[Dict], namespace: str) -> Dict:
         print(f"\nRunning memory benchmark: {len(sessions)} sessions, {len(questions)} questions ({self.mode} mode)...")
 
         if self.mode == 'memory':
@@ -153,34 +162,36 @@ class MemoryRecallRunner(BenchmarkRunner):
         history = " ".join(fact for facts in sessions for fact in facts)
 
         records = []
-        for item in tqdm(questions, desc="Memory QA"):
-            if self.mode == 'memory':
-                result = self.model.generate(item['question'], max_length=MAX_NEW_TOKENS, temperature=0.0,
-                                             namespace=namespace)
-                record = {
-                    'response': result['response'], 'confidence': result['confidence'],
-                    'confidence_source': result['confidence_source'], 'abstained': result['abstained'],
-                    'latency': result['latency'], 'path': result['path'],
-                    'evidence': [e['id'] for e in result['evidence']], 'num_tokens': result['num_tokens'],
-                    'compute_units': result['compute_units'], 'timings': result['timings'],
-                }
-                prompt = item['question']
-            else:
-                prompt = f"{history}\nQ: {item['question']}\nA:"
-                record = self.generate_response(prompt, max_length=MAX_NEW_TOKENS)
-            response = record['response'].strip()
-            answered = not record['abstained']
-            if item['unanswerable']:
-                correct = not answered
-            else:
-                correct = answered and answer_correct(response, item['answer'])
-                if correct and item['old_answer'] and answer_correct(response, item['old_answer']):
-                    correct = False  # credited neither the stale value nor a hedge listing both
-            records.append({
-                **record, 'prompt': prompt, 'prediction': response, 'target': item['answer'],
-                'correct': correct, 'kind': item['kind'], 'unanswerable': item['unanswerable'],
-                'old_value': bool(answered and item['old_answer'] and answer_correct(response, item['old_answer'])),
-            })
+        scope = self.model.frozen_memory() if self.is_engine else contextlib.nullcontext()
+        with scope:
+            for item in tqdm(questions, desc="Memory QA"):
+                if self.mode == 'memory':
+                    result = self.model.generate(item['question'], max_length=MAX_NEW_TOKENS, temperature=0.0,
+                                                 namespace=namespace)
+                    record = {
+                        'response': result['response'], 'confidence': result['confidence'],
+                        'confidence_source': result['confidence_source'], 'abstained': result['abstained'],
+                        'latency': result['latency'], 'path': result['path'],
+                        'evidence': [e['id'] for e in result['evidence']], 'num_tokens': result['num_tokens'],
+                        'compute_units': result['compute_units'], 'timings': result['timings'],
+                    }
+                    prompt = item['question']
+                else:
+                    prompt = f"{history}\nQ: {item['question']}\nA:"
+                    record = self.generate_response(prompt, max_length=MAX_NEW_TOKENS)
+                response = record['response'].strip()
+                answered = not record['abstained']
+                if item['unanswerable']:
+                    correct = not answered
+                else:
+                    correct = answered and answer_correct(response, item['answer'])
+                    if correct and item['old_answer'] and answer_correct(response, item['old_answer']):
+                        correct = False  # credited neither the stale value nor a hedge listing both
+                records.append({
+                    **record, 'prompt': prompt, 'prediction': response, 'target': item['answer'],
+                    'correct': correct, 'kind': item['kind'], 'unanswerable': item['unanswerable'],
+                    'old_value': bool(answered and item['old_answer'] and answer_correct(response, item['old_answer'])),
+                })
 
         def rate(flag: str, kind: str) -> float:
             rows = [r for r in records if r['kind'] == kind]

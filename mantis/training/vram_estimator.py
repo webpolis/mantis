@@ -95,7 +95,6 @@ def estimate_training_vram(
     L = config.n_layers
     H = config.n_heads
     F = config.d_ff
-    E = config.n_experts
     K = config.top_k
     V = config.vocab_size
 

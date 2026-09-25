@@ -57,7 +57,8 @@ class EvaluationHarness:
     no interaction is written and no consolidation runs, so results do not
     depend on evaluation order or earlier exposure to evaluation prompts.
     `memory_mode='stateful'` keeps writes on (conversational evaluations).
-    The memory benchmark always runs stateful inside its own namespace.
+    The memory benchmark ingests sessions into its own temporary namespace,
+    freezes writes while scoring questions, then deletes that namespace.
     """
 
     def __init__(self, model, tokenizer, device='cuda', memory_mode='frozen', sandbox=None,
@@ -135,7 +136,7 @@ class EvaluationHarness:
                 all_results[benchmark_name] = results
 
                 # Print summary
-                print(f"\nResults:")
+                print("\nResults:")
                 for metric_name, score in results['metrics'].items():
                     print(f"  {metric_name}: {score:.4f}")
                 for key in ('pass_rate', 'truthfulness_proxy', 'unanswerable_abstention_rate', 'old_value_rate'):

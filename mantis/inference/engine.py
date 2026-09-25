@@ -219,10 +219,10 @@ class MANTISInferenceEngine:
     def save_memory(self, directory: str) -> None:
         """Write the episodic buffer and semantic store to `directory`."""
         os.makedirs(directory, exist_ok=True)
-        if self.episodic is not None:
-            self.episodic.save(os.path.join(directory, 'episodic.pt'))
         if self.semantic is not None:
             self.semantic.save(os.path.join(directory, 'semantic'))
+        if self.episodic is not None:
+            self.episodic.save(os.path.join(directory, 'episodic.pt'))
 
     @contextlib.contextmanager
     def frozen_memory(self):
@@ -251,6 +251,18 @@ class MANTISInferenceEngine:
         if self.consolidator is not None:
             stats['consolidation'] = self.consolidator.get_stats()
         return stats
+
+    def delete_namespace(self, namespace: str) -> None:
+        """Remove all runtime memory belonging to a temporary namespace."""
+        if self.consolidator is not None:
+            self.consolidator.delete_namespace(namespace)
+            return
+        if self.episodic is not None:
+            self.episodic.delete_namespace(namespace)
+        if self.semantic is not None:
+            self.semantic.delete_namespace(namespace)
+        if self.memory_dir:
+            self.save_memory(self.memory_dir)
 
     # --------------------------------------------------------------- ingest
 
@@ -312,6 +324,7 @@ class MANTISInferenceEngine:
         forced = torch.zeros_like(gate_actions)
         if policy == 'always':
             forced = self.gate_mask.clone()
+            forced[:, 0] = 0.0
         elif policy == 'bypass':
             forced[:, 0] = 1.0
         return forced
@@ -349,7 +362,11 @@ class MANTISInferenceEngine:
     def _budget(self, query_len: int, max_length: int) -> int:
         """Evidence tokens that leave room for the query and half a window of generation."""
         reserve = min(max_length, self.base.max_seq_len // 2)
-        return max(0, self.base.max_seq_len - query_len - reserve)
+        if self.config.prompt_format == 'chat':
+            wrapper = len(self.tokenizer.encode('<evidence>\n</evidence>\n'))
+        else:
+            wrapper = len(self.tokenizer.encode('\n'))
+        return max(0, self.base.max_seq_len - query_len - reserve - wrapper)
 
     def _retrieve(self, query_hidden: torch.Tensor, query_emb: torch.Tensor, gates: Dict[str, bool],
                   namespace: str, used: Dict[str, set], scale: int, cost: Dict) -> List[Dict]:

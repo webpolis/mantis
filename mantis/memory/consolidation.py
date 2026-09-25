@@ -193,11 +193,13 @@ class MemoryConsolidator:
         with self._run_lock:
             candidates = self.episodic.candidates(self.min_hits)
             stored, failed = self.store_entries(candidates)
+            if stored and self.persist_dir:
+                self._persist_semantic()
             self.episodic.remove(stored)
             self.stats['cycles'] += 1
             self.stats['last_cycle'] = time.time()
             if stored:
-                self.persist()
+                self._persist_episodic()
             return {
                 'status': 'success' if candidates else 'skipped',
                 'candidates': len(candidates),
@@ -207,14 +209,30 @@ class MemoryConsolidator:
                 'semantic_total': self.semantic.size(),
             }
 
+    def delete_namespace(self, namespace: str) -> None:
+        """Delete a temporary namespace without racing a promotion cycle."""
+        with self._run_lock:
+            self.episodic.delete_namespace(namespace)
+            self.semantic.delete_namespace(namespace)
+            self.persist()
+
     def persist(self) -> None:
         """Checkpoint both stores under persist_dir (no-op without one)."""
+        self._persist_semantic()
+        self._persist_episodic()
+
+    def _persist_semantic(self) -> None:
         if not self.persist_dir:
             return
         import os
         os.makedirs(self.persist_dir, exist_ok=True)
-        self.episodic.save(os.path.join(self.persist_dir, 'episodic.pt'))
         self.semantic.save(os.path.join(self.persist_dir, 'semantic'))
+
+    def _persist_episodic(self) -> None:
+        if not self.persist_dir:
+            return
+        import os
+        self.episodic.save(os.path.join(self.persist_dir, 'episodic.pt'))
 
     def get_stats(self) -> Dict:
         return {**self.stats, 'queue_pending': self._queue.qsize(),

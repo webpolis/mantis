@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from mantis.inference.engine import ABSTENTION, MANTISInferenceEngine
+from mantis.inference.prompting import build_prompt_ids, select_evidence
 from mantis.models.meta_controller import GATES
 from tests.conftest import DEVICE, needs_faiss, needs_mamba, seed
 
@@ -57,6 +58,17 @@ def test_query_filling_window_leaves_no_evidence_budget(make_engine, base):
     assert result['evidence'] == [] and 'ingest' not in result['timings']
 
 
+def test_evidence_budget_includes_prompt_wrapper(make_engine, base, tokenizer, monkeypatch):
+    monkeypatch.setattr(base, 'max_seq_len', 128)
+    engine = make_engine(prompt_format='chat', max_length=1)
+    query_ids = tokenizer.encode('User: question\nAssistant:')
+    candidates = [{'id': 'O0', 'tier': 'oracle', 'text': 'fact ' * 100,
+                   'source': 'external', 'dense': 1.0}]
+    selected = select_evidence(candidates, 'question', engine._budget(len(query_ids), 1), tokenizer)
+    assert selected
+    assert len(build_prompt_ids(selected, query_ids, tokenizer, 'chat')) <= base.max_seq_len - 1
+
+
 def test_abstention_semantics(make_engine, critic):
     engine = make_engine(critic=critic, route_policy='always', verification_confidence_threshold=1.01)
     result = engine.generate(QUERY)
@@ -96,8 +108,8 @@ def test_action_mask_and_expert_bias(make_engine, critic):
 
 def test_route_policies_and_force_gates(make_engine, critic):
     always = make_engine(critic=critic, route_policy='always').generate(QUERY, return_details=True)
-    assert always['routing_decisions'] == {'bypass': True, 'episodic': False, 'semantic': False, 'verification': True}
-    assert always['path'] == 'full' or always['query_entropy'] < always and False  # bypass needs low entropy
+    assert always['routing_decisions'] == {'bypass': False, 'episodic': False, 'semantic': False, 'verification': True}
+    assert always['path'] == 'full'
     never = make_engine(critic=critic, route_policy='never').generate(QUERY, return_details=True)
     assert never['routing_decisions'] == {g: False for g in GATES} and not never['verified']
     learned = make_engine(critic=critic, bypass_uncertainty_threshold=0.0)
@@ -201,6 +213,23 @@ def test_from_checkpoints_rejects_foreign_semantic_store(config, base, tokenizer
     assert engine.semantic.size() == 0 and engine.consolidator is None
     engine.close()
     assert os.path.exists(tmp_path / "state" / "semantic.meta")
+
+
+@needs_faiss
+def test_memory_benchmark_does_not_leave_synthetic_facts(make_engine, base, tokenizer, monkeypatch):
+    from evaluation import make_memory_dataset
+    from evaluation.memory_bench import MemoryRecallRunner
+    from mantis.memory.semantic import SemanticMemory
+    import evaluation.memory_bench as memory_bench
+
+    monkeypatch.setattr(memory_bench, 'MAX_NEW_TOKENS', 1)
+    semantic = SemanticMemory(dimension=base.d_model, index_type='Flat', use_gpu=False)
+    engine = make_engine(semantic=semantic, route_policy='always')
+    dataset = make_memory_dataset(n_sessions=1, facts_per_session=1, updates=0, distractors=0)
+    result = MemoryRecallRunner(engine, tokenizer, device=DEVICE).run(dataset)
+    assert result['num_examples'] == len(dataset['questions'])
+    assert semantic.size() == 0
+    assert engine.config.remember
 
 
 def test_checkpoint_fingerprint_covers_non_embedding_weights(base, tokenizer):

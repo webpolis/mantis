@@ -193,6 +193,35 @@ def test_consolidation_recovers_deduplication_after_restart(tokenizer):
     assert memory.size() == 2
 
 
+@needs_faiss
+def test_consolidation_keeps_source_when_semantic_checkpoint_fails(tokenizer, tmp_path, monkeypatch):
+    from mantis.memory.consolidation import MemoryConsolidator
+
+    memory = make_semantic()
+    entry = {'id': 7, 'segments': segments(tokenizer, 'a fact'),
+             'embedding': vectors(1)[0], 'metadata': {'namespace': 'tenant-a', 'source': 'user'}, 'hits': 1}
+
+    class Source:
+        on_overflow = None
+        def __init__(self):
+            self.entries = [entry]
+        def candidates(self, min_hits):
+            return list(self.entries)
+        def remove(self, stored):
+            self.entries = [e for e in self.entries if e not in stored]
+        def size(self):
+            return len(self.entries)
+
+    source = Source()
+    consolidator = MemoryConsolidator(source, memory, tokenizer, persist_dir=str(tmp_path))
+    def fail_save(path):
+        raise OSError('disk full')
+    monkeypatch.setattr(memory, 'save', fail_save)
+    with pytest.raises(OSError, match='disk full'):
+        consolidator.consolidate()
+    assert source.size() == 1
+
+
 # ----------------------------------------------------------- consolidation
 
 
