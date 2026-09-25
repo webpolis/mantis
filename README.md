@@ -202,7 +202,14 @@ uv run torchrun --nproc_per_node=2 train.py --stage 1 data/train.txt \
     --batch-size 1 \
     --gradient-accumulation-steps 4 \
     --val-split 0.1
+
+# Model too large for one GPU: split its layers over all visible GPUs by free VRAM.
+# Single process (no torchrun); the GPUs run one after another, so this adds capacity, not speed.
+uv run train.py --stage 1 data/train.txt --pipeline --model-size small \
+    --mixed-precision --gradient-checkpointing --batch-size 32 --val-split 0.1
 ```
+
+Under torchrun every rank gets the same batch size: the largest that fits the free VRAM of the smallest GPU, capped by `--batch-size`. `--pipeline` and `--auto-batch` size the batch the same way from the free VRAM the run actually gets.
 
 ### Memory Optimization
 

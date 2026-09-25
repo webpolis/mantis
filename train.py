@@ -96,7 +96,7 @@ from mantis.training.common import (
     build_accelerator, build_optimizer, warmup_cosine_schedule, report_schedule, round_steps_to_accumulation,
 )
 from mantis.training.vram_estimator import (
-    estimate_training_vram, compute_optimal_batch_sizes, format_vram_summary,
+    estimate_training_vram, compute_optimal_batch_sizes, format_vram_summary, plan_layer_placement, format_bytes,
 )
 
 try:
@@ -439,6 +439,43 @@ def shared_batch_size(accelerator, config, seq_len, args, use_deepspeed):
     return batch_size
 
 
+def pipeline_plan(config, seq_len, args):
+    """
+    Largest batch size (at most --batch-size) whose layers fit across the free
+    VRAM of the visible GPUs, in device order. Returns (batch_size, placement).
+    """
+    free = [torch.cuda.mem_get_info(i)[0] for i in range(torch.cuda.device_count())]
+    vram_kwargs = dict(
+        mixed_precision=args.mixed_precision,
+        gradient_checkpointing=args.gradient_checkpointing,
+        use_8bit_optimizer=args.use_8bit_optimizer,
+    )
+    for batch_size in range(args.batch_size, 0, -1):
+        placement = plan_layer_placement(config, seq_len, batch_size, free, safety_margin=0.85, **vram_kwargs)
+        if placement is not None:
+            break
+    else:
+        est = estimate_training_vram(config, seq_len, batch_size=1, **vram_kwargs)
+        raise ValueError(
+            f"Model needs ~{format_bytes(est['total'])} at batch size 1 but the GPUs have "
+            f"{', '.join(format_bytes(f) for f in free)} free. Try --gradient-checkpointing, "
+            f"--use-8bit-optimizer or a smaller --seq-len"
+        )
+    est = estimate_training_vram(config, seq_len, batch_size, **vram_kwargs)
+    print(f"\nPipeline placement (seq_len={seq_len}, batch_size {args.batch_size} → {batch_size}):")
+    for device in range(len(free)):
+        layers = [i for i, d in enumerate(placement) if d == device]
+        used = est['cuda_overhead'] + est['recompute_per_sample'] * batch_size
+        used += len(layers) * (est['layer_fixed'] + est['layer_per_sample'] * batch_size)
+        if device == 0:
+            used += est['head_fixed'] + est['head_per_sample'] * batch_size
+        span = f"layers {layers[0]}-{layers[-1]}" if layers else "no layers"
+        print(f"  GPU {device} ({torch.cuda.get_device_name(device)}): {span}"
+              f"{', embedding and head' if device == 0 else ''}, "
+              f"est. {format_bytes(used)} / {format_bytes(free[device])} free")
+    return batch_size, placement
+
+
 def train(args):
     tokenizer = load_or_create_tokenizer(args.tokenizer_path)
 
@@ -456,7 +493,12 @@ def train(args):
     from accelerate.utils import set_seed
     set_seed(42)
 
-    if torch.cuda.is_available() and (accelerator.num_processes > 1 or args.auto_batch):
+    placement = None
+    if args.pipeline:
+        if accelerator.num_processes > 1:
+            raise ValueError("--pipeline runs in a single process: launch without torchrun")
+        args.batch_size, placement = pipeline_plan(config.base_moe, seq_len, args)
+    elif torch.cuda.is_available() and (accelerator.num_processes > 1 or args.auto_batch):
         args.batch_size = shared_batch_size(accelerator, config.base_moe, seq_len, args, use_deepspeed)
 
     if is_main:
@@ -493,9 +535,16 @@ def train(args):
         print(f"Model: {param_counts['total'] / 1e6:.2f}M total, {param_counts['active'] / 1e6:.2f}M active, "
               f"window {config.base_moe.max_seq_len} tokens")
 
+    if placement is not None:
+        model.place_layers([torch.device('cuda', d) for d in placement])
+
     optimizer = build_optimizer(model, args, use_deepspeed, is_main)
 
-    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+    if placement is not None:
+        # The model already lives on its devices; prepare() would move it to one
+        optimizer, train_loader = accelerator.prepare(optimizer, train_loader)
+    else:
+        model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
     if val_loader is not None:
         val_loader = accelerator.prepare(val_loader)
 
@@ -596,7 +645,10 @@ def train(args):
 
     if is_main:
         print(f"\n{'='*80}")
-        gpu_desc = f"{accelerator.num_processes} GPU(s)" + (" with DeepSpeed ZeRO-2" if use_deepspeed else "")
+        if placement is not None:
+            gpu_desc = f"{len(set(placement))} GPU(s) in a pipeline"
+        else:
+            gpu_desc = f"{accelerator.num_processes} GPU(s)" + (" with DeepSpeed ZeRO-2" if use_deepspeed else "")
         print(f"Training on {gpu_desc}: epochs {start_epoch + 1}-{args.epochs}, "
               f"{steps_per_epoch} steps/epoch")
         print(f"{'='*80}\n")
@@ -621,7 +673,9 @@ def train(args):
                 break
 
             with accelerator.accumulate(model):
-                output = model(batch['input_ids'])
+                # prepare() wraps a replicated model's forward in autocast; a pipelined model is not prepared
+                with accelerator.autocast():
+                    output = model(batch['input_ids'])
                 logits = output['logits']
                 lm_loss = F.cross_entropy(
                     logits.float().view(-1, logits.size(-1)),
@@ -705,7 +759,7 @@ def train(args):
 STAGE1_ONLY_FLAGS = {
     'hf_dataset': None, 'pretokenized': False, 'streaming': False, 'val_file': None,
     'val_split': None, 'mixed_precision': None, 'deepspeed': False, 'cpu_offload': False,
-    'use_8bit_optimizer': False, 'gradient_checkpointing': False, 'auto_batch': False,
+    'use_8bit_optimizer': False, 'gradient_checkpointing': False, 'auto_batch': False, 'pipeline': False,
 }
 
 
@@ -764,6 +818,10 @@ def validate_stage1_args(args):
                 else "Use the tokenizer from the original training run"
             return f"--tokenizer-path required when resuming from checkpoint\n       {hint}"
 
+    if args.pipeline and args.deepspeed:
+        return "--pipeline splits one model over the GPUs; --deepspeed replicates it. Choose one"
+    if args.pipeline and not torch.cuda.is_available():
+        return "--pipeline needs CUDA GPUs"
     if args.val_split and args.val_file:
         return ("Cannot use both --val-split and --val-file. Choose one:\n"
                 "  --val-split: Auto-split from training data (convenience mode)\n"
@@ -855,6 +913,9 @@ Examples:
 
   # Mixed VRAM GPUs: Use gradient accumulation (effective batch: 2×4×N_GPUs)
   python train.py data/train.txt --gradient-accumulation-steps 4 --batch-size 2 --val-split 0.1
+
+  # Model too large for one GPU: split its layers over all GPUs by free VRAM
+  python train.py data/train.txt --pipeline --model-size small --gradient-checkpointing --val-split 0.1
 
   # LATER STAGES (JSONL data file optional; demo data otherwise)
   # ============================================================
@@ -976,6 +1037,10 @@ Examples:
                         help='Enable DeepSpeed ZeRO-2 for multi-GPU training')
     parser.add_argument('--cpu-offload', action='store_true',
                         help='Offload DeepSpeed optimizer state to CPU (requires --deepspeed)')
+    parser.add_argument('--pipeline', action='store_true',
+                        help='Split the layers over all visible GPUs by free VRAM (single process, no torchrun). '
+                             'Fits a larger model than one GPU holds; the GPUs run one after another. '
+                             'Sizes the batch like --auto-batch')
     parser.add_argument('--auto-batch', action='store_true',
                         help='Automatically set batch size based on VRAM estimation '
                              '(always active for multi-GPU; this flag enables it for single-GPU too). '

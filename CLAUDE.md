@@ -46,6 +46,10 @@ uv run torchrun --nproc_per_node=2 train.py --stage 1 data/train.txt \
     --gradient-checkpointing \
     --use-8bit-optimizer \
     --val-split 0.1
+
+# Model larger than one GPU: layers placed over all visible GPUs by free VRAM (single process)
+uv run train.py --stage 1 data/train.txt --pipeline --model-size small \
+    --mixed-precision --gradient-checkpointing --val-split 0.1
 ```
 
 ### Stages 2-5 (OPTIONAL)
@@ -270,7 +274,7 @@ mantis/
 │   ├── critic_train.py  # Stage 4: Critic training with calibration split
 │   ├── sft.py           # Stage 5: instruction / evidence dataset in the engine's prompt format
 │   ├── scoring.py       # Lexical answer correctness shared by rewards and evaluation
-│   └── vram_estimator.py  # Analytic parameter and VRAM estimate per preset
+│   └── vram_estimator.py  # Parameter/VRAM estimate per preset, batch size from free VRAM, layer placement
 ├── inference/           # Generation engine
 │   ├── generation.py    # Shared decode loop (cache, window, sampling, prefill reuse)
 │   ├── prompting.py     # Query formats, evidence block with source ids, budgeted selection
@@ -426,7 +430,8 @@ When modifying model architectures:
 ### Training Modifications
 
 The main training script (`train.py`) uses HuggingFace Accelerate for:
-- Multi-GPU training (auto-detected)
+- Multi-GPU training: one process per GPU under `torchrun` (DDP, or DeepSpeed ZeRO-2 with `--deepspeed`). Every rank uses the same batch size, the largest that fits the smallest GPU's free VRAM, because Accelerate shards the index stream by batch number
+- `--pipeline` (single process): `BaseMoEModel.place_layers` hosts each block on a device chosen by `plan_layer_placement`, filling free VRAM in device order; the embedding and tied head stay on the first device and the hidden state moves between them. Fits a larger model, runs the GPUs in turn. Pipelined models use reentrant gradient checkpointing (the non-reentrant form recomputes every block at once across devices)
 - Mixed precision (FP16)
 - Gradient accumulation
 - DeepSpeed ZeRO-2 (optional; checkpoints then omit the sharded optimizer state)

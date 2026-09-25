@@ -6,6 +6,8 @@ rotary positional embeddings, grouped-query attention and a projected
 key/value cache.
 """
 
+import contextlib
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -79,13 +81,16 @@ class CausalSelfAttention(nn.Module):
             k = torch.cat([past_kv[0], k], dim=2)
             v = torch.cat([past_kv[1], v], dim=2)
 
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=attn_mask is None,
-            enable_gqa=self.n_kv_heads != self.n_heads,
-        )
+        # SDPA picks its kernel from the current device, not q's: a pipelined
+        # layer on an older GPU would otherwise get the Ampere flash kernel
+        with torch.cuda.device(q.device) if q.is_cuda else contextlib.nullcontext():
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=attn_mask is None,
+                enable_gqa=self.n_kv_heads != self.n_heads,
+            )
         out = out.transpose(1, 2).reshape(batch, seq_len, d_model)
         return self.out(out), ((k, v) if use_cache else None)
 
@@ -449,9 +454,16 @@ class BaseMoEModel(nn.Module):
                 layer_bias = layer_bias.to(device) if layer_bias is not None else None
 
             if self.gradient_checkpointing and self.training:
+                # A non-reentrant checkpoint recomputes the block as soon as a
+                # grad reaches any of its outputs. With layers on several
+                # devices, the idle device's backward thread reaches the
+                # load-balance outputs of all its blocks at once and holds every
+                # recompute alive; the reentrant form waits for all output grads.
+                # DDP with find_unused_parameters rejects the reentrant form, so
+                # replicated training keeps the non-reentrant one.
                 x, load_loss, dispatch, present_kv = torch.utils.checkpoint.checkpoint(
                     layer, x, rope, attn_mask, layer_bias, None, False,
-                    use_reentrant=False
+                    use_reentrant=self.layer_devices is not None
                 )
             else:
                 x, load_loss, dispatch, present_kv = layer(x, rope, attn_mask, layer_bias, layer_past, use_cache)
