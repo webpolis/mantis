@@ -16,6 +16,10 @@ Usage:
         --model-size tiny --seq-len 2048 --batch-size 8 --steps-per-epoch 1000 --epochs 20 \
         --learning-rate 5e-4 --warmup-steps 2000 --mixed-precision --val-split 0.1
 
+    # Prepare the reusable token cache before a GPU run (optional)
+    python train_evo.py --bio data/evo_bio.txt --eco data/evo_eco.txt \
+        --intel data/evo_intel.txt --prepare-data-only
+
     # Resume from checkpoint
     python train_evo.py --bio data/evo_bio.txt --resume checkpoints/evo_train/best_model.pt \
         --tokenizer-path checkpoints/evo_train/tokenizer --steps-per-epoch 1000 --epochs 40 --val-split 0.1
@@ -23,6 +27,12 @@ Usage:
 
 import os
 import subprocess
+import hashlib
+import json
+import shutil
+import tempfile
+from bisect import bisect_right
+from pathlib import Path
 
 os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ["NCCL_IB_DISABLE"] = "1"
@@ -51,6 +61,7 @@ import math
 import argparse
 import random
 import numpy as np
+import fcntl
 from tqdm import tqdm
 import warnings
 
@@ -73,70 +84,164 @@ from mantis.training.common import (
 # Datasets
 # ---------------------------------------------------------------------------
 
+EVO_CACHE_VERSION = 1
+
+
+def _evo_cache_identity(file_path, tokenizer):
+    source = Path(file_path).resolve()
+    stat = source.stat()
+    return {
+        'version': EVO_CACHE_VERSION,
+        'source': str(source),
+        'size': stat.st_size,
+        'mtime_ns': stat.st_mtime_ns,
+        'tokenizer': tokenizer.fingerprint(),
+    }
+
+
+def _valid_evo_cache(cache_path, identity):
+    try:
+        with (cache_path / 'metadata.json').open(encoding='utf-8') as f:
+            metadata = json.load(f)
+        ends = metadata['world_ends']
+        total = metadata['total_tokens']
+        pad_id = metadata['pad_token_id']
+        if (metadata['identity'] != identity or not ends or ends[-1] != total
+                or not isinstance(pad_id, int)
+                or any(a >= b for a, b in zip([0] + ends[:-1], ends))):
+            return None
+        if (cache_path / 'tokens.bin').stat().st_size != total * np.dtype(np.uint16).itemsize:
+            return None
+        if (cache_path / 'weights.bin').stat().st_size != total * np.dtype(np.float16).itemsize:
+            return None
+        return metadata
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
+
+
+def ensure_evo_cache(file_path, tokenizer, cache_dir, verbose=True):
+    """Tokenize once, then reuse immutable, memory-mappable arrays across ranks."""
+    identity = _evo_cache_identity(file_path, tokenizer)
+    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
+    cache_root = Path(cache_dir)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_root / key
+
+    with (cache_root / f'{key}.lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        metadata = _valid_evo_cache(cache_path, identity)
+        if metadata is None:
+            if verbose:
+                print(f"Preparing evolution cache (one-time): {file_path}", flush=True)
+            temp_path = Path(tempfile.mkdtemp(prefix=f'{key}.tmp.', dir=cache_root))
+            try:
+                world_ends = []
+                total_tokens = 0
+                with (temp_path / 'tokens.bin').open('wb') as token_file, \
+                     (temp_path / 'weights.bin').open('wb') as weight_file:
+                    for text in tqdm(iter_documents(file_path), desc='Tokenizing worlds', unit='world', disable=not verbose):
+                        tokens = np.asarray(tokenizer.encode(text) + [tokenizer.eos_token_id], dtype=np.uint16)
+                        weights = tokenizer.compute_loss_weights(
+                            torch.from_numpy(tokens.astype(np.int64))
+                        ).numpy().astype(np.float16)
+                        tokens.tofile(token_file)
+                        weights.tofile(weight_file)
+                        total_tokens += len(tokens)
+                        world_ends.append(total_tokens)
+                if not world_ends:
+                    raise ValueError(f'No worlds found in {file_path}')
+                if _evo_cache_identity(file_path, tokenizer) != identity:
+                    raise RuntimeError(f'{file_path} changed while its cache was being built; retry')
+                metadata = {
+                    'identity': identity,
+                    'world_ends': world_ends,
+                    'total_tokens': total_tokens,
+                    'pad_token_id': tokenizer.pad_token_id,
+                }
+                with (temp_path / 'metadata.json').open('w', encoding='utf-8') as f:
+                    json.dump(metadata, f)
+                if cache_path.exists():
+                    shutil.rmtree(cache_path)
+                os.replace(temp_path, cache_path)
+            finally:
+                if temp_path.exists():
+                    shutil.rmtree(temp_path)
+        elif verbose:
+            print(f"Reusing evolution cache: {file_path}", flush=True)
+    return cache_path, metadata
+
+
 class EvoWorldDataset(Dataset):
     """
-    Map-style dataset of one partition file, chunked per world.
+    Map-style dataset of one partition file, chunked per world on demand.
 
     Worlds are blank-line separated; chunks never cross a world boundary.
-    Per-token loss weights are computed over the whole world (so a chunk that
-    starts mid-block keeps its layer's weight) and zeroed where the label is
-    ignored.
+    Token IDs and whole-world loss weights are memory-mapped from a reusable
+    cache, so ranks share the OS page cache without copying every padded chunk.
     """
 
-    def __init__(self, file_path=None, tokenizer=None, seq_len=2048, worlds=None):
-        """Build from `file_path`, or wrap already-chunked `worlds` (see split_by_world)."""
+    def __init__(self, file_path=None, tokenizer=None, seq_len=2048, cache_dir='data/.evo_cache',
+                 cache=None, worlds=None, verbose=True):
         self.seq_len = seq_len
-        if worlds is not None:
-            self.worlds = worlds
-        else:
-            print(f"Loading evolution dataset: {file_path}")
-            self.worlds = [self._chunk_world(tokenizer, text) for text in iter_documents(file_path)]
-            print(f"  Found {len(self.worlds)} worlds")
-        self.sequences = [chunk for world in self.worlds for chunk in world]
-        if file_path:
-            total = sum(chunk[3] for chunk in self.sequences)
-            print(f"  Total tokens: {total:,}")
-            print(f"  Sequences: {len(self.sequences):,}")
+        if cache is None:
+            cache = ensure_evo_cache(file_path, tokenizer, cache_dir, verbose=verbose)
+        self.cache = cache
+        cache_path, metadata = cache
+        self.tokens = np.memmap(cache_path / 'tokens.bin', dtype=np.uint16, mode='r')
+        self.weights = np.memmap(cache_path / 'weights.bin', dtype=np.float16, mode='r')
+        self.world_ends = metadata['world_ends']
+        self.worlds = list(range(len(self.world_ends))) if worlds is None else list(worlds)
+        self.pad_token_id = metadata['pad_token_id']
 
-    def _chunk_world(self, tokenizer, text):
-        tokens = tokenizer.encode(text) + [tokenizer.eos_token_id]
-        weights = tokenizer.compute_loss_weights(torch.tensor(tokens)).numpy()
-        pad = tokenizer.pad_token_id
-        chunks = []
-        for start in range(0, len(tokens) - 1, self.seq_len):
-            window = tokens[start:start + self.seq_len + 1]
-            n_real = len(window)
-            input_ids = np.full(self.seq_len, pad, dtype=np.int16)
-            labels = np.full(self.seq_len, -100, dtype=np.int16)
-            loss_w = np.zeros(self.seq_len, dtype=np.float16)
-            input_ids[:n_real - 1] = window[:-1]
-            labels[:n_real - 1] = window[1:]
-            loss_w[:n_real - 1] = weights[start:start + n_real - 1]
-            chunks.append((input_ids, labels, loss_w, n_real - 1))
-        return chunks
+        chunk_counts = []
+        self.real_tokens = 0
+        for world in self.worlds:
+            start = self.world_ends[world - 1] if world else 0
+            real = self.world_ends[world] - start - 1
+            self.real_tokens += real
+            chunk_counts.append((real + seq_len - 1) // seq_len)
+        self.chunk_ends = np.cumsum(chunk_counts).tolist()
+        if file_path and verbose:
+            print(f"  Found {len(self.worlds)} worlds")
+            print(f"  Total tokens: {self.real_tokens:,}")
+            print(f"  Sequences: {len(self):,}")
 
     def split_by_world(self, val_fraction, seed=42):
         """Return (train, val) datasets holding disjoint sets of whole worlds."""
-        order = list(range(len(self.worlds)))
+        order = list(self.worlds)
         random.Random(seed).shuffle(order)
         n_val = max(1, int(len(order) * val_fraction))
         if n_val >= len(order):
             raise ValueError(f"Cannot split {len(order)} world(s) into train and validation")
-        pick = lambda idx: EvoWorldDataset(seq_len=self.seq_len, worlds=[self.worlds[i] for i in idx])
+        def pick(indices):
+            return EvoWorldDataset(seq_len=self.seq_len, cache=self.cache, worlds=indices, verbose=False)
         return pick(order[n_val:]), pick(order[:n_val])
 
     def mean_tokens(self):
-        return sum(chunk[3] for chunk in self.sequences) / max(1, len(self.sequences))
+        return self.real_tokens / max(1, len(self))
 
     def __len__(self):
-        return len(self.sequences)
+        return self.chunk_ends[-1] if self.chunk_ends else 0
 
     def __getitem__(self, idx):
-        input_ids, labels, loss_w, _ = self.sequences[idx]
+        if idx < 0 or idx >= len(self):
+            raise IndexError(idx)
+        world_pos = bisect_right(self.chunk_ends, idx)
+        world = self.worlds[world_pos]
+        previous_chunks = self.chunk_ends[world_pos - 1] if world_pos else 0
+        world_start = self.world_ends[world - 1] if world else 0
+        start = world_start + (idx - previous_chunks) * self.seq_len
+        n_real = min(self.seq_len, self.world_ends[world] - start - 1)
+        input_ids = np.full(self.seq_len, self.pad_token_id, dtype=np.int64)
+        labels = np.full(self.seq_len, -100, dtype=np.int64)
+        loss_w = np.zeros(self.seq_len, dtype=np.float32)
+        input_ids[:n_real] = self.tokens[start:start + n_real]
+        labels[:n_real] = self.tokens[start + 1:start + n_real + 1]
+        loss_w[:n_real] = self.weights[start:start + n_real]
         return {
-            'input_ids': torch.from_numpy(input_ids.astype(np.int64)),
-            'labels': torch.from_numpy(labels.astype(np.int64)),
-            'loss_weights': torch.from_numpy(loss_w.astype(np.float32)),
+            'input_ids': torch.from_numpy(input_ids),
+            'labels': torch.from_numpy(labels),
+            'loss_weights': torch.from_numpy(loss_w),
         }
 
 
@@ -301,16 +406,21 @@ def train(args):
         config.base_moe.max_seq_len = args.seq_len
     config.base_moe.vocab_size = len(tokenizer)
 
+    partition_files = {'bio': args.bio, 'eco': args.eco, 'intel': args.intel}
+    if os.environ.get('RANK', '0') == '0':
+        print("\nPreparing datasets...")
+    prepared = {
+        path: ensure_evo_cache(path, tokenizer, args.cache_dir)
+        for path in dict.fromkeys(p for p in [*partition_files.values(), args.val_file] if p)
+    }
+
     accelerator, use_deepspeed = build_accelerator(args)
     is_main = accelerator.is_main_process
     from accelerate.utils import set_seed
     set_seed(42)
 
-    # Datasets
-    if is_main:
-        print("\nLoading datasets...")
-    partition_files = {'bio': args.bio, 'eco': args.eco, 'intel': args.intel}
-    partitions = {name: EvoWorldDataset(path, tokenizer, seq_len=args.seq_len)
+    partitions = {name: EvoWorldDataset(path, seq_len=args.seq_len,
+                                         cache=prepared[path], verbose=is_main)
                   for name, path in partition_files.items() if path}
 
     val_datasets = []
@@ -323,7 +433,8 @@ def train(args):
                 print(f"  {name}: {len(train_ds.worlds)} train / {len(val_ds.worlds)} val worlds "
                       f"({len(train_ds)} / {len(val_ds)} sequences)")
     elif args.val_file:
-        val_datasets.append(EvoWorldDataset(args.val_file, tokenizer, seq_len=args.seq_len))
+        val_datasets.append(EvoWorldDataset(args.val_file, seq_len=args.seq_len,
+                                            cache=prepared[args.val_file], verbose=is_main))
 
     schedules = {
         'default': CurriculumDataset.DEFAULT_SCHEDULE,
@@ -558,6 +669,10 @@ def main():
     # Output
     parser.add_argument('--output-dir', type=str, default='./checkpoints/evo_train',
                         help='Output directory (default: ./checkpoints/evo_train)')
+    parser.add_argument('--cache-dir', type=str, default='data/.evo_cache',
+                        help='Reusable token cache directory (default: data/.evo_cache)')
+    parser.add_argument('--prepare-data-only', action='store_true',
+                        help='Build token caches and exit without starting training')
 
     # Tokenizer
     parser.add_argument('--tokenizer-path', type=str,
@@ -578,7 +693,7 @@ def main():
     parser.add_argument('--learning-rate', type=float, default=5e-4, help='Peak learning rate (default: 5e-4)')
     parser.add_argument('--weight-decay', type=float, default=0.01, help='Weight decay (default: 0.01)')
     parser.add_argument('--warmup-steps', type=int, default=2000, help='Warmup optimizer steps (default: 2000)')
-    parser.add_argument('--steps-per-epoch', type=int, required=True,
+    parser.add_argument('--steps-per-epoch', type=int,
                         help='Micro-batches per epoch (the curriculum stream is endless)')
     parser.add_argument('--grad-clip', type=float, default=1.0, help='Gradient clipping (default: 1.0)')
 
@@ -607,6 +722,8 @@ def main():
                         help='Offload DeepSpeed optimizer state to CPU (requires --deepspeed)')
 
     args = parser.parse_args()
+    if not args.prepare_data_only and args.steps_per_epoch is None:
+        parser.error('--steps-per-epoch is required for training')
 
     # Validate
     for flag, path in (('Bio partition', args.bio), ('Eco partition', args.eco),
@@ -627,6 +744,13 @@ def main():
         print("Error: --tokenizer-path required when resuming")
         if os.path.exists(tokenizer_dir):
             print(f"       Try: --tokenizer-path {tokenizer_dir}")
+        return
+
+    if args.prepare_data_only:
+        tokenizer = MANTISTokenizer.load(args.tokenizer_path) if args.tokenizer_path else MANTISTokenizer()
+        for path in dict.fromkeys(p for p in (args.bio, args.eco, args.intel, args.val_file) if p):
+            ensure_evo_cache(path, tokenizer, args.cache_dir)
+        print(f"Evolution data cache ready: {args.cache_dir}")
         return
 
     print(f"\n{'='*80}")
