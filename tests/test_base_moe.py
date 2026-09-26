@@ -67,12 +67,13 @@ def test_skipped_experts_have_zero_gradients():
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
 def test_placed_layers_match_single_device_model(config):
-    cfg = dataclasses.replace(config.base_moe, dropout=0.0)
+    # Two blocks on the second device: every block there must get that device's RoPE tables
+    cfg = dataclasses.replace(config.base_moe, dropout=0.0, n_layers=3)
     seed()
     single = BaseMoEModel.from_config(cfg).to('cuda:0')
     placed = BaseMoEModel.from_config(cfg)
     placed.load_state_dict(single.state_dict())
-    placed.place_layers(['cuda:0', 'cuda:1'])
+    placed.place_layers(['cuda:0', 'cuda:1', 'cuda:1'])
     placed.gradient_checkpointing_enable()
     assert placed.lm_head.weight.data_ptr() == placed.token_embedding.weight.data_ptr()
     assert placed.layers[1].attn.q_proj.weight.device == torch.device('cuda:1')

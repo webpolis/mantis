@@ -651,16 +651,17 @@ class BaseMoEModel(nn.Module):
         present_key_values = KVCache(length=past_len + seq_len) if use_cache else None
 
         for i, layer in enumerate(self.layers):
-            layer_past = past_key_values[i] if past_key_values else None
-            layer_bias = expert_weights[:, i] if expert_weights is not None else None
-            rope = rope_global if self.is_global(i) else rope_local
-
             if self.layer_devices is not None and x.device != self.layer_devices[i]:
                 device = self.layer_devices[i]
                 x = x.to(device)
-                rope = (rope[0].to(device), rope[1].to(device))
+                rope_local = (rope_local[0].to(device), rope_local[1].to(device))
+                rope_global = (rope_global[0].to(device), rope_global[1].to(device))
                 attn_mask = attn_mask.to(device) if attn_mask is not None else None
-                layer_bias = layer_bias.to(device) if layer_bias is not None else None
+                expert_weights = expert_weights.to(device) if expert_weights is not None else None
+
+            layer_past = past_key_values[i] if past_key_values else None
+            layer_bias = expert_weights[:, i] if expert_weights is not None else None
+            rope = rope_global if self.is_global(i) else rope_local
 
             if self.gradient_checkpointing and self.training:
                 # A non-reentrant checkpoint recomputes the block as soon as a
