@@ -38,6 +38,7 @@ HuggingFace datasets (use only 10% of data):
 """
 
 import os
+import sys
 
 # Enable expandable segments to reduce CUDA memory fragmentation.
 # Without this, PyTorch's caching allocator can fail to serve large contiguous
@@ -63,7 +64,7 @@ warnings.filterwarnings('ignore', message='.*lr_scheduler.step.*optimizer.step.*
 
 from mantis.models import BaseMoEModel
 from mantis.configs.model_config import (
-    get_micro_config, get_tiny_config, get_small_config, get_medium_config, get_base_config,
+    get_micro_config, get_tiny_config, get_small_config, get_medium_config, get_base_config, default_global_layers,
 )
 from mantis.tokenizer import BPETokenizer, MANTISTokenizer, load_tokenizer
 from mantis.data import (
@@ -184,6 +185,40 @@ def compute_perplexity(loss):
     return math.exp(min(loss, 100))
 
 
+LAYOUT_FIELDS = ('local_window', 'global_layers', 'rope_factor', 'rope_original_context')
+
+
+def layout_overrides(args, base, seq_len, trained_len):
+    """
+    Attention-layout fields to set on `base`: the explicit flags, plus, under
+    --profile long-context on a new schedule, defaults that keep the source
+    model's function up to its trained length: local window = trained length,
+    every fifth and the last layer global, YaRN factor = seq_len / trained length.
+    """
+    layout = {k: getattr(args, k) for k in LAYOUT_FIELDS if getattr(args, k) is not None}
+    if args.profile == 'long-context' and not args.resume:
+        original = layout.setdefault('rope_original_context', trained_len if not base.local_window
+                                     else base.rope_original_context)
+        layout.setdefault('local_window', base.local_window or original)
+        layout.setdefault('global_layers', base.global_layers or default_global_layers(base.n_layers))
+        layout.setdefault('rope_factor', max(1.0, seq_len / original))
+    elif layout.get('local_window') and not base.local_window:
+        layout.setdefault('rope_original_context', trained_len)
+    return layout
+
+
+def apply_profile(args):
+    """--profile long-context: the memory settings a very long sequence needs on one GPU."""
+    if args.profile != 'long-context':
+        return
+    args.gradient_checkpointing = True
+    args.residual_dtype = 'bf16'
+    args.moe_chunk = args.moe_chunk or 4096
+    args.loss_chunk = args.loss_chunk or 1024
+    args.mixed_precision = args.mixed_precision or 'bf16'
+    args.activation_offload = int(os.environ.get('WORLD_SIZE', '1')) == 1 and not (args.pipeline or args.deepspeed)
+
+
 def resolve_model_config(args, tokenizer, seq_len):
     """
     Resolve model config from checkpoint or model-size preset.
@@ -202,18 +237,11 @@ def resolve_model_config(args, tokenizer, seq_len):
             raise ValueError(f"Checkpoint missing 'config' key: {source}")
         check_tokenizer(checkpoint, tokenizer, source)
         config = checkpoint['config']
-        if seq_len > config.base_moe.max_seq_len:
-            print(f"Extending attention window {config.base_moe.max_seq_len} → {seq_len}")
-            config.base_moe.max_seq_len = seq_len
-        layout = {k: v for k, v in vars(args).items()
-                  if k in ('local_window', 'global_layers', 'rope_factor', 'rope_original_context') and v is not None}
-        if args.resume:
-            changed = {k: v for k, v in layout.items() if getattr(config.base_moe, k) != v}
-            if changed:
-                raise ValueError(f"--resume continues the checkpoint's attention layout; {changed} differ. "
-                                 "Use --init-from to start a new schedule with a new layout")
-        for k, v in layout.items():
-            setattr(config.base_moe, k, v)
+        base = config.base_moe
+        trained_len = base.rope_original_context if base.local_window else base.max_seq_len
+        if seq_len > base.max_seq_len:
+            print(f"Extending attention window {base.max_seq_len} → {seq_len}")
+            base.max_seq_len = seq_len
     else:
         config = {
             'micro': get_micro_config,
@@ -223,9 +251,15 @@ def resolve_model_config(args, tokenizer, seq_len):
             'base': get_base_config
         }[args.model_size]()
         config.base_moe.max_seq_len = seq_len
-        for k in ('local_window', 'global_layers', 'rope_factor', 'rope_original_context'):
-            if getattr(args, k) is not None:
-                setattr(config.base_moe, k, getattr(args, k))
+        trained_len = seq_len
+    layout = layout_overrides(args, config.base_moe, seq_len, trained_len)
+    if args.resume:
+        changed = {k: v for k, v in layout.items() if getattr(config.base_moe, k) != v}
+        if changed:
+            raise ValueError(f"--resume continues the checkpoint's attention layout; {changed} differ. "
+                             "Use --init-from to start a new schedule with a new layout")
+    for k, v in layout.items():
+        setattr(config.base_moe, k, v)
     # The verifier reads the base model's hidden states, so its input budget
     # cannot exceed the context window selected for this training run.
     config.critic.max_seq_len = min(config.critic.max_seq_len, config.base_moe.max_seq_len)
@@ -772,7 +806,7 @@ STAGE1_ONLY_FLAGS = {
     'tokenizer': 'bpe', 'vocab_size': 32768, 'tokenizer_train_docs': 100_000,
     'init_from': None, 'local_window': None, 'global_layers': None, 'rope_factor': None,
     'rope_original_context': None, 'moe_chunk': 0, 'loss_chunk': 0, 'activation_offload': False,
-    'residual_dtype': 'fp32',
+    'residual_dtype': 'fp32', 'profile': None, 'length_schedule': None, 'extension_lr': 1e-5,
 }
 
 
@@ -811,6 +845,16 @@ def validate_pipeline_args(args):
             if not os.path.isdir(sibling):
                 return f"--tokenizer-path required with --init-from (none found at {sibling})"
             args.tokenizer_path = sibling
+    if args.length_schedule:
+        if args.resume:
+            return "--length-schedule resumes itself: rerun the same command (without --resume)"
+        if args.pretokenized:
+            return "--length-schedule packs each phase at its own length; use raw text, JSONL or --hf-dataset"
+        try:
+            from mantis.training.length_schedule import parse_schedule
+            parse_schedule(args.length_schedule)
+        except ValueError as exc:
+            return f"--length-schedule: {exc}"
     if args.activation_offload and not args.gradient_checkpointing:
         return "--activation-offload moves checkpoint boundaries; add --gradient-checkpointing"
     if args.activation_offload and (args.deepspeed or args.pipeline):
@@ -897,6 +941,7 @@ def main():
     torch.set_float32_matmul_precision('high')
     parser = argparse.ArgumentParser(
         description='Train MANTIS Model',
+        allow_abbrev=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1106,6 +1151,16 @@ Examples:
                         help='Tokens per head/cross-entropy pass (0 = whole sequence); 1024 bounds the logits')
     parser.add_argument('--activation-offload', action='store_true',
                         help='Keep gradient-checkpoint boundaries in pinned host RAM (single GPU)')
+    parser.add_argument('--profile', choices=['long-context'],
+                        help='long-context: gradient checkpointing, bf16 residual stream, chunked experts and '
+                             'loss, checkpoint boundaries in host RAM (single GPU), bf16 autocast; on a new '
+                             'schedule also the local/global layout with YaRN (factor = --seq-len / trained length)')
+    parser.add_argument('--length-schedule', type=str,
+                        help='Context extension in one command: LENGTH:TOKENS phases, e.g. '
+                             '32768:130M,131072:200M,262144:650M. Each phase runs from the previous one\'s final '
+                             'model (the first from --init-from) in <output-dir>/ctx-LENGTH; rerun to resume')
+    parser.add_argument('--extension-lr', type=float, default=1e-5,
+                        help='Peak learning rate of the phases longer than the pretraining length (default: 1e-5)')
     parser.add_argument('--residual-dtype', choices=['fp32', 'bf16'], default='fp32',
                         help='Storage dtype of the residual stream; bf16 halves the boundaries (default: fp32)')
     parser.add_argument('--auto-batch', action='store_true',
@@ -1114,17 +1169,22 @@ Examples:
                              'The --batch-size value becomes the ceiling.')
 
     args = parser.parse_args()
+    apply_profile(args)
 
     validators = {1: validate_stage1_args, 5: validate_sft_args}
     error = validators.get(args.stage, validate_later_stage_args)(args)
     if error:
         print(f"Error: {error}")
-        return
+        sys.exit(1)
 
     if args.stage == 1 and args.learning_rate is None:
         args.learning_rate = 3e-4
     if args.stage == 5 and args.learning_rate is None:
         args.learning_rate = compat_load(args.resume)['config'].training.sft_lr
+
+    if args.length_schedule:
+        from mantis.training.length_schedule import run_length_schedule
+        sys.exit(run_length_schedule(args, sys.argv[1:], os.path.abspath(__file__)))
 
     if args.streaming and args.num_workers > 0:
         print(f"\n⚠️  Streaming mode detected: setting num_workers=0 (was {args.num_workers})")

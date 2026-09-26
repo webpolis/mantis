@@ -56,22 +56,24 @@ uv run train.py --stage 1 data/train.txt --pipeline --model-size small \
 
 ### Long Context (256K)
 
-Context extension is a second Stage 1 run that starts from the pretrained weights (`--init-from`, a new schedule) with a local/global attention layout: every layer attends to the last `--local-window` tokens except `--global-layers`, which see the whole window with YaRN-scaled RoPE (`--rope-factor` = target length / `--rope-original-context`). Up to the window the layout computes the same function as the plain model, so the checkpoint carries over unchanged. Per-sequence memory is bounded by `--moe-chunk`, `--loss-chunk`, `--activation-offload` and `--residual-dtype bf16` (single GPU); measured on an RTX 3060, the tiny preset with a 32K vocabulary trains at 262,144 tokens in 6.4 GB.
+Context extension continues a pretrained checkpoint at longer lengths with a local/global attention layout: every layer attends to the last `--local-window` tokens except `--global-layers`, which see the whole window with YaRN-scaled RoPE (factor = length / trained length). With the window equal to the trained length the layout computes the same function as the plain model (local layers even keep plain flash attention up to the window), so any Stage 1 checkpoint carries over, including ones saved before these fields existed.
 
 ```bash
-# 2K-pretrained medium -> 256K on one 48 GB GPU. Stage it (32K, 128K, 256K), rope factor = length / 2048,
-# each stage an --init-from of the previous one
-uv run train.py --stage 1 data/long_docs.jsonl --init-from checkpoints/medium/best_model.pt \
-    --seq-len 262144 --local-window 2048 --global-layers 4,9,14,19 --rope-factor 128 --rope-original-context 2048 \
-    --mixed-precision bf16 --gradient-checkpointing --use-8bit-optimizer --residual-dtype bf16 \
-    --moe-chunk 4096 --loss-chunk 1024 --activation-offload --batch-size 1 --gradient-accumulation-steps 4 \
-    --learning-rate 5e-6 --warmup-steps 50 --val-split 0.05 --output-dir checkpoints/medium-256k
+# One command: 2K checkpoint -> 32K -> 128K -> 256K on one 48 GB GPU. Each phase starts from the previous
+# phase's final model in <output-dir>/ctx-<length>; rerunning the same command resumes where it stopped
+uv run train.py --stage 1 --hf-dataset emozilla/pg19 --hf-val-split validation --streaming \
+    --init-from checkpoints/medium/epoch_40.pt \
+    --length-schedule 32768:130M,131072:200M,262144:650M \
+    --batch-size 8 --gradient-accumulation-steps 8 --steps-per-epoch 1000 --val-max-batches 25 \
+    --use-8bit-optimizer --output-dir checkpoints/medium-long
 
 # Needle-in-a-haystack by length and depth; --rope-factor tries a longer window at inference only (1M = 512)
-uv run scripts/eval_long_context.py checkpoints/medium-256k/best_model.pt --lengths 32768 262144 --samples 5
+uv run scripts/eval_long_context.py checkpoints/medium-long/ctx-262144/final_model.pt --lengths 32768 262144 --samples 5
 ```
 
-JSONL data (one `{"text": ...}` per line) keeps a book or a repository as one document; blank-line text files split at paragraphs. HF streaming datasets are one document per example already. `--resume` refuses a changed layout; use `--init-from` for each stage. Generation encodes prompts `prefill_chunk` tokens at a time with last-position logits only, so a 256K prompt costs the KV cache (global layers) and the hidden states, not a logits matrix.
+`--length-schedule` phases are `LENGTH:TOKENS`. Pass the base run's `--batch-size`, `--gradient-accumulation-steps`, `--steps-per-epoch` and `--val-max-batches`: each phase keeps its tokens per optimizer update, per epoch and per validation, with batch 1, `--extension-lr` (1e-5, 5% warmup) and `--profile long-context`. Every phase is an ordinary single-GPU train.py run (printed before it starts). By hand, one phase is `--init-from CKPT --seq-len 262144 --profile long-context`; the profile turns on gradient checkpointing, a bf16 residual stream, chunked experts (`--moe-chunk 4096`) and loss (`--loss-chunk 1024`), checkpoint boundaries in host RAM and bf16 autocast, and on a new schedule the layout: window = trained length, every fifth and the last layer global, YaRN factor = `--seq-len` / trained length. Explicit layout flags override it; `--resume` keeps the checkpoint's layout.
+
+JSONL data (one `{"text": ...}` per line) keeps a book or a repository as one document; blank-line text files split at paragraphs; HF examples are one document each. Generation encodes prompts `prefill_chunk` tokens at a time with last-position logits only, so a 256K prompt costs the KV cache (global layers) and the hidden states, not a logits matrix.
 
 ### Stages 2-5 (OPTIONAL)
 
@@ -340,7 +342,7 @@ Sparse MoE transformer with:
 - Scales from 3M (micro, dense) to 6.7B parameters (base)
 - Pre-norm transformer backbone with rotary positional embeddings and `scaled_dot_product_attention`
 - `max_seq_len` is the attention window; new models set it to the training `--seq-len`
-- Long context: `local_window` / `global_layers` / `rope_factor` (see Long Context). Local layers use FlexAttention with an arithmetically built block mask and keep `window - 1` keys in the cache; `KVCache.length` carries the position. `configure_long_context()` sets expert chunking, head/loss chunking (`labels=` in forward returns `loss_sum` and `n_tokens`), boundary offload and the residual dtype. RoPE phases are FP64
+- Long context: `local_window` / `global_layers` / `rope_factor` (see Long Context). Local layers use FlexAttention with an arithmetically built block mask and keep `window - 1` keys in the cache; `KVCache.length` carries the position. `configure_long_context()` sets expert chunking, head/loss chunking (`labels=` in forward returns `loss_sum` and `n_tokens`), boundary offload and the residual dtype; a bf16 residual stream is normalized in bf16 (`_layer_norm`: autocast LayerNorm would keep FP32 copies). Local layers use plain causal SDPA while the sequence fits the window. RoPE phases are FP64. `mantis/training/length_schedule.py` drives `--length-schedule`: one train.py subprocess per phase, resumable. Measured `medium`-width working set: about 1.5 GB per 32K tokens, so `medium` at 256K needs about 34 GB
 - `return_hidden=True` returns only the final normalized hidden states (`last_hidden`)
 - The per-expert Python loop is reference code; profile before replacing it with grouped GEMMs
 

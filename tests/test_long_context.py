@@ -199,3 +199,17 @@ def test_bf16_residual_stream_keeps_boundaries_in_bf16(config):
     assert torch.isfinite(out['loss_sum']) and out['loss_sum'].dtype == torch.float32
     out['loss_sum'].backward()
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+def test_layout_trains_like_the_legacy_model_up_to_the_window(config):
+    cfg = dataclasses.replace(config.base_moe, dropout=0.1)
+    seed()
+    legacy = BaseMoEModel.from_config(cfg).to(DEVICE).train()
+    local = BaseMoEModel.from_config(dataclasses.replace(cfg, local_window=64, global_layers=(1,))).to(DEVICE).train()
+    local.load_state_dict(legacy.state_dict())
+    ids = torch.randint(4, 300, (2, 64), device=DEVICE)
+    seed()
+    a = legacy(ids)['logits']
+    seed()
+    b = local(ids)['logits']
+    assert torch.allclose(a, b, atol=1e-5)  # same dropout draws: the local layers took the plain SDPA path

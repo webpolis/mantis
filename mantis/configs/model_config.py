@@ -255,6 +255,11 @@ def _sized_config(d_model: int, n_layers: int, n_heads: int, n_kv_heads: int, d_
     return config
 
 
+def default_global_layers(n_layers: int) -> tuple:
+    """Every fifth layer plus the last one keeps full attention (Gemma-style 4 local : 1 global)."""
+    return tuple(sorted({i for i in range(n_layers) if i % 5 == 4} | {n_layers - 1}))
+
+
 def get_micro_config() -> MANTISConfig:
     """Micro model for pipeline checks (~3M parameters, dense)."""
     return _sized_config(d_model=256, n_layers=4, n_heads=4, n_kv_heads=4, d_ff=1024, n_experts=1, top_k=1,

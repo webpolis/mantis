@@ -188,12 +188,14 @@ class CausalSelfAttention(nn.Module):
         # SDPA picks its kernel from the current device, not q's: a pipelined
         # layer on an older GPU would otherwise get the Ampere flash kernel
         with torch.cuda.device(q.device) if q.is_cuda else contextlib.nullcontext():
-            if self.window and seq_len > 1:
+            # Up to the window a local layer is a plain causal layer: keep flash SDPA
+            # (and attention dropout), so a pretraining-length run pays nothing for the layout
+            if self.window and seq_len > 1 and (past_kv is not None or seq_len > self.window):
                 if attn_mask is not None:
                     raise ValueError("attention_mask is not supported by sliding-window layers")
                 mask = _window_mask(seq_len, k.size(2), past_len, self.window, q.device)
                 out = _flex()(q, k, v, block_mask=mask, scale=self.scale, enable_gqa=self.n_kv_heads != self.n_heads)
-            elif self.window:
+            elif self.window and past_kv is not None:
                 # One query against a cache that already holds only the last window - 1 keys
                 out = F.scaled_dot_product_attention(q, k, v, scale=self.scale,
                                                      enable_gqa=self.n_kv_heads != self.n_heads)
@@ -210,6 +212,19 @@ class CausalSelfAttention(nn.Module):
         if use_cache and self.window:
             k, v = k[:, :, -(self.window - 1):], v[:, :, -(self.window - 1):]
         return self.out(out), ((k, v) if use_cache else None)
+
+
+def _layer_norm(norm: nn.LayerNorm, x: torch.Tensor) -> torch.Tensor:
+    """
+    LayerNorm that keeps a 16-bit residual stream 16-bit. Under autocast
+    nn.LayerNorm saves an FP32 copy of its input and returns FP32, which at
+    256K tokens is 1.5 GB per tensor for `medium`; the fused kernel already
+    accumulates in FP32, so a bf16 stream normalizes in bf16 instead.
+    """
+    if x.dtype == torch.float32:
+        return norm(x)
+    with torch.autocast(x.device.type, enabled=False):
+        return F.layer_norm(x, norm.normalized_shape, norm.weight.to(x.dtype), norm.bias.to(x.dtype), norm.eps)
 
 
 class Expert(nn.Module):
@@ -387,10 +402,10 @@ class TransformerBlock(nn.Module):
             dispatch_load: (n_experts,) tensor, or None for dense blocks
             present_kv: (key, value) each (batch, kv_heads, total_len, d_head), or None
         """
-        attn_out, present_kv = self.attn(self.attn_norm(x), rope, attn_mask, past_kv, use_cache, past_len)
+        attn_out, present_kv = self.attn(_layer_norm(self.attn_norm, x), rope, attn_mask, past_kv, use_cache, past_len)
         x = x + self.dropout(attn_out).to(x.dtype)
 
-        normed = self.ff_norm(x)
+        normed = _layer_norm(self.ff_norm, x)
         if self.use_moe:
             ff_out, load_loss, dispatch = self.ff(normed, expert_bias)
         else:
@@ -675,7 +690,7 @@ class BaseMoEModel(nn.Module):
                 present_key_values.append(present_kv)
 
         x = x.to(total_load_loss.device)
-        x = self.final_norm(x)
+        x = _layer_norm(self.final_norm, x)
 
         output = {
             'load_balance_loss': total_load_loss,

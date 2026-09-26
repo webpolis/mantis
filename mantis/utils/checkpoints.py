@@ -39,9 +39,10 @@ class _CompatPickle:
         return getattr(pickle, name)
 
 
-def compat_load(path, *, map_location='cpu'):
-    """Load a checkpoint, remapping old 'hmst' module paths to 'mantis'."""
-    checkpoint = torch.load(path, map_location=map_location, weights_only=False, pickle_module=_CompatPickle())
+def compat_load(path, *, map_location='cpu', mmap: bool = False):
+    """Load a checkpoint, remapping old 'hmst' module paths to 'mantis'. `mmap` reads tensors lazily."""
+    checkpoint = torch.load(path, map_location=map_location, weights_only=False, pickle_module=_CompatPickle(),
+                            mmap=mmap)
     if 'config' in checkpoint:
         migrate_config(checkpoint['config'])
     return checkpoint
