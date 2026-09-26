@@ -63,7 +63,9 @@ warnings.filterwarnings('ignore', message='.*gemm_and_bias error: CUBLAS_STATUS_
 warnings.filterwarnings('ignore', message='.*lr_scheduler.step.*optimizer.step.*')
 
 from mantis.models import BaseMoEModel
-from mantis.configs.model_config import get_micro_config, get_tiny_config, get_small_config, get_base_config
+from mantis.configs.model_config import (
+    get_micro_config, get_tiny_config, get_small_config, get_medium_config, get_base_config,
+)
 from mantis.tokenizer import BPETokenizer, MANTISTokenizer, load_tokenizer
 from mantis.data import (
     encode_documents, iter_documents, pack_windows, tokenize_file, num_windows, split_at_document, split_packed,
@@ -208,6 +210,7 @@ def resolve_model_config(args, tokenizer, seq_len):
             'micro': get_micro_config,
             'tiny': get_tiny_config,
             'small': get_small_config,
+            'medium': get_medium_config,
             'base': get_base_config
         }[args.model_size]()
         config.base_moe.max_seq_len = seq_len
@@ -985,8 +988,8 @@ Examples:
                         help='Stage 1: resume training from checkpoint. Stages 2-4: the Stage 1 model')
 
     # Model
-    parser.add_argument('--model-size', type=str, choices=['micro', 'tiny', 'small', 'base'], default='tiny',
-                        help='Model size: micro (3M), tiny (57M), small (454M), base (6.8B) (default: tiny)')
+    parser.add_argument('--model-size', type=str, choices=['micro', 'tiny', 'small', 'medium', 'base'], default='tiny',
+                        help='Model size: micro (3M), tiny (55M), small (435M), medium (2.2B), base (6.7B) (default: tiny)')
 
     # Training Stage
     parser.add_argument('--stage', type=int, choices=[1, 2, 3, 4, 5], default=1,

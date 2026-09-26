@@ -260,6 +260,13 @@ def get_small_config() -> MANTISConfig:
                          critic_d_model=768, critic_layers=6, critic_heads=12, critic_d_ff=3072)
 
 
+def get_medium_config() -> MANTISConfig:
+    """Medium model for a single 48 GB GPU (~2.2B parameters, ~0.7B active)."""
+    return _sized_config(d_model=1536, n_layers=20, n_heads=24, n_kv_heads=8, d_ff=4096, n_experts=8, top_k=2,
+                         controller_layers=4, controller_d_ff=3072,
+                         critic_d_model=1024, critic_layers=6, critic_heads=16, critic_d_ff=4096)
+
+
 def get_base_config() -> MANTISConfig:
     """Base model (~6.7B parameters, ~1.9B active)."""
     return MANTISConfig()

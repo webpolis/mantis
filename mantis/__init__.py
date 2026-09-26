@@ -24,6 +24,7 @@ _EXPORTS = {
     'get_micro_config': 'mantis.configs.model_config',
     'get_tiny_config': 'mantis.configs.model_config',
     'get_small_config': 'mantis.configs.model_config',
+    'get_medium_config': 'mantis.configs.model_config',
     'get_base_config': 'mantis.configs.model_config',
     'get_large_config': 'mantis.configs.model_config',
 }

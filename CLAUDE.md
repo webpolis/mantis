@@ -372,6 +372,7 @@ Model sizes are defined in `mantis/configs/model_config.py`:
 - **micro**: ~3M parameters (dense, not MoE), controller 0.6M, critic 2.2M - ultra-fast testing
 - **tiny**: ~55M parameters, ~30M active (4 experts, 8/4 heads), controller 2.4M, critic 14M - development/debugging
 - **small**: ~435M parameters, ~234M active (4 experts, 32/8 heads), controller 18M, critic 45M - experimentation
+- **medium**: ~2.2B parameters, ~0.7B active (8 experts, 24/8 heads), controller 41M, critic 80M - the largest preset for one 48 GB GPU (29 GB with `--gradient-checkpointing --use-8bit-optimizer`)
 - **base**: ~6.7B parameters, ~1.9B active (8 experts, 32/8 heads), controller 106M, critic 80M - production target
 
 `get_large_config()` (~71B, 16 experts) and `get_extmem_config()` (32K windows) exist too, but `--model-size` does not offer them.

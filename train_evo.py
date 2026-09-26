@@ -51,7 +51,9 @@ warnings.filterwarnings('ignore', message='.*gemm_and_bias error: CUBLAS_STATUS_
 warnings.filterwarnings('ignore', message='.*lr_scheduler.step.*optimizer.step.*')
 
 from mantis.models import BaseMoEModel
-from mantis.configs.model_config import get_micro_config, get_tiny_config, get_small_config, get_base_config
+from mantis.configs.model_config import (
+    get_micro_config, get_tiny_config, get_small_config, get_medium_config, get_base_config,
+)
 from mantis.tokenizer import MANTISTokenizer
 from mantis.data import iter_documents
 from mantis.utils.checkpoints import compat_load, check_tokenizer, save_training_checkpoint, restore_training_state
@@ -391,6 +393,7 @@ def train(args):
             'micro': get_micro_config,
             'tiny': get_tiny_config,
             'small': get_small_config,
+            'medium': get_medium_config,
             'base': get_base_config,
         }[args.model_size]()
         config.base_moe.max_seq_len = args.seq_len
@@ -686,7 +689,7 @@ def main():
 
     # Model
     parser.add_argument('--model-size', type=str,
-                        choices=['micro', 'tiny', 'small', 'base'], default='tiny',
+                        choices=['micro', 'tiny', 'small', 'medium', 'base'], default='tiny',
                         help='Model size (default: tiny)')
 
     # Training

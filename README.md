@@ -75,7 +75,7 @@ The dotted inputs are optional. Without them, Stage 3 keeps the matching gates c
 
 **What it trains**: Foundation transformer model with Mixture-of-Experts
 - Standard next-token prediction
-- Top-2 routing over 4 experts (`tiny`, `small`) or 8 (`base`); `micro` is dense
+- Top-2 routing over 4 experts (`tiny`, `small`) or 8 (`medium`, `base`); `micro` is dense
 - Load balancing loss (top-1 based); `expert_load` in the model output reports the top-2 dispatch per layer
 - Grouped-query attention (`n_kv_heads` per preset)
 - No memory systems (added in Stage 2)
@@ -168,6 +168,7 @@ uv run train.py --stage 1 data/train.txt --val-file data/val.txt
 | `micro` | ~3M (dense) | 4/4 | 0.6M | 2.2M | Ultra-fast testing | ~0.7GB |
 | `tiny` | ~55M (~30M) | 8/4 | 2.4M | 14M | Development/debugging | ~1.9GB |
 | `small` | ~435M (~234M) | 32/8 | 18M | 45M | Experimentation | ~10GB (~7GB with `--gradient-checkpointing --use-8bit-optimizer`) |
+| `medium` | ~2.2B (~0.7B) | 24/8 | 41M | 80M | One 48 GB GPU | ~42GB (~29GB with `--gradient-checkpointing --use-8bit-optimizer`) |
 | `base` | ~6.7B (~1.9B) | 32/8 | 106M | 80M | Production | ~128GB (~89GB with `--gradient-checkpointing --use-8bit-optimizer`) |
 
 Parameter counts are for the 512-token evolution tokenizer; the default 32K BPE vocabulary adds `32768 × d_model` tied embedding parameters (8M for `micro`, 134M for `base`). The controller and critic scale with the preset, so a `micro` full-system run is a micro-size system. VRAM comes from `mantis/training/vram_estimator.py` for FP16 mixed precision, batch size 1, `--seq-len 512` and the 32K vocabulary.
