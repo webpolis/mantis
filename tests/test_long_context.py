@@ -143,3 +143,59 @@ def test_window_block_mask_matches_dense_definition():
         dense = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=((qi - ki) >= 0) & ((qi - ki) < window))
         mask = _window_mask(seq_len, total, past_len, window, torch.device(DEVICE))
         assert torch.allclose(flex_attention(q, k, v, block_mask=mask), dense, atol=1e-5)
+
+
+def _grads(model, ids, labels):
+    model.zero_grad(set_to_none=True)
+    out = model(ids, labels=labels)
+    loss = out['loss_sum'] / out['n_tokens'] + out['load_balance_loss']
+    loss.backward()
+    return loss.detach(), {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+
+
+def _same_grads(a, b, atol):
+    assert a.keys() == b.keys()
+    return all(torch.allclose(a[n], b[n], atol=atol) for n in a)
+
+
+def test_chunked_experts_loss_and_offload_match_the_plain_model(config):
+    seed()
+    ids = torch.randint(4, 300, (2, 40), device=DEVICE)
+    labels = ids.roll(-1, dims=1)
+    labels[:, -1] = -100
+    plain = _model(config).train()
+    plain_loss, plain_grads = _grads(plain, ids, labels)
+    full_logits = plain(ids)['logits']
+    assert torch.allclose(plain_loss - plain(ids)['load_balance_loss'],
+                          torch.nn.functional.cross_entropy(full_logits.reshape(-1, full_logits.size(-1)), labels.reshape(-1)), atol=1e-5)
+    assert 'gate' in ' '.join(plain_grads) and 'token_embedding.weight' in plain_grads
+
+    chunked = _model(config).train()
+    chunked.load_state_dict(plain.state_dict())
+    chunked.configure_long_context(moe_chunk=8, loss_chunk=16)
+    loss, grads = _grads(chunked, ids, labels)
+    assert torch.allclose(loss, plain_loss, atol=1e-5) and _same_grads(grads, plain_grads, atol=1e-5)
+
+    chunked.gradient_checkpointing_enable()
+    chunked.configure_long_context(moe_chunk=8, loss_chunk=16, offload=True)
+    loss, grads = _grads(chunked, ids, labels)
+    assert torch.allclose(loss, plain_loss, atol=1e-5) and _same_grads(grads, plain_grads, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="bf16 autocast needs CUDA")
+def test_bf16_residual_stream_keeps_boundaries_in_bf16(config):
+    seed()
+    model = _model(config).train()
+    model.gradient_checkpointing_enable()
+    model.configure_long_context(moe_chunk=8, loss_chunk=16, residual_dtype=torch.bfloat16)
+    seen = []
+    block = model.layers[0]
+    hook = block.register_forward_pre_hook(lambda m, args: seen.append(args[0].dtype))
+    ids = torch.randint(4, 300, (1, 32), device=DEVICE)
+    with torch.autocast('cuda', dtype=torch.bfloat16):
+        out = model(ids, labels=ids)
+    hook.remove()
+    assert seen == [torch.bfloat16]
+    assert torch.isfinite(out['loss_sum']) and out['loss_sum'].dtype == torch.float32
+    out['loss_sum'].backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())

@@ -253,6 +253,7 @@ class MoELayer(nn.Module):
             Expert(d_model, d_ff, dropout) for _ in range(n_experts)
         ])
         self.gate = nn.Linear(d_model, n_experts)
+        self.chunk = 0  # tokens per checkpointed expert pass (0 = whole sequence); see configure_long_context
 
     def forward(
         self,
@@ -284,25 +285,40 @@ class MoELayer(nn.Module):
         top_k_probs, top_k_indices = torch.topk(gate_probs, self.top_k, dim=-1)
         top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
 
-        output = torch.zeros_like(x_flat)
-        unused_expert_term = x_flat.new_zeros(())
-        for expert_id, expert in enumerate(self.experts):
-            token_idx, slot = (top_k_indices == expert_id).nonzero(as_tuple=True)
-            if token_idx.numel() == 0:
-                # ZeRO-2 reduces gradients as hooks fire. Keep every expert in
-                # the graph so ranks with different routes call collectives in
-                # the same order.
-                if self.training:
-                    unused_expert_term = unused_expert_term + expert(x_flat[:1]).sum() * 0
-                continue
-            expert_out = expert(x_flat[token_idx]) * top_k_probs[token_idx, slot].unsqueeze(-1)
-            output.index_add_(0, token_idx, expert_out.to(output.dtype))
+        # The gate ran over the whole sequence, so the balancing loss and the
+        # dispatch fractions below are exact; only the expert work is chunked
+        chunk = self.chunk if self.chunk else x_flat.size(0)
+        outputs = []
+        for start in range(0, x_flat.size(0), chunk):
+            args = (x_flat[start:start + chunk], top_k_probs[start:start + chunk], top_k_indices[start:start + chunk])
+            if self.chunk and torch.is_grad_enabled():
+                outputs.append(torch.utils.checkpoint.checkpoint(self._dispatch, *args, use_reentrant=False))
+            else:
+                outputs.append(self._dispatch(*args))
+        output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
 
-        output = output + unused_expert_term
+        if self.training:
+            # ZeRO-2 reduces gradients as hooks fire. Keep every expert in the
+            # graph so ranks with different routes call collectives in the same order.
+            used = torch.bincount(top_k_indices.reshape(-1), minlength=self.n_experts)
+            for expert_id, expert in enumerate(self.experts):
+                if used[expert_id] == 0:
+                    output = output + expert(x_flat[:1]).sum() * 0
 
         dispatch = torch.bincount(top_k_indices.reshape(-1), minlength=self.n_experts).float()
         dispatch = dispatch / top_k_indices.numel()
         return output.view(batch_size, seq_len, d_model), self._compute_load_balance_loss(gate_probs), dispatch
+
+    def _dispatch(self, x_flat: torch.Tensor, top_k_probs: torch.Tensor, top_k_indices: torch.Tensor) -> torch.Tensor:
+        """Run the experts on their tokens and combine the weighted outputs."""
+        output = torch.zeros_like(x_flat)
+        for expert_id, expert in enumerate(self.experts):
+            token_idx, slot = (top_k_indices == expert_id).nonzero(as_tuple=True)
+            if token_idx.numel() == 0:
+                continue
+            expert_out = expert(x_flat[token_idx]) * top_k_probs[token_idx, slot].unsqueeze(-1)
+            output.index_add_(0, token_idx, expert_out.to(output.dtype))
+        return output
 
     def _compute_load_balance_loss(self, gate_probs: torch.Tensor) -> torch.Tensor:
         """
@@ -372,14 +388,14 @@ class TransformerBlock(nn.Module):
             present_kv: (key, value) each (batch, kv_heads, total_len, d_head), or None
         """
         attn_out, present_kv = self.attn(self.attn_norm(x), rope, attn_mask, past_kv, use_cache, past_len)
-        x = x + self.dropout(attn_out)
+        x = x + self.dropout(attn_out).to(x.dtype)
 
         normed = self.ff_norm(x)
         if self.use_moe:
             ff_out, load_loss, dispatch = self.ff(normed, expert_bias)
         else:
             ff_out, load_loss, dispatch = self.ff(normed), None, None
-        x = x + self.dropout(ff_out)
+        x = x + self.dropout(ff_out).to(x.dtype)
         return x, load_loss, dispatch, present_kv
 
 
@@ -418,6 +434,9 @@ class BaseMoEModel(nn.Module):
         self.top_k = top_k
         self.gradient_checkpointing = False
         self.layer_devices: Optional[List[torch.device]] = None
+        self.loss_chunk = 0
+        self.offload_boundaries = False
+        self.residual_dtype: Optional[torch.dtype] = None
         self.local_window = local_window
         self.global_layers = tuple(global_layers)
         self.rope_factor = rope_factor
@@ -507,6 +526,22 @@ class BaseMoEModel(nn.Module):
             layer.to(device)
         self.layer_devices = devices
 
+    def configure_long_context(self, moe_chunk: int = 0, loss_chunk: int = 0, offload: bool = False,
+                               residual_dtype: Optional[torch.dtype] = None) -> None:
+        """
+        Bound the working set of long sequences: experts run on `moe_chunk`
+        tokens at a time, the head and cross-entropy on `loss_chunk` tokens
+        (with `labels` in forward), checkpoint boundaries live in pinned host
+        memory (`offload`, single-process only) and the residual stream is
+        stored in `residual_dtype`. Zeros and None keep today's behaviour.
+        """
+        for layer in self.layers:
+            if isinstance(layer.ff, MoELayer):
+                layer.ff.chunk = moe_chunk
+        self.loss_chunk = loss_chunk
+        self.offload_boundaries = offload
+        self.residual_dtype = residual_dtype
+
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory efficiency."""
         self.gradient_checkpointing = True
@@ -554,6 +589,8 @@ class BaseMoEModel(nn.Module):
         return_hidden: bool = False,
         past_key_values: Optional[KVCache] = None,
         use_cache: bool = False,
+        labels: Optional[torch.Tensor] = None,
+        last_logits_only: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass.
@@ -568,10 +605,15 @@ class BaseMoEModel(nn.Module):
             return_hidden: Also return the final (normalized) hidden states
             past_key_values: Per-layer (key, value) cache from a previous call
             use_cache: Return the updated cache as `past_key_values`
+            labels: (batch, seq_len) next-token targets, -100 ignored. The head
+                and FP32 cross-entropy then run in `loss_chunk` pieces and the
+                output carries `loss_sum` and `n_tokens` instead of logits
+            last_logits_only: Return logits for the last position only
 
         Returns:
-            Dict with logits, load_balance_loss, expert_load (n_layers, n_experts)
-            top-k dispatch fractions, optional last_hidden and cache
+            Dict with logits (or loss_sum and n_tokens), load_balance_loss,
+            expert_load (n_layers, n_experts) top-k dispatch fractions, optional
+            last_hidden and cache
         """
         batch_size, seq_len = input_ids.shape
         past_len = self.cache_len(past_key_values)
@@ -586,8 +628,10 @@ class BaseMoEModel(nn.Module):
         attn_mask = self._attention_mask(seq_len, past_len, attention_mask, input_ids.device)
 
         x = self.dropout(self.token_embedding(input_ids))
+        if self.residual_dtype is not None:
+            x = x.to(self.residual_dtype)
 
-        total_load_loss = x.new_zeros(())
+        total_load_loss = x.new_zeros((), dtype=torch.float32)
         expert_load = []
         present_key_values = KVCache(length=past_len + seq_len) if use_cache else None
 
@@ -611,10 +655,15 @@ class BaseMoEModel(nn.Module):
                 # recompute alive; the reentrant form waits for all output grads.
                 # DDP with find_unused_parameters rejects the reentrant form, so
                 # replicated training keeps the non-reentrant one.
-                x, load_loss, dispatch, present_kv = torch.utils.checkpoint.checkpoint(
-                    layer, x, rope, attn_mask, layer_bias, None, False, past_len,
-                    use_reentrant=self.layer_devices is not None
-                )
+                reentrant = self.layer_devices is not None or self.offload_boundaries
+                # A reentrant checkpoint saves only the block inputs, so an outer
+                # save_on_cpu() moves exactly the boundaries to host memory
+                with torch.autograd.graph.save_on_cpu(pin_memory=True) if self.offload_boundaries \
+                        else contextlib.nullcontext():
+                    x, load_loss, dispatch, present_kv = torch.utils.checkpoint.checkpoint(
+                        layer, x, rope, attn_mask, layer_bias, None, False, past_len,
+                        use_reentrant=reentrant
+                    )
             else:
                 x, load_loss, dispatch, present_kv = layer(x, rope, attn_mask, layer_bias, layer_past,
                                                            use_cache, past_len)
@@ -627,19 +676,41 @@ class BaseMoEModel(nn.Module):
 
         x = x.to(total_load_loss.device)
         x = self.final_norm(x)
-        logits = self.lm_head(x)
 
         output = {
-            'logits': logits,
             'load_balance_loss': total_load_loss,
             'expert_load': torch.stack(expert_load) if expert_load else x.new_zeros((0, self.n_experts)),
         }
+        if labels is not None:
+            output['loss_sum'], output['n_tokens'] = self._chunked_loss(x, labels)
+        elif last_logits_only:
+            output['logits'] = self.lm_head(x[:, -1:])
+        else:
+            output['logits'] = self.lm_head(x)
         if return_hidden:
             output['last_hidden'] = x
         if use_cache:
             output['past_key_values'] = present_key_values
 
         return output
+
+    def _chunked_loss(self, hidden: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Summed FP32 cross-entropy over the head, `loss_chunk` tokens at a time, and the token count."""
+        hidden = hidden.reshape(-1, self.d_model)
+        labels = labels.reshape(-1)
+        chunk = self.loss_chunk if self.loss_chunk else hidden.size(0)
+        total = hidden.new_zeros((), dtype=torch.float32)
+        for start in range(0, hidden.size(0), chunk):
+            args = (hidden[start:start + chunk], labels[start:start + chunk])
+            if self.loss_chunk and torch.is_grad_enabled():
+                total = total + torch.utils.checkpoint.checkpoint(self._loss_sum, *args, use_reentrant=False)
+            else:
+                total = total + self._loss_sum(*args)
+        return total, (labels != -100).sum()
+
+    def _loss_sum(self, hidden: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        logits = self.lm_head(hidden).float()
+        return F.cross_entropy(logits, labels, ignore_index=-100, reduction='sum')
 
     def encode(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
