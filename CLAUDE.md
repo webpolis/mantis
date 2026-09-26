@@ -172,6 +172,11 @@ uv run inference.py checkpoints/stage1/best_model.pt \
 uv run inference.py checkpoints/stage1/best_model.pt \
     --prompt "Hello" \
     --quantize int8
+
+# BF16 layers split over every visible GPU by free VRAM (more memory, not more speed)
+uv run inference.py checkpoints/stage1/best_model.pt \
+    --prompt "Hello" \
+    --quantize bfloat16 --pipeline
 ```
 
 All decode loops share `mantis/inference/generation.py`: KV cache, banned tokens (pad, bos, unk, reserved), and a context window of `max_seq_len`. When the cache fills, the latest half-window is re-encoded from scratch. `generate_tokens(prefill=(past_key_values, last_logits))` continues from an existing prefill, and `hidden_out=[...]` collects the final hidden state of every processed token; the engine uses both so a query is encoded once and its memory write needs no extra pass.

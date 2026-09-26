@@ -7,7 +7,8 @@ Features:
 - Multiple sampling strategies (greedy, top-k, top-p)
 - Streaming token-by-token output
 - Performance metrics (tokens/sec, latency)
-- Quantization support (INT8 on CPU, FP16 on GPU)
+- Quantization support (INT8 on CPU, FP16/BF16 on GPU)
+- Layers split over several GPUs (--pipeline)
 - Clean CLI interface
 - Proper error handling
 
@@ -29,6 +30,9 @@ Usage:
 
     # FP16 inference (GPU only, 2x faster)
     python inference.py checkpoints/train/best_model.pt --prompt "Hello" --quantize float16
+
+    # BF16 layers split over every visible GPU by free VRAM
+    python inference.py checkpoints/train/best_model.pt --prompt "Hello" --quantize bfloat16 --pipeline
 """
 
 import os
@@ -54,6 +58,13 @@ from mantis.inference.generation import generate_tokens
 from mantis.utils.checkpoints import load_base_model
 
 
+def pipeline_devices(n_layers: int) -> List[torch.device]:
+    """One device per layer: each visible GPU hosts a share of the layers proportional to its free VRAM."""
+    free = [torch.cuda.mem_get_info(d)[0] for d in range(torch.cuda.device_count())]
+    bounds = [round(n_layers * sum(free[:d + 1]) / sum(free)) for d in range(len(free))]
+    return [torch.device('cuda', next(d for d, bound in enumerate(bounds) if i < bound)) for i in range(n_layers)]
+
+
 class InferenceEngine:
     """Production-ready inference engine for MANTIS models."""
 
@@ -61,7 +72,8 @@ class InferenceEngine:
         self,
         checkpoint_path: str,
         device: Optional[str] = None,
-        quantize: Optional[str] = None
+        quantize: Optional[str] = None,
+        pipeline: bool = False
     ):
         """
         Initialize inference engine.
@@ -69,14 +81,11 @@ class InferenceEngine:
         Args:
             checkpoint_path: Path to model checkpoint
             device: Device to run on ('cuda', 'cpu', or None for auto)
-            quantize: Quantization mode ('int8', 'float16', or None)
+            quantize: Quantization mode ('int8', 'float16', 'bfloat16', or None)
+            pipeline: Split the layers over all visible GPUs by free VRAM
         """
-        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = self._select_device(device, quantize, pipeline)
         self.quantize = quantize
-
-        if quantize == 'int8' and self.device != 'cpu':
-            print("INT8 dynamic quantization only has CPU kernels; running on CPU")
-            self.device = 'cpu'
 
         print(f"Loading model from: {checkpoint_path}")
         print(f"Device: {self.device}")
@@ -84,24 +93,13 @@ class InferenceEngine:
             print(f"Quantization: {quantize}")
 
         try:
-            self.model, self.tokenizer, checkpoint = load_base_model(checkpoint_path, self.device)
+            # Load and cast on the CPU so the GPU never holds the float32 copy
+            self.model, self.tokenizer, checkpoint = load_base_model(checkpoint_path, 'cpu')
         except Exception as e:
             raise RuntimeError(f"Failed to load checkpoint: {e}")
 
-        if self.quantize == 'int8':
-            print("Applying INT8 dynamic quantization...")
-            self.model = torch.quantization.quantize_dynamic(
-                self.model,
-                {torch.nn.Linear},
-                dtype=torch.qint8
-            )
-            print("✓ Model quantized to INT8")
-        elif self.quantize == 'float16':
-            if self.device == 'cuda':
-                self.model = self.model.half()
-                print("✓ Model converted to FP16 (~50% memory)")
-            else:
-                print("Warning: FP16 only supported on CUDA, skipping quantization")
+        self._convert()
+        self._place(pipeline)
 
         self.banned_ids = self.tokenizer.non_generable_ids
 
@@ -122,6 +120,46 @@ class InferenceEngine:
             'total_time': 0.0,
             'num_generations': 0
         }
+
+    @staticmethod
+    def _select_device(device: Optional[str], quantize: Optional[str], pipeline: bool) -> str:
+        if pipeline:
+            if device == 'cpu' or quantize == 'int8' or not torch.cuda.is_available():
+                raise ValueError("--pipeline splits the model over CUDA GPUs; it cannot run on the CPU")
+            return 'cuda'
+        device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        if quantize == 'int8' and device != 'cpu':
+            print("INT8 dynamic quantization only has CPU kernels; running on CPU")
+            return 'cpu'
+        return device
+
+    def _convert(self):
+        """Apply the quantization mode to the model, still on the CPU."""
+        if self.quantize == 'int8':
+            print("Applying INT8 dynamic quantization...")
+            self.model = torch.quantization.quantize_dynamic(
+                self.model,
+                {torch.nn.Linear},
+                dtype=torch.qint8
+            )
+            print("✓ Model quantized to INT8")
+        elif self.quantize in ('float16', 'bfloat16'):
+            if self.device == 'cuda':
+                self.model.to(getattr(torch, self.quantize))
+                print(f"✓ Model converted to {self.quantize} (~50% memory)")
+            else:
+                print(f"Warning: {self.quantize} only supported on CUDA, skipping quantization")
+
+    def _place(self, pipeline: bool):
+        """Move the model to its device, or split its layers over every visible GPU."""
+        if not pipeline:
+            self.model.to(self.device)
+            return
+        devices = pipeline_devices(self.model.n_layers)
+        self.model.place_layers(devices)
+        print("Pipeline: " + ", ".join(
+            f"{torch.cuda.get_device_name(d)} {devices.count(d)} layers" for d in sorted(set(devices), key=devices.index)
+        ))
 
     def _tokens(self, prompt: str, max_length: int, temperature: float, top_p: float, top_k: int):
         """Encode the prompt and stream (token_id, log_prob) pairs until EOS."""
@@ -431,6 +469,9 @@ Examples:
 
   # FP16 inference (GPU only, 2x faster)
   python inference.py checkpoints/train/best_model.pt --prompt "Hello" --quantize float16
+
+  # BF16 layers split over every visible GPU by free VRAM
+  python inference.py checkpoints/train/best_model.pt --prompt "Hello" --quantize bfloat16 --pipeline
         """
     )
 
@@ -460,8 +501,10 @@ Examples:
     # System
     parser.add_argument('--device', type=str, choices=['cuda', 'cpu'],
                         help='Device to use (default: auto-detect)')
-    parser.add_argument('--quantize', type=str, choices=['int8', 'float16'],
-                        help='Quantization mode: int8 (CPU only) or float16 (GPU only)')
+    parser.add_argument('--quantize', type=str, choices=['int8', 'float16', 'bfloat16'],
+                        help='Quantization mode: int8 (CPU only), float16 or bfloat16 (GPU only)')
+    parser.add_argument('--pipeline', action='store_true',
+                        help='Split the layers over all visible GPUs by free VRAM (adds memory, not speed)')
 
     args = parser.parse_args()
 
@@ -472,7 +515,8 @@ Examples:
 
     # Initialize engine
     try:
-        engine = InferenceEngine(args.checkpoint, device=args.device, quantize=args.quantize)
+        engine = InferenceEngine(args.checkpoint, device=args.device, quantize=args.quantize,
+                                 pipeline=args.pipeline)
     except Exception as e:
         print(f"Error initializing engine: {e}")
         import traceback
