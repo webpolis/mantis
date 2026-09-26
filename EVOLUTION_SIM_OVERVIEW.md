@@ -300,13 +300,13 @@ uv run scripts/gen_evo_dataset.py --worlds 10000 --max-generations 200 \
     --output data/evo_train.txt --workers 8 --seed 42 --compact
 
 # Train (no per-token weighting, no curriculum)
-uv run train.py --stage 1 data/evo_train.txt \
+uv run train.py --stage 1 data/evo_train.txt --tokenizer mantis \
     --model-size tiny --seq-len 2048 --stride 1024 --batch-size 8 \
     --gradient-accumulation-steps 4 --learning-rate 5e-4 \
     --warmup-steps 2000 --epochs 10 --mixed-precision --val-split 0.1
 ```
 
-Note: `train.py` uses plain cross-entropy (no per-token weighting) and `TextDataset` (which does not respect world boundaries). For production evolution training, prefer `train_evo.py`.
+Note: `train.py` uses plain cross-entropy (no per-token weighting) and `TextDataset` (which does not respect world boundaries). Without `--tokenizer mantis` it trains a byte-level BPE tokenizer on the traces instead of using the trie tokenizer. For production evolution training, prefer `train_evo.py`.
 
 ### Agent-enabled training
 
@@ -367,7 +367,7 @@ Use `--gradient-checkpointing` unconditionally with agent-enabled data.
 
 ### Token volume
 
-Tokens per tick, measured on 2026-09-24 with `python scripts/calc_seq_len.py --worlds 60` (v2 compact format, a keyframe every 20 ticks, up to 200 generations per world):
+Tokens per tick, measured on 2026-09-24 with `uv run scripts/calc_seq_len.py --worlds 60` (v2 compact format, a keyframe every 20 ticks, up to 200 generations per world):
 
 | Partition                        | Worlds | Keyframe median | Keyframe p95 | Delta median | Delta p95 |
 | -------------------------------- | ------ | --------------- | ------------ | ------------ | --------- |
@@ -432,6 +432,7 @@ Perplexity alone is insufficient. Track:
 | Micro (3M)    | Dense     | Single GPU                | Pipeline sanity check |
 | Tiny (55M)    | 4 experts | Single GPU                | Development iteration |
 | Small (435M)  | 4 experts | Single GPU or DDP         | Experimentation       |
+| Medium (2.1B) | 8 experts | One 48 GB GPU             | Largest single-GPU run |
 | Base (6.7B)   | 8 experts | DDP + ZeRO-2 (`--deepspeed`) | Production target  |
 
 ### What the trained model can do

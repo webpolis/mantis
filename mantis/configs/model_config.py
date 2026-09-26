@@ -50,7 +50,7 @@ class MetaControllerConfig:
 class CriticConfig:
     """
     Configuration for the critic: a small encoder over the frozen base
-    model's final hidden states of [query; response; evidence].
+    model's final hidden states of [evidence; query; response].
     """
     d_model: int = 1024
     n_layers: int = 6
@@ -282,7 +282,7 @@ def get_small_config() -> MANTISConfig:
 
 
 def get_medium_config() -> MANTISConfig:
-    """Medium model for a single 48 GB GPU (~2.2B parameters, ~0.7B active)."""
+    """Medium model for a single 48 GB GPU (~2.1B parameters, ~0.6B active)."""
     return _sized_config(d_model=1536, n_layers=20, n_heads=24, n_kv_heads=8, d_ff=4096, n_experts=8, top_k=2,
                          controller_layers=4, controller_d_ff=3072,
                          critic_d_model=1024, critic_layers=6, critic_heads=16, critic_d_ff=4096)

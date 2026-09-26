@@ -299,14 +299,15 @@ mantis/
 │   ├── critic_train.py  # Stage 4: Critic training with calibration split
 │   ├── sft.py           # Stage 5: instruction / evidence dataset in the engine's prompt format
 │   ├── scoring.py       # Lexical answer correctness shared by rewards and evaluation
-│   └── vram_estimator.py  # Parameter/VRAM estimate per preset, batch size from free VRAM, layer placement
+│   ├── vram_estimator.py  # Parameter/VRAM estimate per preset, batch size from free VRAM, layer placement
+│   └── length_schedule.py # --length-schedule: one train.py run per context-extension phase, resumable
 ├── inference/           # Generation engine
 │   ├── generation.py    # Shared decode loop (cache, window, sampling, prefill reuse)
 │   ├── prompting.py     # Query formats, evidence block with source ids, budgeted selection
 │   └── engine.py        # Dynamic routing, retrieval, verification, memory writes
 ├── simulation/          # Ecological simulator for evolution training data (see its CLAUDE.md)
 ├── configs/             # Configuration management
-│   └── model_config.py  # Presets: micro/tiny/small/base
+│   └── model_config.py  # Presets: micro/tiny/small/medium/base
 ├── utils/checkpoints.py # Checkpoint schema, model/tokenizer loading
 ├── data.py              # Documents, EOS, packing, leak-free splits
 └── tokenizer.py         # BPETokenizer (byte-level BPE trained on the data), MANTISTokenizer (evolution trie), load_tokenizer
@@ -317,6 +318,8 @@ evaluation/              # Evaluation harness
 └── metrics.py           # Accuracy, error/coverage, confident-error rate, ECE, Brier, AURC
 tests/                   # Deterministic diagnostics (pytest)
 
+train.py                 # Main training entry point (--stage 1-5, context extension)
+inference.py             # Stage 1 text generation without memory systems
 train_evo.py             # Evolution curriculum training (weighted loss, partition mixing)
 inference_evo.py         # Evolution tick-by-tick inference (importable for web apps)
 
@@ -326,7 +329,8 @@ scripts/                 # Utility scripts
 ├── calc_seq_len.py      # Measure per-tick token counts and recommend --seq-len per partition
 ├── split_dataset.py     # Split train/val for reproducibility
 ├── run_eval.py          # Run benchmark evaluations
-└── eval_long_context.py # Needle-in-a-haystack by context length and depth
+├── eval_long_context.py # Needle-in-a-haystack by context length and depth
+└── generate_paper_diagram.py  # Writes mantis_architecture.tex (README diagram source)
 
 web/                     # Simulation playground: Flask + Socket.IO server, React/PixiJS client
 ```
@@ -395,7 +399,7 @@ Model sizes are defined in `mantis/configs/model_config.py`:
 - **micro**: ~3M parameters (dense, not MoE), controller 0.6M, critic 2.2M - ultra-fast testing
 - **tiny**: ~55M parameters, ~30M active (4 experts, 8/4 heads), controller 2.4M, critic 14M - development/debugging
 - **small**: ~435M parameters, ~234M active (4 experts, 32/8 heads), controller 18M, critic 45M - experimentation
-- **medium**: ~2.2B parameters, ~0.7B active (8 experts, 24/8 heads), controller 41M, critic 80M - the largest preset for one 48 GB GPU (29 GB with `--gradient-checkpointing --use-8bit-optimizer`)
+- **medium**: ~2.1B parameters, ~0.6B active (8 experts, 24/8 heads), controller 41M, critic 80M - the largest preset for one 48 GB GPU (29 GB with `--gradient-checkpointing --use-8bit-optimizer`)
 - **base**: ~6.7B parameters, ~1.9B active (8 experts, 32/8 heads), controller 106M, critic 80M - production target
 
 `get_large_config()` (~71B, 16 experts) and `get_extmem_config()` (32K windows) exist too, but `--model-size` does not offer them.

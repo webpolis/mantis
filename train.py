@@ -1065,7 +1065,7 @@ Examples:
 
     # Model
     parser.add_argument('--model-size', type=str, choices=['micro', 'tiny', 'small', 'medium', 'base'], default='tiny',
-                        help='Model size: micro (3M), tiny (55M), small (435M), medium (2.2B), base (6.7B) (default: tiny)')
+                        help='Model size: micro (3M), tiny (55M), small (435M), medium (2.1B), base (6.7B) (default: tiny)')
 
     # Training Stage
     parser.add_argument('--stage', type=int, choices=[1, 2, 3, 4, 5], default=1,

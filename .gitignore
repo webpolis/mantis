@@ -60,3 +60,7 @@ wandb/
 .DS_Store
 Thumbs.db
 web/client/node_modules
+
+# LaTeX build artifacts
+*.aux
+*.out

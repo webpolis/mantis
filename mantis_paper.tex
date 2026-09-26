@@ -34,34 +34,34 @@
 \maketitle
 
 \begin{abstract}
-Large Language Models (LLMs) exhibit a fundamental trade-off between long-context retention, computational efficiency, and hallucination rates. Existing approaches either scale quadratically with context length (dense transformers), compress information lossy (state-space models), or lack contextual statefulness (retrieval-augmented generation). We propose \textbf{MANTIS} (Metacognitive Adaptive Network with Tiered Inference Strategies), a hybrid architecture that couples a sparse Mixture-of-Experts (MoE) backbone with a meta-controlled three-tier memory system. We present a complete reference implementation in which a \textit{Meta-Controller}, trained with reinforcement learning (PPO), decides for each query whether to bypass the optional components, whether to read (2) episodic memory (Mamba-based SSM retrieval keys over recent interactions) and (3) semantic memory (a FAISS vector index), whether to add a bounded bias to expert selection, and whether to verify the answer. A critic scores the draft against the retrieved evidence, retrieves once more when the draft fails, and abstains when the evidence still does not support an answer. This paper describes the architecture, its five-stage training pipeline and its evaluation harness as a framework for research into adaptive memory systems. No model has been trained yet, so its expected benefits are hypotheses; we state the measurements that would test them.
+Large Language Models (LLMs) exhibit a fundamental trade-off between long-context retention, computational efficiency, and hallucination rates. Existing approaches either scale quadratically with context length (dense transformers), compress information lossy (state-space models), or lack contextual statefulness (retrieval-augmented generation). We propose \textbf{MANTIS} (Metacognitive Adaptive Network with Tiered Inference Strategies), a hybrid architecture that couples a sparse Mixture-of-Experts (MoE) backbone with a meta-controlled three-tier memory system. We present a complete reference implementation in which a \textit{Meta-Controller}, trained with reinforcement learning (PPO), decides for each query whether to bypass the optional components, whether to read (2) episodic memory (Mamba-based SSM retrieval keys over recent interactions) and (3) semantic memory (a FAISS vector index), whether to add a bounded bias to expert selection, and whether to verify the answer. A critic scores the draft against the retrieved evidence, retrieves once more when the draft fails, and abstains when the evidence still does not support an answer. A context-extension phase trains the backbone on windows of up to 256K tokens on one GPU, with sliding-window attention in most layers and full attention in a few. This paper describes the architecture, its five-stage training pipeline and its evaluation harness as a framework for research into adaptive memory systems. No trained model has been evaluated yet, so its expected benefits are hypotheses; we state the measurements that would test them.
 \end{abstract}
 
 \section{Introduction}
 
 The success of Large Language Models \cite{brown2020gpt3,touvron2023llama,anthropic2024claude} has been accompanied by persistent challenges in long-context reasoning and factual accuracy. Current architectures face three fundamental limitations:
 
-\textbf{(1) Quadratic Scaling:} Self-attention in transformers costs $O(L^2)$ in sequence length $L$ \cite{vaswani2017attention,dao2022flashattention}. Long windows are a matter of training and serving budget rather than a hard limit; our presets fix an 8K window as a design choice.
+\textbf{(1) Quadratic Scaling:} Self-attention in transformers costs $O(L^2)$ in sequence length $L$ \cite{vaswani2017attention,dao2022flashattention}. Long windows are a matter of training and serving budget rather than a hard limit: the presets train at 2K--8K tokens, and a context-extension phase reaches 256K by keeping full attention in only a few layers (Section~\ref{sec:long-context}).
 
 \textbf{(2) Lost-in-the-Middle:} Dense attention struggles to maintain uniform retrieval accuracy across extended contexts, exhibiting U-shaped performance curves where mid-sequence information is preferentially forgotten \cite{liu2023lost}.
 
 \textbf{(3) Hallucination Persistence:} Despite advances in pre-training scale and alignment, LLMs continue to generate plausible but factually incorrect outputs, particularly when forced to extrapolate beyond training distributions \cite{zhang2023sirens,ji2023hallucination}.
 
-Existing mitigation strategies exhibit complementary weaknesses. \textit{Retrieval-Augmented Generation} (RAG) \cite{lewis2020retrieval} offloads long-term memory to external datastores but lacks stateful compression of conversation context. \textit{State Space Models} (SSMs) \cite{gu2022s4,gu2023mamba} achieve linear complexity but sacrifice the ability to perform targeted retrieval over historical context. \textit{Sparse attention} patterns \cite{child2019sparse,beltagy2020longformer} reduce compute (Longformer's sliding-window pattern scales linearly in $L$) but give up full pairwise attention over the history.
+Existing mitigation strategies exhibit complementary weaknesses. \textit{Retrieval-Augmented Generation} (RAG) \cite{lewis2020retrieval} offloads long-term memory to external datastores but lacks stateful compression of conversation context. \textit{State Space Models} (SSMs) \cite{gu2022s4,gu2023mamba} achieve linear complexity but sacrifice the ability to perform targeted retrieval over historical context. \textit{Sparse attention} patterns \cite{child2019sparse,beltagy2020longformer} reduce compute (Longformer's sliding-window pattern scales linearly in $L$) but give up full pairwise attention over the history. MANTIS uses a sliding window in most layers once its context is extended and keeps full attention in the rest.
 
 \subsection{Contributions}
 
 We propose MANTIS, a metacognitive architecture that integrates three memory tiers under unified RL-based control:
 
 \begin{enumerate}
-    \item \textbf{Sparse MoE Backbone:} A base configuration with 6.7B parameters, 8 experts, top-2 routing and grouped-query attention, activating about 1.9B parameters per token.
+    \item \textbf{Sparse MoE Backbone:} A base configuration with 6.7B parameters, 8 experts, top-2 routing and grouped-query attention, activating about 1.9B parameters per token, with interleaved local and global attention for windows of up to 256K tokens.
     \item \textbf{Three-Tier Memory Hierarchy:}
     \begin{itemize}
-        \item \textit{L1 (Working Memory):} Causal self-attention with rotary position embeddings over the preset's window (8K tokens for \texttt{base}).
+        \item \textit{L1 (Working Memory):} Causal self-attention with rotary position embeddings over the model's window (8K tokens for \texttt{base}, up to 256K after context extension).
         \item \textit{L2 (Episodic Memory):} Stacked Mamba SSM blocks that encode each stored interaction into a 256-dimensional retrieval key; entries keep their tokens, provenance and hit counts.
         \item \textit{L3 (Semantic Memory):} A FAISS vector index with namespaces, trust levels and approximate retrieval over up to 1M entries.
     \end{itemize}
-    \item \textbf{Meta-Controller Architecture:} A 105M-parameter residual MLP policy, trained with PPO, that routes queries based on the query embedding, query predictability and memory state.
+    \item \textbf{Meta-Controller Architecture:} A 106M-parameter residual MLP policy, trained with PPO, that routes queries based on the query embedding, query predictability and memory state.
     \item \textbf{Integrated Critic Model:} An 80M-parameter encoder over the frozen backbone's hidden states that scores responses against retrieved evidence, triggers one bounded round of evidence recovery and, failing that, abstention.
 \end{enumerate}
 
@@ -93,13 +93,13 @@ Let $d_{model}$ denote embedding dimension, $N=8$ the number of experts, and $K=
 
 \subsection{Backbone}
 
-The base model is a decoder-only transformer with pre-norm LayerNorm blocks. Attention uses rotary position embeddings \cite{su2021roformer} and fused scaled dot-product attention over a window of $L_{max}$ tokens, with a key/value cache for generation. Grouped-query attention \cite{ainslie2023gqa} shares each key/value head among several query heads: the \texttt{base} preset uses 32 query heads and 8 key/value heads, so one 8K-token cache holds about 0.375~GiB in 16-bit precision instead of 1.5~GiB. Input embeddings and the output projection share weights. Every block's feed-forward sublayer is the MoE layer below; with $N=1$ it reduces to a dense feed-forward network. Table~\ref{tab:presets} lists the implemented configurations.
+The base model is a decoder-only transformer with pre-norm LayerNorm blocks. Attention uses rotary position embeddings \cite{su2021roformer} and fused scaled dot-product attention over a window of $L_{max}$ tokens, with a key/value cache for generation. Grouped-query attention \cite{ainslie2023gqa} shares each key/value head among several query heads: the \texttt{base} preset uses 32 query heads and 8 key/value heads, so one 8K-token cache holds about 0.375~GiB in 16-bit precision instead of 1.5~GiB. After context extension (Section~\ref{sec:long-context}), most layers attend only to the last $w$ tokens and cache $w-1$ keys, while a few global layers attend over the whole window with YaRN-scaled rotary embeddings \cite{peng2023yarn}. Input embeddings and the output projection share weights. Every block's feed-forward sublayer is the MoE layer below; with $N=1$ it reduces to a dense feed-forward network. Table~\ref{tab:presets} lists the implemented configurations.
 
-\textbf{Tokenizer.} The implementation uses a 512-token vocabulary matched longest-first through a trie. It holds 283 domain tokens for the text protocol of a synthetic ecological simulator, which the project uses as its first training corpus, plus 18 extra ASCII characters, 161 UTF-8 byte-fallback tokens and 50 reserved slots. Numbers are split into digits. Any string round-trips losslessly, but natural-language text falls back to single characters and bytes, so its sequences are several times longer than under a subword vocabulary.
+\textbf{Tokenizer.} Stage 1 trains a byte-level BPE vocabulary (32,768 tokens by default) on the first 100K documents of its corpus, so no input maps to an unknown token. The synthetic ecological simulator that the project uses as its first training corpus keeps a fixed 512-token vocabulary matched longest-first through a trie: 283 domain tokens for its text protocol, 18 extra ASCII characters, 161 UTF-8 byte-fallback tokens and 50 reserved slots, with numbers split into digits.
 
 \begin{table}[h]
 \centering
-\caption{Model presets in the reference implementation (vocabulary of 512 tokens, $L_{max}=8192$). Heads are query/key-value heads. The controller and critic scale with the preset.}
+\caption{Model presets in the reference implementation. Counts are for the 512-token vocabulary; the default 32,768-token BPE vocabulary adds $32768 \cdot d_{model}$ tied parameters. $L_{max}$ is the Stage 1 sequence length. Heads are query/key-value heads. The controller and critic scale with the preset.}
 \label{tab:presets}
 \begin{tabular}{lrrrrrrrr}
 \toprule
@@ -108,6 +108,7 @@ Preset & $d_{model}$ & Layers & Heads & Experts & Parameters & Active & Controll
 micro & 256 & 4 & 4/4 & 1 (dense) & 3.3M & 3.3M & 0.6M & 2.2M \\
 tiny & 512 & 6 & 8/4 & 4 & 55M & 30M & 2.4M & 14M \\
 small & 1024 & 12 & 32/8 & 4 & 435M & 234M & 18M & 45M \\
+medium & 1536 & 20 & 24/8 & 8 & 2.14B & 0.63B & 41M & 80M \\
 base & 2048 & 24 & 32/8 & 8 & 6.70B & 1.86B & 106M & 80M \\
 \bottomrule
 \end{tabular}
@@ -141,7 +142,7 @@ where $f_i$ is the fraction of tokens in the batch whose top-1 expert is $i$, $\
 
 \subsection{Meta-Controller}
 
-The Meta-Controller $\pi_\theta$ sees one vector per query, so it is a residual MLP rather than a sequence model: 6 pre-norm feed-forward blocks (inner width 4096; 105M parameters at $d_{model}=2048$; smaller presets use 2--4 blocks). The base model first runs a forward pass over the query, and that pass is kept: its key/value cache and hidden states serve decoding and the memory write later, so the query is encoded once. Its mean-pooled final hidden state is the query embedding $\mathbf{e}_q$, and its next-token distributions yield the features of the state summary:
+The Meta-Controller $\pi_\theta$ sees one vector per query, so it is a residual MLP rather than a sequence model: 6 pre-norm feed-forward blocks (inner width 4096; 106M parameters at $d_{model}=2048$; smaller presets use 2--4 blocks). The base model first runs a forward pass over the query, and that pass is kept: its key/value cache and hidden states serve decoding and the memory write later, so the query is encoded once. Its mean-pooled final hidden state is the query embedding $\mathbf{e}_q$, and its next-token distributions yield the features of the state summary:
 \begin{equation}
 \mathbf{s}_t = \text{Enc}_\psi(u_t, \ell_t, \mathbf{m}_t, c_t)
 \end{equation}
@@ -221,7 +222,7 @@ The critic $C_\phi$ is a 6-layer pre-norm transformer encoder ($d_{model}=1024$,
 \begin{equation}
 P_{ver} = \sigma\!\left(C_\phi\!\left(h_{base}([\mathcal{E}; \mathbf{q}; \mathbf{r}])\right) / T\right)
 \end{equation}
-Reading backbone representations gives the critic the backbone's language knowledge instead of asking a randomly initialized encoder to learn language from a small labeled set. Evidence comes first so that, under the causal backbone, every response token has seen the evidence and the query. Learned segment embeddings mark the three parts, and the input fits a 2048-token budget: the response gets up to half, the evidence up to 35\% and the query the last 15\%, with unused capacity flowing to the response, then the evidence, then the query. Mean pooling feeds one sigmoid head; $T$ is a temperature fitted on a held-out calibration split in Stage 4. The critic receives the same evidence lines the generator saw, episodic and semantic alike. When $P_{ver} < 0.6$, the engine retrieves once more, now conditioning on the query and the rejected draft, regenerates and rescores; if the score still falls short (or no memory is available) it replaces the response with an abstention, which is never written to memory.
+Reading backbone representations gives the critic the backbone's language knowledge instead of asking a randomly initialized encoder to learn language from a small labeled set. Evidence comes first so that, under the causal backbone, every response token has seen the evidence and the query. Learned segment embeddings mark the three parts, and the input fits a 2048-token budget, capped at the backbone's window: the response gets up to half, the evidence up to 35\% and the query the last 15\%, with unused capacity flowing to the response, then the evidence, then the query. Mean pooling feeds one sigmoid head; $T$ is a temperature fitted on a held-out calibration split in Stage 4. The critic receives the same evidence lines the generator saw, episodic and semantic alike. When $P_{ver} < 0.6$, the engine retrieves once more, now conditioning on the query and the rejected draft, regenerates and rescores; if the score still falls short (or no memory is available) it replaces the response with an abstention, which is never written to memory.
 
 Training minimizes binary cross-entropy on the correctness logit. Calibration is measured, not assumed: Stage 4 reports Brier score and expected calibration error on a validation split that the temperature fit did not see.
 
@@ -236,7 +237,12 @@ The base MoE model is trained alone on language modeling:
 \mathcal{L}_{total} = \mathcal{L}_{LM} + \sum_{\text{layers}} \mathcal{L}_{bal}
 \end{equation}
 
-The implementation uses AdamW \cite{loshchilov2019adamw} ($\beta = (0.9, 0.95)$, weight decay 0.01) with a peak learning rate of $3 \times 10^{-4}$, linear warmup, cosine decay to 10\% of the peak, and FP16 or BF16 mixed precision. 8-bit AdamW, gradient checkpointing and DeepSpeed ZeRO-2 are optional. Documents end with an EOS token and are packed into windows of $L+1$ tokens. For natural-language pre-training we propose a corpus of about 2T tokens from web text, books and code.
+The implementation uses AdamW \cite{loshchilov2019adamw} ($\beta = (0.9, 0.95)$, weight decay 0.01) with a peak learning rate of $3 \times 10^{-4}$, linear warmup, cosine decay to 10\% of the peak, and FP16 or BF16 mixed precision. 8-bit AdamW, gradient checkpointing and DeepSpeed ZeRO-2 are optional. Training runs one data-parallel process per GPU; a model too large for one GPU instead runs in a single process with its layers placed across the GPUs by free memory. Documents end with an EOS token and are packed into windows of $L+1$ tokens. For natural-language pre-training we propose a corpus of about 2T tokens from web text, books and code.
+
+\subsection{Context Extension}
+\label{sec:long-context}
+
+A Stage 1 checkpoint can continue training on longer sequences. Every layer then attends to the last $w$ tokens, where $w$ is the trained length, except every fifth layer and the last, which attend over the whole window with rotary frequencies scaled by YaRN \cite{peng2023yarn} (factor: new length over trained length). Gemma~2 \cite{gemma2024gemma2} interleaves local and global layers in a similar way. With the window equal to the trained length, the layout computes the same function as the plain model, so any Stage 1 checkpoint carries over. A schedule of phases (32K, 128K and 256K tokens in the reference recipe) starts each phase from the previous one's final model, keeps the tokens per optimizer update of the base run, and trains at learning rate $10^{-5}$ with 5\% warmup. To fit 256K tokens on one 48~GB GPU, each phase checkpoints activations, keeps the residual stream in BF16, runs the experts and the loss in chunks and holds checkpoint boundaries in host RAM; the \texttt{medium} preset's measured working set is about 1.5~GB per 32K tokens. A needle-in-a-haystack harness measures retrieval by context length and depth. Raising the YaRN factor at inference stretches the window to 1M tokens, but that window is neither trained nor evaluated.
 
 \subsection{Stage 2: Memory Fine-Tuning}
 
@@ -286,6 +292,7 @@ The critic is trained with supervision on labeled (query, response, evidence) tr
 Stages 2--4 freeze the generator, so better retrieval need not produce better answers. Stage 5 fine-tunes the base model on instruction data in the runtime prompt format: conversation roles, an evidence block whose lines carry source identifiers and provenance labels, and a response. The loss covers only response tokens. Records may include distractor or contradictory evidence and unanswerable questions whose response is an abstention. The saved checkpoint marks the chat format so the engine builds prompts the way the model was trained.
 
 \section{Proposed Evaluation Protocol}
+\label{sec:evaluation}
 
 \subsection{Baselines}
 
@@ -321,7 +328,7 @@ The comparison that matters most is an ablation ladder over the same backbone: n
 
 \subsection{Implemented Harness}
 
-The reference implementation evaluates MMLU \cite{hendrycks2021mmlu}, TruthfulQA \cite{lin2022truthfulqa}, HumanEval \cite{chen2021codex} and GSM8K \cite{cobbe2021gsm8k}, loaded from the HuggingFace Hub, plus a synthetic multi-session memory benchmark, for either the base model alone or the full engine rebuilt from a Stage 3 policy. Independent-example benchmarks run on frozen memory so results do not depend on evaluation order. The engine's confidence is the critic score when the answer was verified, the geometric-mean token probability otherwise, and 0 after an abstention; abstentions are recorded. MMLU prompts the question and lettered choices, decodes at most 10 tokens and reads the first standalone letter. TruthfulQA counts a response as truthful when its word F1 is higher against a true reference than against every false one; this is a lexical proxy, not the official judge, and its scores are not comparable with published ones. HumanEval runs generated code in a Docker container without network when Docker is available, else in a resource-limited subprocess that is not a security boundary. Reports keep per-example records (route, evidence identifiers, timings, compute) and artifact versions, and command-line flags switch the route policy, expert bias, serving precision and memory mode for ablations.
+The reference implementation evaluates MMLU \cite{hendrycks2021mmlu}, TruthfulQA \cite{lin2022truthfulqa}, HumanEval \cite{chen2021codex} and GSM8K \cite{cobbe2021gsm8k}, loaded from the HuggingFace Hub, plus a synthetic multi-session memory benchmark and a needle-in-a-haystack test by context length and depth, for either the base model alone or the full engine rebuilt from a Stage 3 policy. Independent-example benchmarks run on frozen memory so results do not depend on evaluation order. The engine's confidence is the critic score when the answer was verified, the geometric-mean token probability otherwise, and 0 after an abstention; abstentions are recorded. MMLU prompts the question and lettered choices, decodes at most 10 tokens and reads the first standalone letter. TruthfulQA counts a response as truthful when its word F1 is higher against a true reference than against every false one; this is a lexical proxy, not the official judge, and its scores are not comparable with published ones. HumanEval runs generated code in a Docker container without network when Docker is available, else in a resource-limited subprocess that is not a security boundary. Reports keep per-example records (route, evidence identifiers, timings, compute) and artifact versions, and command-line flags switch the route policy, expert bias, serving precision and memory mode for ablations.
 
 \section{Expected Properties}
 
@@ -331,7 +338,7 @@ The hierarchical memory design is expected to enable graceful degradation: predi
 
 \subsection{Scaling Analysis}
 
-Attention cost is fixed by the preset's window; history beyond it reaches the generator only through retrieval. Episodic retrieval is linear in the number of entries (at most 100 keys), and semantic retrieval costs $O(\sqrt{M})$ under the assumptions stated above. Whether this recovers the information a longer window would provide is an empirical question about retrieval recall and evidence budgets, which the memory benchmark and the long-context tests (RULER, LongMemEval) are meant to answer.
+Attention cost is set by the window. Without context extension, history beyond it reaches the generator only through retrieval; with it, local layers cost $O(Lw)$ and only the global layers $O(L^2)$, so by its measured working set the \texttt{medium} preset fits 256K tokens on one 48~GB GPU. The needle-in-a-haystack test measures whether the model uses that window. Episodic retrieval is linear in the number of entries (at most 100 keys), and semantic retrieval costs $O(\sqrt{M})$ under the assumptions stated above. Whether this recovers the information a longer window would provide is an empirical question about retrieval recall and evidence budgets, which the memory benchmark and the long-context tests (RULER, LongMemEval) are meant to answer.
 
 \section{Discussion}
 
@@ -347,11 +354,11 @@ The critic model is designed to improve calibration by conditioning verification
 
 \begin{itemize}
     \item \textbf{No Trained Weights:} Every component ships untrained. No benchmark, throughput or calibration result exists; the design claims above remain hypotheses until training and evaluation test them.
-    \item \textbf{Measurement Plan:} A reliability review of the implementation set three gates before any large training commitment: a memory gate (beat ordinary retrieval on the memory benchmark at the same generator, context and storage budget, with a paired confidence interval excluding zero), an efficiency gate (lower measured cost at comparable quality without violating a p95 latency target) and a reliability gate (lower error rate among answered questions at matched coverage on held-out sources). The ablation ladder of Section~5 supplies the controls.
+    \item \textbf{Measurement Plan:} A reliability review of the implementation set three gates before any large training commitment: a memory gate (beat ordinary retrieval on the memory benchmark at the same generator, context and storage budget, with a paired confidence interval excluding zero), an efficiency gate (lower measured cost at comparable quality without violating a p95 latency target) and a reliability gate (lower error rate among answered questions at matched coverage on held-out sources). The ablation ladder of Section~\ref{sec:evaluation} supplies the controls.
     \item \textbf{Training Complexity:} RL optimization of the meta-controller presents a stability challenge and requires careful hyperparameter tuning. Its accuracy reward is lexical and misjudges paraphrases; verbose correct answers can score below the F1 threshold.
     \item \textbf{Memory Maintenance:} Each L3 rebuild retrains the IVF-PQ codebooks over all live entries, a cost that grows faster than linearly in $M$; vectors and text live in RAM (8.2~GB of vectors for 1M entries at $d_{model}=2048$). Disk-backed storage remains future work.
     \item \textbf{Retention Policy:} Consolidation promotes entries by retrieval hits and preserves every evicted record, but it does not learn which facts a later query will need, nor does it extract atomic facts or resolve conflicting updates.
-    \item \textbf{Tokenizer Specialization:} The 512-token vocabulary targets the simulation protocol, so natural-language workloads pay for longer sequences: attention over the same text costs more, and a fixed window covers less of it. A subword vocabulary for assistant work has not been evaluated.
+    \item \textbf{Tokenizer Portability:} The BPE vocabulary is learned per run from a sample of documents, so checkpoints trained on different corpora are not token-compatible, and its bytes per token on assistant workloads have not been measured.
     \item \textbf{Cold Start:} The system requires a warmup period to populate the episodic memory before it can leverage historical context.
 \end{itemize}
 
@@ -359,7 +366,7 @@ The critic model is designed to improve calibration by conditioning verification
 
 We have presented MANTIS, a proposed metacognitive adaptive network designed to address fundamental trade-offs in long-context LLM design. It combines sparse MoE computation with tiered memory under RL-based meta-control, in the hope of improving both efficiency and factual accuracy. This paper details the architecture, its five-stage training pipeline, its memory lifecycle and its evaluation harness. Stage 1 supports controlled experiments now; the integrated reliability and efficiency claims await the ablations and gates listed above. If the design holds, learned routing policies could allocate retrieval and verification according to query needs.
 
-Future work, in order of what the gates need first: (1) a general-language tokenizer evaluated for bytes per token and end-to-end cost, (2) RULER and LongMemEval runs alongside the synthetic memory benchmark, (3) retention learned from the future usefulness of stored evidence, with atomic facts and supersession, (4) a cost-constrained routing objective (minimize expected cost subject to an answered-error bound, a coverage floor and a p95 latency target), (5) disk-backed vector and text storage, and (6) profiled expert kernels and sharding before any large pretraining run.
+Future work, in order of what the gates need first: (1) bytes per token and end-to-end cost of the BPE vocabulary, and long-context results for the extended window, (2) RULER and LongMemEval runs alongside the synthetic memory benchmark, (3) retention learned from the future usefulness of stored evidence, with atomic facts and supersession, (4) a cost-constrained routing objective (minimize expected cost subject to an answered-error bound, a coverage floor and a p95 latency target), (5) disk-backed vector and text storage, and (6) profiled expert kernels and sharding before any large pretraining run.
 
 \section*{Broader Impact}
 
@@ -450,6 +457,12 @@ I. Loshchilov and F. Hutter, ``Decoupled Weight Decay Regularization,'' \textit{
 
 \bibitem{schulman2017ppo}
 J. Schulman et al., ``Proximal Policy Optimization Algorithms,'' \textit{arXiv:1707.06347}, 2017.
+
+\bibitem{peng2023yarn}
+B. Peng et al., ``YaRN: Efficient Context Window Extension of Large Language Models,'' \textit{ICLR}, 2024.
+
+\bibitem{gemma2024gemma2}
+Gemma Team, ``Gemma 2: Improving Open Language Models at a Practical Size,'' \textit{arXiv:2408.00118}, 2024.
 
 \bibitem{su2021roformer}
 J. Su et al., ``RoFormer: Enhanced Transformer with Rotary Position Embedding,'' \textit{arXiv:2104.09864}, 2021.

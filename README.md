@@ -9,7 +9,7 @@ A novel LLM architecture exploring hallucination mitigation and long-context mem
 ![MANTIS Architecture Diagram](mantis_architecture.png)
 
 **Components**:
-- **Three-tier memory**: Attention (8K window in the `base` preset) → Episodic SSM retrieval keys → Semantic FAISS store with namespaces and trust levels
+- **Three-tier memory**: Attention (8K window in the `base` preset, extendable to 256K) → Episodic SSM retrieval keys → Semantic FAISS store with namespaces and trust levels
 - **Meta-controller**: RL-trainable routing with 5 decision gates (bypass, episodic, semantic, expert bias, verification)
 - **MoE base model**: ~6.7B total, ~1.9B active parameters (8 experts, top-2, grouped-query attention)
 - **Critic model**: verification head over the frozen base model's hidden states, with one bounded evidence-recovery round before abstaining
@@ -52,15 +52,17 @@ flowchart LR
     S4["Stage 4<br/>Critic training<br/>critic_best.pt"]
     S3["Stage 3<br/>RL routing policy<br/>meta_controller_rl.pt"]
     S5["Stage 5<br/>Generator adaptation (SFT)<br/>best_model.pt (chat format)"]
+    CE["Context extension<br/>Stage 1 at longer windows<br/>ctx-LEN/final_model.pt"]
     S1 -- "--resume (frozen base)" --> S2
     S1 -- "--resume (frozen base)" --> S4
     S1 -- "--resume (frozen base)" --> S3
     S1 -- "--resume (weights only)" --> S5
+    S1 -. "--init-from<br/>--length-schedule" .-> CE
     S2 -. "--memory-checkpoint<br/>--semantic-store" .-> S3
     S4 -. "--critic-checkpoint" .-> S3
 ```
 
-The dotted inputs are optional. Without them, Stage 3 keeps the matching gates closed. Run Stages 2, 4 and 5 in any order, then Stage 3. A Stage 5 checkpoint can replace the Stage 1 checkpoint as the base for Stages 2–4, so the memory, critic and policy are trained against the generator that will answer.
+The dotted inputs are optional. Without them, Stage 3 keeps the matching gates closed. The engine rejects memory, critic and policy artifacts trained against a different backbone, so Stages 2–4 must share the base that will answer. To serve a Stage 5 or context-extended model, train it first and pass it to `--resume` in Stages 2–4. Run Stage 3 last.
 
 **What you need**:
 - Basic LLM: Stage 1 only
@@ -168,7 +170,7 @@ uv run train.py --stage 1 data/train.txt --val-file data/val.txt
 | `micro` | ~3M (dense) | 4/4 | 0.6M | 2.2M | Ultra-fast testing | ~0.7GB |
 | `tiny` | ~55M (~30M) | 8/4 | 2.4M | 14M | Development/debugging | ~1.9GB |
 | `small` | ~435M (~234M) | 32/8 | 18M | 45M | Experimentation | ~10GB (~7GB with `--gradient-checkpointing --use-8bit-optimizer`) |
-| `medium` | ~2.2B (~0.7B) | 24/8 | 41M | 80M | One 48 GB GPU | ~42GB (~29GB with `--gradient-checkpointing --use-8bit-optimizer`) |
+| `medium` | ~2.1B (~0.6B) | 24/8 | 41M | 80M | One 48 GB GPU | ~42GB (~29GB with `--gradient-checkpointing --use-8bit-optimizer`) |
 | `base` | ~6.7B (~1.9B) | 32/8 | 106M | 80M | Production | ~128GB (~89GB with `--gradient-checkpointing --use-8bit-optimizer`) |
 
 Parameter counts are for the 512-token evolution tokenizer; the default 32K BPE vocabulary adds `32768 × d_model` tied embedding parameters (8M for `micro`, 134M for `base`). The controller and critic scale with the preset, so a `micro` full-system run is a micro-size system. VRAM comes from `mantis/training/vram_estimator.py` for FP16 mixed precision, batch size 1, `--seq-len 512` and the 32K vocabulary.
@@ -555,7 +557,7 @@ uv run web/server/app.py   # open http://localhost:5000
 | `--deepspeed` | Enable DeepSpeed ZeRO-2 | `--deepspeed` |
 | `--gpu-ids` | Select specific GPUs | `--gpu-ids 0 2` |
 
-Full list: `python train.py --help`
+Full list: `uv run train.py --help`
 
 ### Validation Options
 
@@ -658,10 +660,10 @@ uv run train.py --stage 1 data/train.txt --val-split 0.1  # Auto-detects
 mantis/
 ├── models/           # base_moe, meta_controller, critic, ssm
 ├── memory/           # episodic, semantic, consolidation (lifecycle), provenance (source → trust)
-├── training/         # common, pretrain, memory_train, rl_train, critic_train, sft, scoring, vram_estimator
+├── training/         # common, pretrain, memory_train, rl_train, critic_train, sft, scoring, vram_estimator, length_schedule
 ├── inference/        # generation (shared decode loop), prompting (evidence budget), engine
 ├── simulation/       # Ecological simulator that generates evolution training data
-├── configs/          # model_config (presets: micro/tiny/small/base)
+├── configs/          # model_config (presets: micro/tiny/small/medium/base)
 ├── utils/            # checkpoints (schema, model and tokenizer loading, fingerprints)
 ├── data.py           # Documents, EOS, packing, leak-free splits
 ├── tokenizer.py      # BPETokenizer (byte-level BPE trained on the data), MANTISTokenizer (evolution trie, 512 tokens)
@@ -674,7 +676,7 @@ train.py              # Main training script (--stage 1/2/3/4/5)
 inference.py          # Text generation script
 train_evo.py          # Evolution curriculum training
 inference_evo.py      # Tick-by-tick evolution generation
-scripts/              # preprocess_data, split_dataset, run_eval, gen_evo_dataset, calc_seq_len
+scripts/              # preprocess_data, split_dataset, run_eval, eval_long_context, gen_evo_dataset, calc_seq_len, generate_paper_diagram
 web/                  # Simulation playground (Flask server, React client)
 ```
 
@@ -721,7 +723,7 @@ web/                  # Simulation playground (Flask server, React client)
 - RL-trainable via PPO (Stage 3); a fixed route policy replaces it for ablations
 
 ### Memory Systems
-- **Episodic**: Mamba SSM (mamba-ssm library) encodes each interaction into a 256-d retrieval key; entries keep token segments, a pooled embedding, hit counts and provenance (namespace, source, trust, timestamp), not full hidden states. L2 cache of up to 100 entries
+- **Episodic**: Mamba SSM (mamba-ssm library) encodes each interaction into a 256-d retrieval key; entries keep token segments, a pooled embedding, hit counts and provenance (namespace, source, trust, timestamp), not full hidden states. The buffer holds 100 entries by default (`max_entries`); the oldest overflows to consolidation
 - **Semantic**: FAISS vector DB with stable IDs, namespaces (per caller plus shared `global`), trust levels by source (unverified generated claims are never cited as facts), supersession links, deletion and an embedding fingerprint. Evicted IDs are tombstoned with bounded over-fetch, and the index rebuilds off-thread when more than 20% are stale. Flat search below 10K entries, approximate IVF-PQ above; `recall_at_k()` measures it
 - **Consolidation**: started by the engine when both memories exist. Every evicted episodic entry is written to semantic memory as its own record before it is dropped; the periodic cycle promotes entries retrieved at least once. `engine.close()` flushes the queue and checkpoints both stores
 - **Retrieval**: hybrid rerank (tier similarity + word F1), an equal token-budget share per tier with leftover flow, source identifiers in the prompt, the same evidence to the critic

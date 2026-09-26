@@ -103,6 +103,7 @@ tikz_content = r"""\documentclass[tikz,border=10pt]{standalone}
     \textbf{Base MoE Model}\\
     {\footnotesize (base preset: 24 layers, GQA,}\\
     {\footnotesize 6.7B params, 1.9B active)}\\
+    {\tiny 8K window; local/global layers + YaRN extend it to 256K}\\
     {\tiny One query pass: cache, hidden states, mean pool}
 };
 \draw[flow] (input) -- (encoder);
@@ -156,6 +157,9 @@ tikz_content = r"""\documentclass[tikz,border=10pt]{standalone}
 \draw[control] ($(meta.east)-(0, 0.2)$) to[out=-15, in=180] node[pos=0.4, below, font=\tiny] {Gate 3} (semantic.west);
 \draw[memory_link] (semantic.north) -- (mem_gate.south);
 
+% Input beyond the window is ingested into both memories before routing
+\draw[memory_link, dotted] (input.east) -| node[pos=0.25, below, font=\tiny, text=mantisGreen!80!black] {Input beyond the window: ingested as documents} (semantic.south);
+
 % Consolidation - route around to avoid crossing mem_gate
 \coordinate (consol_turn) at ($(semantic.east)+(0.6,0)$);
 \draw[consolidation] (episodic.east) to[out=0, in=90] (consol_turn) to[out=-90, in=0] ($(semantic.east)+(0,-0.25)$);
@@ -170,7 +174,7 @@ tikz_content = r"""\documentclass[tikz,border=10pt]{standalone}
 \node (expert_gen) [moe_model, above=2.5cm of context, align=center] {
     \textbf{Base MoE Model}\\
     {\footnotesize Generation; prefill reused}\\
-    {\footnotesize when no evidence}
+    {\footnotesize without evidence or bias}
 };
 \draw[flow] (context) -- (expert_gen);
 
@@ -182,10 +186,10 @@ tikz_content = r"""\documentclass[tikz,border=10pt]{standalone}
 
 % --- Step 5: Verification (Optional) ---
 
-\node (critic) [critic, right=3cm of expert_gen, align=center] {Critic Model\\{\footnotesize (80M, over base}\\{\footnotesize hidden states)}};
+\node (critic) [critic, right=3cm of expert_gen, align=center] {Critic Model\\{\footnotesize (80M, over base}\\{\footnotesize hidden states)}\\{\tiny [evidence; query; response]}};
 \draw[control] ($(meta.south east)+(-0.3, 0)$) |- ++(0,-0.4) -| node[pos=0.75, right, font=\tiny] {Gate 5} (critic.south);
 \draw[control, dashed] (expert_gen.east) -- node[above, font=\tiny] {Verify with evidence} (critic.west);
-\draw[control, dashed] (critic.south) to[out=-90, in=0] node[pos=0.5, right, font=\tiny, align=left] {Rejected: retrieve\\once more, regenerate} (context.east);
+\draw[control, dashed] (critic.south) to[out=-90, in=0] node[pos=0.35, left, font=\tiny, align=right] {Rejected: retrieve with\\query + draft, regenerate} (context.east);
 
 % --- Final Output ---
 
@@ -193,7 +197,7 @@ tikz_content = r"""\documentclass[tikz,border=10pt]{standalone}
 \draw[flow] (expert_gen) -- (output);
 \draw[control, dashed] (critic.north) to[out=120, in=0] node[pos=0.6, above right, font=\tiny, align=left] {Abstain if score\\still $<$ 0.6} (output.east);
 
-% Merge early exit path
+% Merge bypass path
 \draw[flow] (simple_out.north) |- (output.west);
 
 % Every answered interaction is written to episodic memory (never an abstention)
@@ -203,11 +207,13 @@ tikz_content = r"""\documentclass[tikz,border=10pt]{standalone}
 
 \begin{pgfonlayer}{background}
     % Memory System
-    \node [fit=(episodic) (semantic) (mem_gate), fill=mantisGreen!5, rounded corners, draw=mantisGreen!20, thick, label={[mantisGreen, font=\bfseries]below:Memory Hierarchy}] {};
+    \node (memsys) [fit=(episodic) (semantic) (mem_gate), fill=mantisGreen!5, rounded corners, draw=mantisGreen!20, thick] {};
 
     % Meta-Controller decision zone
     \node [fit=(meta) (state) (early_check), fill=mantisRed!3, rounded corners, draw=none] {};
 \end{pgfonlayer}
+% Drawn over the ingest arrow, which passes behind it
+\node[below, fill=white, inner sep=2pt, text=mantisGreen, font=\bfseries] at (memsys.south) {Memory Hierarchy};
 
 % Legend
 \node[font=\tiny, align=left, anchor=north west] at ($(simple_gen.west |- input.north)+(0,0.4)$) {
