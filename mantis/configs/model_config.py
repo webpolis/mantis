@@ -21,6 +21,15 @@ class BaseMoEConfig:
     max_seq_len: int = 8192
     dropout: float = 0.1
     load_balance_weight: float = 0.01
+    # Long context: with local_window > 0, every layer attends to the last
+    # local_window tokens except the global_layers, which see the whole
+    # window. Global layers apply YaRN to RoPE with rope_factor relative to
+    # rope_original_context (1.0 = plain RoPE). At sequences up to
+    # local_window this is the same model as local_window = 0.
+    local_window: int = 0
+    global_layers: tuple = ()
+    rope_factor: float = 1.0
+    rope_original_context: int = 2048
 
 
 @dataclass
@@ -169,6 +178,13 @@ class MANTISConfig:
             raise ValueError(f"n_kv_heads ({kv_heads}) must divide n_heads ({heads})")
         if self.base_moe.top_k > self.base_moe.n_experts:
             raise ValueError(f"top_k ({self.base_moe.top_k}) cannot exceed n_experts ({self.base_moe.n_experts})")
+        b = self.base_moe
+        if b.local_window < 0 or b.rope_factor < 1.0 or b.rope_original_context < 1:
+            raise ValueError("local_window must be >= 0, rope_factor >= 1 and rope_original_context >= 1")
+        if b.local_window == 0 and (b.global_layers or b.rope_factor != 1.0):
+            raise ValueError("global_layers and rope_factor need local_window > 0")
+        if any(not 0 <= i < b.n_layers for i in b.global_layers) or len(set(b.global_layers)) != len(b.global_layers):
+            raise ValueError(f"global_layers must be distinct layer indexes below n_layers ({b.n_layers})")
         if self.critic.max_seq_len > self.base_moe.max_seq_len:
             raise ValueError(
                 f"Critic max_seq_len ({self.critic.max_seq_len}) cannot exceed the base window "

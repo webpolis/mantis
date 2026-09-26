@@ -7,6 +7,7 @@ key/value cache.
 """
 
 import contextlib
+import math
 
 import torch
 import torch.nn as nn
@@ -14,20 +15,52 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from typing import Tuple, Optional, Dict, List, Sequence
 
-KVCache = List[Tuple[torch.Tensor, torch.Tensor]]
+class KVCache(list):
+    """Per-layer (key, value) tensors plus the number of tokens they stand for."""
+
+    def __init__(self, layers=(), length: int = 0):
+        super().__init__(layers)
+        self.length = length
 
 
 class RotaryEmbedding(nn.Module):
-    """Rotary positional embedding (GPT-NeoX half-split layout)."""
+    """
+    Rotary positional embedding (GPT-NeoX half-split layout).
 
-    def __init__(self, d_head: int, base: float = 10000.0):
+    `factor` > 1 applies YaRN: frequencies whose wavelength exceeds
+    `original_context` are interpolated by 1/factor, the fastest ones are
+    kept, with a linear ramp (in dimension index) between beta_fast and
+    beta_slow rotations per original context. The matching attention
+    temperature is `attention_scale` (None for plain RoPE).
+
+    Phases are computed in FP64: at position 1M a float32 product loses
+    ~1e-2 in cos/sin. The frequencies are plain floats so `model.to(dtype)`
+    never quantizes them.
+    """
+
+    def __init__(self, d_head: int, base: float = 10000.0, factor: float = 1.0,
+                 original_context: int = 2048, beta_fast: float = 32.0, beta_slow: float = 1.0):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, d_head, 2, dtype=torch.float32) / d_head))
-        self.register_buffer('inv_freq', inv_freq, persistent=False)
+        inv_freq = [base ** (-2 * i / d_head) for i in range(d_head // 2)]
+        if factor > 1.0:
+            def correction(beta):
+                return d_head * math.log(original_context / (2 * math.pi * beta)) / (2 * math.log(base))
+            low = max(math.floor(correction(beta_fast)), 0)
+            high = min(math.ceil(correction(beta_slow)), d_head // 2 - 1)
+            span = max(high - low, 1e-3)
+            for i in range(d_head // 2):
+                ramp = min(max((i - low) / span, 0.0), 1.0)
+                inv_freq[i] *= (1 - ramp) + ramp / factor
+            temperature = 1 + 0.1 * math.log(factor)
+            self.attention_scale: Optional[float] = temperature ** 2 / math.sqrt(d_head)
+        else:
+            self.attention_scale = None
+        self.inv_freq = tuple(inv_freq)
 
     def forward(self, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        freqs = torch.outer(positions.float(), self.inv_freq)  # (seq, d_head / 2)
-        return freqs.cos(), freqs.sin()
+        inv_freq = torch.tensor(self.inv_freq, dtype=torch.float64, device=positions.device)
+        freqs = positions.to(torch.float64)[:, None] * inv_freq[None, :]  # (seq, d_head / 2)
+        return freqs.cos().float(), freqs.sin().float()
 
 
 def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -35,6 +68,71 @@ def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch
     x1, x2 = x.float().chunk(2, dim=-1)
     rotated = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
     return rotated.to(x.dtype)
+
+
+_flex_attention = None
+
+
+def _flex():
+    """flex_attention, compiled on first use (uncompiled on CPU)."""
+    global _flex_attention
+    if _flex_attention is None:
+        from torch.nn.attention.flex_attention import flex_attention
+        _flex_attention = torch.compile(flex_attention) if torch.cuda.is_available() else flex_attention
+    return _flex_attention
+
+
+_block_masks: Dict[tuple, object] = {}
+_BLOCK = 128
+
+
+def _window_mask(seq_len: int, total: int, past_len: int, window: int, device: torch.device):
+    """
+    FlexAttention block mask over (seq_len new queries, total keys): each query
+    sees the keys within the last `window` positions. The cache holds the
+    `total - seq_len` positions before `past_len`. Block visibility is computed
+    arithmetically (no S x S evaluation) and the offsets reach the kernel as
+    tensors, so chunked prefills never recompile.
+    """
+    key = (seq_len, total, past_len, window, str(device))
+    mask = _block_masks.get(key)
+    if mask is not None:
+        return mask
+    from torch.nn.attention.flex_attention import BlockMask
+
+    offset = past_len - (total - seq_len)  # absolute position of key 0
+    n_q, n_k = -(-seq_len // _BLOCK), -(-total // _BLOCK)
+    q_lo = torch.arange(n_q) * _BLOCK
+    q_hi = torch.clamp(q_lo + _BLOCK - 1, max=seq_len - 1)
+    k_lo = torch.arange(n_k) * _BLOCK
+    k_hi = torch.clamp(k_lo + _BLOCK - 1, max=total - 1)
+    dist_min = (past_len + q_lo)[:, None] - (k_hi + offset)[None, :]
+    dist_max = (past_len + q_hi)[:, None] - (k_lo + offset)[None, :]
+    partial = (dist_max >= 0) & (dist_min < window)
+    full = (dist_min >= 0) & (dist_max < window)
+    partial &= ~full
+
+    def pack(visible):
+        counts = visible.sum(dim=1)
+        indices = torch.zeros(n_q, n_k, dtype=torch.int32)  # flex indexes this by kv block, so full width
+        for row in range(n_q):
+            cols = visible[row].nonzero(as_tuple=True)[0]
+            indices[row, :len(cols)] = cols.to(torch.int32)
+        return counts.to(torch.int32)[None, None].to(device), indices[None, None].to(device)
+
+    past_t = torch.tensor(past_len, device=device)
+    offset_t = torch.tensor(offset, device=device)
+
+    def allowed(b, h, q, k):
+        distance = (q + past_t) - (k + offset_t)
+        return (distance >= 0) & (distance < window)
+
+    kv_num, kv_idx = pack(partial)
+    full_num, full_idx = pack(full)
+    mask = BlockMask.from_kv_blocks(kv_num, kv_idx, full_num, full_idx, BLOCK_SIZE=(_BLOCK, _BLOCK),
+                                    mask_mod=allowed, seq_lengths=(seq_len, total))
+    _block_masks[key] = mask
+    return mask
 
 
 class CausalSelfAttention(nn.Module):
@@ -46,7 +144,8 @@ class CausalSelfAttention(nn.Module):
     smaller than a full multi-head cache.
     """
 
-    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, dropout: float = 0.1,
+                 window: int = 0, scale: Optional[float] = None):
         super().__init__()
         if n_heads % n_kv_heads != 0:
             raise ValueError(f"n_kv_heads ({n_kv_heads}) must divide n_heads ({n_heads})")
@@ -54,6 +153,10 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_heads = n_kv_heads
         self.d_head = d_model // n_heads
         self.dropout = dropout
+        # window > 0: sliding-window attention over the last `window` positions
+        # (FlexAttention, no attention dropout); the cache keeps window - 1 keys
+        self.window = window
+        self.scale = scale
         self.q_proj = nn.Linear(d_model, d_model)
         self.kv_proj = nn.Linear(d_model, 2 * n_kv_heads * self.d_head)
         self.out = nn.Linear(d_model, d_model)
@@ -65,6 +168,7 @@ class CausalSelfAttention(nn.Module):
         attn_mask: Optional[torch.Tensor],
         past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]],
         use_cache: bool,
+        past_len: int = 0,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         batch, seq_len, d_model = x.shape
         q = self.q_proj(x).view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
@@ -84,14 +188,27 @@ class CausalSelfAttention(nn.Module):
         # SDPA picks its kernel from the current device, not q's: a pipelined
         # layer on an older GPU would otherwise get the Ampere flash kernel
         with torch.cuda.device(q.device) if q.is_cuda else contextlib.nullcontext():
-            out = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=attn_mask is None,
-                enable_gqa=self.n_kv_heads != self.n_heads,
-            )
+            if self.window and seq_len > 1:
+                if attn_mask is not None:
+                    raise ValueError("attention_mask is not supported by sliding-window layers")
+                mask = _window_mask(seq_len, k.size(2), past_len, self.window, q.device)
+                out = _flex()(q, k, v, block_mask=mask, scale=self.scale, enable_gqa=self.n_kv_heads != self.n_heads)
+            elif self.window:
+                # One query against a cache that already holds only the last window - 1 keys
+                out = F.scaled_dot_product_attention(q, k, v, scale=self.scale,
+                                                     enable_gqa=self.n_kv_heads != self.n_heads)
+            else:
+                out = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=attn_mask,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=attn_mask is None,
+                    scale=self.scale,
+                    enable_gqa=self.n_kv_heads != self.n_heads,
+                )
         out = out.transpose(1, 2).reshape(batch, seq_len, d_model)
+        if use_cache and self.window:
+            k, v = k[:, :, -(self.window - 1):], v[:, :, -(self.window - 1):]
         return self.out(out), ((k, v) if use_cache else None)
 
 
@@ -219,12 +336,14 @@ class TransformerBlock(nn.Module):
         top_k: int = 2,
         dropout: float = 0.1,
         load_balance_weight: float = 0.01,
-        use_moe: bool = True
+        use_moe: bool = True,
+        window: int = 0,
+        attention_scale: Optional[float] = None,
     ):
         super().__init__()
         self.use_moe = use_moe
 
-        self.attn = CausalSelfAttention(d_model, n_heads, n_kv_heads, dropout)
+        self.attn = CausalSelfAttention(d_model, n_heads, n_kv_heads, dropout, window, attention_scale)
         self.attn_norm = nn.LayerNorm(d_model)
 
         if use_moe:
@@ -243,6 +362,7 @@ class TransformerBlock(nn.Module):
         expert_bias: Optional[torch.Tensor] = None,
         past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
+        past_len: int = 0,
     ):
         """
         Returns:
@@ -251,7 +371,7 @@ class TransformerBlock(nn.Module):
             dispatch_load: (n_experts,) tensor, or None for dense blocks
             present_kv: (key, value) each (batch, kv_heads, total_len, d_head), or None
         """
-        attn_out, present_kv = self.attn(self.attn_norm(x), rope, attn_mask, past_kv, use_cache)
+        attn_out, present_kv = self.attn(self.attn_norm(x), rope, attn_mask, past_kv, use_cache, past_len)
         x = x + self.dropout(attn_out)
 
         normed = self.ff_norm(x)
@@ -283,7 +403,11 @@ class BaseMoEModel(nn.Module):
         top_k: int = 2,
         max_seq_len: int = 8192,
         dropout: float = 0.1,
-        load_balance_weight: float = 0.01
+        load_balance_weight: float = 0.01,
+        local_window: int = 0,
+        global_layers: Sequence[int] = (),
+        rope_factor: float = 1.0,
+        rope_original_context: int = 2048,
     ):
         super().__init__()
 
@@ -294,16 +418,24 @@ class BaseMoEModel(nn.Module):
         self.top_k = top_k
         self.gradient_checkpointing = False
         self.layer_devices: Optional[List[torch.device]] = None
+        self.local_window = local_window
+        self.global_layers = tuple(global_layers)
+        self.rope_factor = rope_factor
+        self.rope_original_context = rope_original_context
 
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.rotary = RotaryEmbedding(d_model // n_heads)
+        self.rotary_global = RotaryEmbedding(d_model // n_heads, factor=rope_factor,
+                                             original_context=rope_original_context)
         self.dropout = nn.Dropout(dropout)
 
         use_moe = n_experts > 1
         self.layers = nn.ModuleList([
             TransformerBlock(d_model, n_heads, n_kv_heads, d_ff, n_experts, top_k, dropout,
-                             load_balance_weight, use_moe=use_moe)
-            for _ in range(n_layers)
+                             load_balance_weight, use_moe=use_moe,
+                             window=0 if self.is_global(i) else local_window,
+                             attention_scale=self.rotary_global.attention_scale if self.is_global(i) else None)
+            for i in range(n_layers)
         ])
 
         self.final_norm = nn.LayerNorm(d_model)
@@ -327,7 +459,19 @@ class BaseMoEModel(nn.Module):
             max_seq_len=config.max_seq_len,
             dropout=config.dropout,
             load_balance_weight=config.load_balance_weight,
+            local_window=config.local_window,
+            global_layers=config.global_layers,
+            rope_factor=config.rope_factor,
+            rope_original_context=config.rope_original_context,
         )
+
+    def is_global(self, layer: int) -> bool:
+        """Whether layer `layer` attends to the whole window (all layers do without a local window)."""
+        return self.local_window == 0 or layer in self.global_layers
+
+    def attention_layout(self) -> tuple:
+        """The attention settings that, with the weights, define the model's function."""
+        return (self.local_window, self.global_layers, self.rope_factor, self.rope_original_context)
 
     def _init_weights(self):
         """Initialize weights with GPT-style standards."""
@@ -357,6 +501,7 @@ class BaseMoEModel(nn.Module):
         devices = [torch.device(d) for d in devices]
         self.token_embedding.to(devices[0])
         self.rotary.to(devices[0])
+        self.rotary_global.to(devices[0])
         self.final_norm.to(devices[0])
         for layer, device in zip(self.layers, devices):
             layer.to(device)
@@ -372,7 +517,10 @@ class BaseMoEModel(nn.Module):
 
     @staticmethod
     def cache_len(past_key_values: Optional[KVCache]) -> int:
-        return past_key_values[0][0].size(2) if past_key_values else 0
+        """Tokens the cache stands for (local layers keep fewer keys than that)."""
+        if not past_key_values:
+            return 0
+        return getattr(past_key_values, 'length', past_key_values[0][0].size(2))
 
     def _attention_mask(
         self,
@@ -433,18 +581,20 @@ class BaseMoEModel(nn.Module):
             )
 
         positions = torch.arange(past_len, past_len + seq_len, device=input_ids.device)
-        rope = self.rotary(positions)
+        rope_local = self.rotary(positions)
+        rope_global = self.rotary_global(positions) if self.rope_factor > 1.0 else rope_local
         attn_mask = self._attention_mask(seq_len, past_len, attention_mask, input_ids.device)
 
         x = self.dropout(self.token_embedding(input_ids))
 
         total_load_loss = x.new_zeros(())
         expert_load = []
-        present_key_values = [] if use_cache else None
+        present_key_values = KVCache(length=past_len + seq_len) if use_cache else None
 
         for i, layer in enumerate(self.layers):
             layer_past = past_key_values[i] if past_key_values else None
             layer_bias = expert_weights[:, i] if expert_weights is not None else None
+            rope = rope_global if self.is_global(i) else rope_local
 
             if self.layer_devices is not None and x.device != self.layer_devices[i]:
                 device = self.layer_devices[i]
@@ -462,11 +612,12 @@ class BaseMoEModel(nn.Module):
                 # DDP with find_unused_parameters rejects the reentrant form, so
                 # replicated training keeps the non-reentrant one.
                 x, load_loss, dispatch, present_kv = torch.utils.checkpoint.checkpoint(
-                    layer, x, rope, attn_mask, layer_bias, None, False,
+                    layer, x, rope, attn_mask, layer_bias, None, False, past_len,
                     use_reentrant=self.layer_devices is not None
                 )
             else:
-                x, load_loss, dispatch, present_kv = layer(x, rope, attn_mask, layer_bias, layer_past, use_cache)
+                x, load_loss, dispatch, present_kv = layer(x, rope, attn_mask, layer_bias, layer_past,
+                                                           use_cache, past_len)
 
             if load_loss is not None:
                 total_load_loss = total_load_loss + load_loss.to(total_load_loss.device)

@@ -6,6 +6,7 @@ optimizer/scheduler/AMP-scaler state, RNG state and the exact training position
 (completed epochs plus micro-batches consumed in the current epoch).
 """
 
+import dataclasses
 import hashlib
 import os
 import pickle
@@ -40,7 +41,22 @@ class _CompatPickle:
 
 def compat_load(path, *, map_location='cpu'):
     """Load a checkpoint, remapping old 'hmst' module paths to 'mantis'."""
-    return torch.load(path, map_location=map_location, weights_only=False, pickle_module=_CompatPickle())
+    checkpoint = torch.load(path, map_location=map_location, weights_only=False, pickle_module=_CompatPickle())
+    if 'config' in checkpoint:
+        migrate_config(checkpoint['config'])
+    return checkpoint
+
+
+def migrate_config(config) -> None:
+    """Give a pickled config from an older release the fields added since, at their defaults."""
+    for section in dataclasses.fields(config):
+        sub = getattr(config, section.name)
+        if not dataclasses.is_dataclass(sub):
+            continue
+        for f in dataclasses.fields(sub):
+            if not hasattr(sub, f.name):
+                default = f.default_factory() if f.default_factory is not dataclasses.MISSING else f.default
+                setattr(sub, f.name, default)
 
 
 def check_tokenizer(checkpoint: Dict, tokenizer, source: str) -> None:
@@ -74,10 +90,12 @@ def load_tokenizer(checkpoint_path: str, checkpoint: Dict, tokenizer_path: Optio
 
 def model_fingerprint(model, tokenizer) -> str:
     """
-    Identity of the tokenizer and all backbone weights that produce memory
-    embeddings. Hash one tensor at a time to avoid duplicating the model in RAM.
+    Identity of the tokenizer, the attention layout and all backbone weights
+    that produce memory embeddings. Hash one tensor at a time to avoid
+    duplicating the model in RAM.
     """
     digest = hashlib.sha256(tokenizer.fingerprint().encode())
+    digest.update(repr(model.attention_layout()).encode())
     for name, tensor in model.state_dict().items():
         digest.update(name.encode())
         digest.update(str(tuple(tensor.shape)).encode())
