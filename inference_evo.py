@@ -24,20 +24,6 @@ Usage (CLI):
 """
 
 import os
-import subprocess
-
-try:
-    result = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
-                          capture_output=True, text=True, timeout=5)
-    if result.returncode == 0:
-        gpu_names = result.stdout.strip().split('\n')
-        problematic_gpus = ['RTX 30', 'RTX 40', 'A4000', 'A5000', 'A6000']
-        detected_buggy = [name for name in gpu_names if any(gpu in name for gpu in problematic_gpus)]
-        if detected_buggy:
-            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":0:0"
-            os.environ["TORCH_BLAS_PREFER_CUBLASLT"] = "0"
-except Exception:
-    pass
 
 import torch
 import argparse

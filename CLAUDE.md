@@ -214,17 +214,18 @@ exposes the last route/critic result in `engine.last_result`. Call
 emitting a non-protocol refusal. The browser playground's model streaming
 path still uses the standalone backbone.
 
-### RTX 3060 cuBLAS Bug Workaround
+### GPU Environment Variables
 
-If you encounter `CUBLAS_STATUS_NOT_INITIALIZED` errors during inference:
+The scripts set nothing GPU-specific themselves (only `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` as a default). Export these when the hardware needs them:
 
 ```bash
-export CUBLAS_WORKSPACE_CONFIG=:0:0
-export TORCH_BLAS_PREFER_CUBLASLT=0
-uv run inference.py checkpoints/stage1/best_model.pt --prompt "Hello"
-```
+# CUBLAS_STATUS_NOT_INITIALIZED on some Ampere consumer cards (seen on an RTX 3060 with a 128K vocabulary):
+# legacy cuBLAS without a workspace, at some cost in matmul throughput
+export CUBLAS_WORKSPACE_CONFIG=:0:0 TORCH_BLAS_PREFER_CUBLASLT=0
 
-This bug affects RTX 30xx/40xx series and A-series Ampere GPUs at sequence length ≥5 with large vocabulary matrices (128K tokens). The workaround is automatically applied in `train.py`, `train_evo.py`, `inference.py`, and `inference_evo.py`.
+# Multi-GPU boxes whose cards cannot do peer-to-peer transfers (mixed consumer GPUs): NCCL hangs without this
+export NCCL_P2P_DISABLE=1
+```
 
 ## Evaluation
 
@@ -496,7 +497,7 @@ KV caching is implemented in `BaseMoEModel` for efficient inference. When adding
 
 2. **TextDataset Memory**: Not true streaming, loads all tokens into RAM. Use `--pretokenized` or `--streaming` for large datasets.
 
-3. **RTX 3060 cuBLAS Bug**: Ampere GPUs have kernel bug with large vocab matrices at seq_len ≥5. Automatic workaround applied in `train.py`, `train_evo.py`, `inference.py` and `inference_evo.py`.
+3. **GPU quirks are opt-in**: the cuBLAS workaround for `CUBLAS_STATUS_NOT_INITIALIZED` on some Ampere consumer cards and `NCCL_P2P_DISABLE` for mixed consumer multi-GPU boxes are environment variables (see GPU Environment Variables), not automatic, so cloud GPUs run at full speed.
 
 4. **mamba-ssm Dependency**: Requires CUDA-capable GPU for compilation and runtime. CPU-only systems cannot use episodic memory. Package imports are lazy, so Stage 1, the tokenizer and basic inference need neither mamba-ssm nor faiss (`uv sync --extra memory` adds them).
 

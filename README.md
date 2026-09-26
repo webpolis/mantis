@@ -467,12 +467,7 @@ engine.close()  # flushes consolidation and saves memory_dir
 
 `generate()` encodes the query once and reuses that prefill for decoding unless evidence is prepended. Input longer than the window is ingested into memory as document chunks. The result reports the path taken, the critic score, whether the engine abstained, the evidence identifiers used, per-component timings, token counts and `compute_units`. `frozen_memory()` disables writes for evaluation.
 
-**RTX 3060 Known Issue**: If you encounter `CUBLAS_STATUS_NOT_INITIALIZED` errors:
-```bash
-export CUBLAS_WORKSPACE_CONFIG=:0:0
-export TORCH_BLAS_PREFER_CUBLASLT=0
-uv run inference.py checkpoints/stage1/best_model.pt --prompt "Hello"
-```
+**GPU quirks** (opt-in, nothing is set automatically): `CUBLAS_STATUS_NOT_INITIALIZED` on some Ampere consumer cards goes away with `CUBLAS_WORKSPACE_CONFIG=:0:0 TORCH_BLAS_PREFER_CUBLASLT=0`; a multi-GPU box whose cards cannot do peer-to-peer transfers needs `NCCL_P2P_DISABLE=1` or NCCL hangs.
 
 ---
 

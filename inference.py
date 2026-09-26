@@ -32,30 +32,6 @@ Usage:
 """
 
 import os
-import subprocess
-
-# Detect and fix RTX 3060 cuBLAS bug
-# RTX 3060 (and some other Ampere GPUs) have a cuBLASLt kernel bug with large matrices
-# that causes CUBLAS_STATUS_NOT_INITIALIZED at specific sequence lengths
-try:
-    result = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
-                          capture_output=True, text=True, timeout=5)
-    if result.returncode == 0:
-        gpu_names = result.stdout.strip().split('\n')
-        # Check for RTX 30xx series or A-series Ampere GPUs (known to have cuBLAS bug)
-        # RTX 20xx (Turing) does NOT have this issue
-        problematic_gpus = ['RTX 30', 'RTX 40', 'A4000', 'A5000', 'A6000']
-        detected_buggy = [name for name in gpu_names if any(gpu in name for gpu in problematic_gpus)]
-
-        if detected_buggy:
-            # Apply cuBLAS workaround
-            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":0:0"
-            os.environ["TORCH_BLAS_PREFER_CUBLASLT"] = "0"
-            print(f"⚠️  Detected Ampere GPU with known cuBLAS bug: {', '.join(detected_buggy)}")
-            print(f"✓  Applied cuBLAS workaround (forces legacy cuBLAS, slight performance impact)\n")
-except Exception:
-    # If nvidia-smi fails, silently continue (might be CPU-only or different setup)
-    pass
 
 import torch
 import warnings
