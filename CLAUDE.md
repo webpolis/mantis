@@ -54,6 +54,25 @@ uv run train.py --stage 1 data/train.txt --pipeline --model-size small \
     --mixed-precision --gradient-checkpointing --val-split 0.1
 ```
 
+### Long Context (256K)
+
+Context extension is a second Stage 1 run that starts from the pretrained weights (`--init-from`, a new schedule) with a local/global attention layout: every layer attends to the last `--local-window` tokens except `--global-layers`, which see the whole window with YaRN-scaled RoPE (`--rope-factor` = target length / `--rope-original-context`). Up to the window the layout computes the same function as the plain model, so the checkpoint carries over unchanged. Per-sequence memory is bounded by `--moe-chunk`, `--loss-chunk`, `--activation-offload` and `--residual-dtype bf16` (single GPU); measured on an RTX 3060, the tiny preset with a 32K vocabulary trains at 262,144 tokens in 6.4 GB.
+
+```bash
+# 2K-pretrained medium -> 256K on one 48 GB GPU. Stage it (32K, 128K, 256K), rope factor = length / 2048,
+# each stage an --init-from of the previous one
+uv run train.py --stage 1 data/long_docs.jsonl --init-from checkpoints/medium/best_model.pt \
+    --seq-len 262144 --local-window 2048 --global-layers 4,9,14,19 --rope-factor 128 --rope-original-context 2048 \
+    --mixed-precision bf16 --gradient-checkpointing --use-8bit-optimizer --residual-dtype bf16 \
+    --moe-chunk 4096 --loss-chunk 1024 --activation-offload --batch-size 1 --gradient-accumulation-steps 4 \
+    --learning-rate 5e-6 --warmup-steps 50 --val-split 0.05 --output-dir checkpoints/medium-256k
+
+# Needle-in-a-haystack by length and depth; --rope-factor tries a longer window at inference only (1M = 512)
+uv run scripts/eval_long_context.py checkpoints/medium-256k/best_model.pt --lengths 32768 262144 --samples 5
+```
+
+JSONL data (one `{"text": ...}` per line) keeps a book or a repository as one document; blank-line text files split at paragraphs. HF streaming datasets are one document per example already. `--resume` refuses a changed layout; use `--init-from` for each stage. Generation encodes prompts `prefill_chunk` tokens at a time with last-position logits only, so a 256K prompt costs the KV cache (global layers) and the hidden states, not a logits matrix.
+
 ### Stages 2-5 (OPTIONAL)
 
 Stages 2-4 take the Stage 1 model and an optional JSONL file (demo data without it); Stage 1-only flags are rejected. Stage 5 fine-tunes the base model itself and accepts the Stage 1 flags.
@@ -304,7 +323,8 @@ scripts/                 # Utility scripts
 ├── gen_evo_dataset.py   # Generate evolution simulation traces (supports --max-epoch partitioning)
 ├── calc_seq_len.py      # Measure per-tick token counts and recommend --seq-len per partition
 ├── split_dataset.py     # Split train/val for reproducibility
-└── run_eval.py          # Run benchmark evaluations
+├── run_eval.py          # Run benchmark evaluations
+└── eval_long_context.py # Needle-in-a-haystack by context length and depth
 
 web/                     # Simulation playground: Flask + Socket.IO server, React/PixiJS client
 ```
@@ -320,6 +340,7 @@ Sparse MoE transformer with:
 - Scales from 3M (micro, dense) to 6.7B parameters (base)
 - Pre-norm transformer backbone with rotary positional embeddings and `scaled_dot_product_attention`
 - `max_seq_len` is the attention window; new models set it to the training `--seq-len`
+- Long context: `local_window` / `global_layers` / `rope_factor` (see Long Context). Local layers use FlexAttention with an arithmetically built block mask and keep `window - 1` keys in the cache; `KVCache.length` carries the position. `configure_long_context()` sets expert chunking, head/loss chunking (`labels=` in forward returns `loss_sum` and `n_tokens`), boundary offload and the residual dtype. RoPE phases are FP64
 - `return_hidden=True` returns only the final normalized hidden states (`last_hidden`)
 - The per-expert Python loop is reference code; profile before replacing it with grouped GEMMs
 
@@ -510,7 +531,7 @@ KV caching is implemented in `BaseMoEModel` for efficient inference. When adding
 
 - **No trained weights**: This is a research prototype with architecture only. Full training of the `base` preset on 2-5T tokens needs roughly 50K-125K A100 GPU-hours by a parameter-dominated estimate (6 × 1.9B active × tokens at 125 TFLOPS sustained), before attention overhead, auxiliary training, evaluation and failed runs.
 - **Validation required**: Design claims (reduced hallucinations, extended context, lower cost) are unvalidated. The review's gates: beat ordinary retrieval on the memory benchmark, lower measured cost at comparable quality, lower answered-error rate at matched coverage; run the ablation ladder (`run_eval.py --route-policy`, `--expert-bias`, `--memory-bench-mode prompt`) before scaling.
-- **True attention limited to the preset window (8K)**: Memory systems extend what the generator can see only as far as retrieval recall and the evidence budget allow; a 1M-entry store is datastore capacity, not context.
+- **True attention limited to the model window**: `max_seq_len` (2K-8K for the presets, 256K after context extension; 1M is an inference-only YaRN extrapolation to evaluate, not a supported window). Memory systems extend what the generator can see only as far as retrieval recall and the evidence budget allow; a 1M-entry store is datastore capacity, not context.
 - **Bypass is not depth reduction**: Gate 1 skips memory reads, expert bias and verification; the backbone always runs at full depth.
 - Always use `--tokenizer-path` when resuming training to ensure vocabulary consistency.
 - When using `--resume`, the model config is loaded from checkpoint, not CLI args (except vocab_size which syncs with tokenizer).

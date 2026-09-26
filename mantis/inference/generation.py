@@ -55,6 +55,7 @@ def generate_tokens(
     expert_weights: Optional[torch.Tensor] = None,
     prefill: Optional[Tuple[list, torch.Tensor]] = None,
     hidden_out: Optional[List[torch.Tensor]] = None,
+    prefill_chunk: int = 8192,
 ) -> Iterator[Tuple[int, float]]:
     """
     Yield (token_id, log_prob) pairs, one per generated token.
@@ -70,6 +71,9 @@ def generate_tokens(
     `prompt_ids[-window:] + generated`; a re-encoded half-window replaces the
     states it recomputes. With `prefill`, pass the prompt's hidden states in
     `hidden_out` (one row per cached token) and the loop appends to them.
+    Prompts are encoded `prefill_chunk` tokens at a time against the cache,
+    and only the last position's logits are computed, so a long prompt costs
+    the cache and the hidden states, not a logits matrix.
     """
     if len(prompt_ids) == 0:
         raise ValueError("prompt_ids must contain at least one token")
@@ -101,17 +105,22 @@ def generate_tokens(
             pending = context[-max(1, window // 2):]
             past = None
             processed = total - len(pending)
-        output = model(
-            torch.tensor([pending], dtype=torch.long, device=device),
-            expert_weights=expert_weights,
-            past_key_values=past,
-            use_cache=True,
-            return_hidden=want_hidden,
-        )
         if want_hidden:
             del hidden_out[max(0, processed):]
-            hidden_out.extend(output['last_hidden'][0])
-        return output['past_key_values'], output['logits'][0, -1], processed + len(pending)
+        for start in range(0, len(pending), prefill_chunk):
+            chunk = pending[start:start + prefill_chunk]
+            output = model(
+                torch.tensor([chunk], dtype=torch.long, device=device),
+                expert_weights=expert_weights,
+                past_key_values=past,
+                use_cache=True,
+                return_hidden=want_hidden,
+                last_logits_only=True,
+            )
+            past = output['past_key_values']
+            if want_hidden:
+                hidden_out.extend(output['last_hidden'][0])
+        return past, output['logits'][0, -1], processed + len(pending)
 
     for _ in range(max_new_tokens):
         if pending:

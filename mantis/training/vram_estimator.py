@@ -70,6 +70,9 @@ def estimate_training_vram(
     deepspeed_zero_stage=0,
     num_gpus=1,
     optimizer_offload=False,
+    moe_chunk=0,
+    loss_chunk=0,
+    activation_offload=False,
 ):
     """
     Estimate training VRAM usage in bytes.
@@ -84,6 +87,9 @@ def estimate_training_vram(
         deepspeed_zero_stage: 0 (none), 2, or 3
         num_gpus: Number of GPUs (for ZeRO sharding calculation)
         optimizer_offload: ZeRO keeps the optimizer state in host RAM
+        moe_chunk: Tokens per expert pass (0 = whole sequence), see configure_long_context
+        loss_chunk: Tokens per head/cross-entropy pass (0 = whole sequence)
+        activation_offload: Checkpoint boundaries live in host RAM
 
     Returns:
         dict with 'model_weights', 'optimizer_state', 'gradients',
@@ -169,11 +175,12 @@ def estimate_training_vram(
     #   two dropout masks (1 byte)
     #   gathered expert inputs, GELU input and output, weighted expert outputs (FP32)
     #   the FP32 scatter buffer that collects the expert outputs
+    moe_share = min(1.0, moe_chunk / seq_len) if moe_chunk else 1.0
     per_layer_units = (
         2 * 4 + 2 * act
         + act * (1 + 2 * kv_share) + act
         + 2
-        + K * act + 2 * K * act * (F / D) + K * 4
+        + (K * act + 2 * K * act * (F / D) + K * 4) * moe_share
         + 4
     )
     per_layer_total = int(per_layer_units * seq_len * D)
@@ -195,7 +202,7 @@ def estimate_training_vram(
         # block at a time is recomputed with autograd enabled (full saves)
         # while the backward temporaries of the block above are still alive
         # (measured: 1.5x the block's saves)
-        layer_per_sample = int(seq_len * D * 4 * overhead)
+        layer_per_sample = 0 if activation_offload else int(seq_len * D * 4 * overhead)
         recompute_per_sample = int(1.5 * per_layer_total * overhead)
     else:
         # Full activation storage: all L layers
@@ -208,7 +215,8 @@ def estimate_training_vram(
 
     # Embedding output and final norm input (FP32), normalized output (cast),
     # logits (cast) plus their FP32 copy and softmax gradient for the loss
-    head_per_sample = int((8 * seq_len * D + act * seq_len * D + (act + 8) * seq_len * V) * overhead)
+    loss_share = min(1.0, loss_chunk / seq_len) if loss_chunk else 1.0
+    head_per_sample = int((8 * seq_len * D + act * seq_len * D + (act + 8) * seq_len * V * loss_share) * overhead)
     per_sample = activation_per_sample + head_per_sample
 
     total = fixed + per_sample * batch_size

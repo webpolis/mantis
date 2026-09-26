@@ -45,7 +45,6 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset, IterableDataset, DataLoader
 import itertools
 import json
@@ -196,15 +195,25 @@ def resolve_model_config(args, tokenizer, seq_len):
     the loaded checkpoint later instead of deserializing it twice.
     """
     checkpoint = None
-    if args.resume:
-        checkpoint = compat_load(args.resume)
+    source = args.resume or args.init_from
+    if source:
+        checkpoint = compat_load(source)
         if 'config' not in checkpoint:
-            raise ValueError(f"Checkpoint missing 'config' key: {args.resume}")
-        check_tokenizer(checkpoint, tokenizer, args.resume)
+            raise ValueError(f"Checkpoint missing 'config' key: {source}")
+        check_tokenizer(checkpoint, tokenizer, source)
         config = checkpoint['config']
         if seq_len > config.base_moe.max_seq_len:
             print(f"Extending attention window {config.base_moe.max_seq_len} → {seq_len}")
             config.base_moe.max_seq_len = seq_len
+        layout = {k: v for k, v in vars(args).items()
+                  if k in ('local_window', 'global_layers', 'rope_factor', 'rope_original_context') and v is not None}
+        if args.resume:
+            changed = {k: v for k, v in layout.items() if getattr(config.base_moe, k) != v}
+            if changed:
+                raise ValueError(f"--resume continues the checkpoint's attention layout; {changed} differ. "
+                                 "Use --init-from to start a new schedule with a new layout")
+        for k, v in layout.items():
+            setattr(config.base_moe, k, v)
     else:
         config = {
             'micro': get_micro_config,
@@ -214,6 +223,9 @@ def resolve_model_config(args, tokenizer, seq_len):
             'base': get_base_config
         }[args.model_size]()
         config.base_moe.max_seq_len = seq_len
+        for k in ('local_window', 'global_layers', 'rope_factor', 'rope_original_context'):
+            if getattr(args, k) is not None:
+                setattr(config.base_moe, k, getattr(args, k))
     # The verifier reads the base model's hidden states, so its input budget
     # cannot exceed the context window selected for this training run.
     config.critic.max_seq_len = min(config.critic.max_seq_len, config.base_moe.max_seq_len)
@@ -388,16 +400,9 @@ def validate(model, dataloader, accelerator, max_batches=None):
         if max_batches is not None and i >= max_batches:
             break
         with accelerator.autocast():
-            logits = model(batch['input_ids'])['logits']
-        labels = batch['labels']
-        loss = F.cross_entropy(
-            logits.float().view(-1, logits.size(-1)),
-            labels.view(-1),
-            ignore_index=-100,
-            reduction='sum'
-        )
-        total_loss += loss.item()
-        total_tokens += (labels != -100).sum().item()
+            output = model(batch['input_ids'], labels=batch['labels'])
+        total_loss += output['loss_sum'].item()
+        total_tokens += output['n_tokens'].item()
 
     return total_loss, total_tokens
 
@@ -407,6 +412,10 @@ def gather_val_loss(accelerator, raw_loss, raw_tokens):
     gathered_loss = accelerator.gather(torch.tensor([raw_loss], device=accelerator.device)).sum()
     gathered_tokens = accelerator.gather(torch.tensor([float(raw_tokens)], device=accelerator.device)).sum()
     return (gathered_loss / gathered_tokens).item() if gathered_tokens > 0 else float('inf')
+
+
+def long_context_kwargs(args):
+    return dict(moe_chunk=args.moe_chunk, loss_chunk=args.loss_chunk, activation_offload=args.activation_offload)
 
 
 def shared_batch_size(accelerator, config, seq_len, args, use_deepspeed):
@@ -428,6 +437,7 @@ def shared_batch_size(accelerator, config, seq_len, args, use_deepspeed):
         deepspeed_zero_stage=2 if use_deepspeed else 0,
         num_gpus=accelerator.num_processes,
         optimizer_offload=use_deepspeed and args.cpu_offload,
+        **long_context_kwargs(args),
     )
     local = compute_optimal_batch_sizes(
         config, seq_len, [free], safety_margin=0.85, max_batch_size=args.batch_size, **vram_kwargs,
@@ -451,6 +461,7 @@ def pipeline_plan(config, seq_len, args):
         mixed_precision=args.mixed_precision,
         gradient_checkpointing=args.gradient_checkpointing,
         use_8bit_optimizer=args.use_8bit_optimizer,
+        **long_context_kwargs(args),
     )
     for batch_size in range(args.batch_size, 0, -1):
         plan = plan_layer_placement(config, seq_len, batch_size, free, safety_margin=0.85, **vram_kwargs)
@@ -535,6 +546,12 @@ def train(args):
 
     if placement is not None:
         model.place_layers([torch.device('cuda', d) for d in placement])
+    if args.activation_offload and (accelerator.num_processes > 1 or placement is not None):
+        raise ValueError("--activation-offload runs in a single process on one GPU")
+    model.configure_long_context(
+        moe_chunk=args.moe_chunk, loss_chunk=args.loss_chunk, offload=args.activation_offload,
+        residual_dtype=torch.bfloat16 if args.residual_dtype == 'bf16' else None,
+    )
 
     optimizer = build_optimizer(model, args, use_deepspeed, is_main)
 
@@ -577,12 +594,14 @@ def train(args):
     best_val_loss = float('inf')
     epochs_without_improvement = 0
 
-    if args.resume and args.stage == 5:
-        # Adaptation starts a fresh optimization from the Stage 1 weights
+    if args.init_from or (args.resume and args.stage == 5):
+        # A new schedule from the checkpoint's weights
         accelerator.unwrap_model(model).load_state_dict(preloaded_checkpoint['model_state_dict'])
-        config.inference.prompt_format = 'chat'
+        if args.stage == 5:
+            config.inference.prompt_format = 'chat'
         if is_main:
-            print("✓ Loaded base weights; prompts use the chat format from now on")
+            print(f"✓ Loaded weights from {args.init_from or args.resume}"
+                  + ("; prompts use the chat format from now on" if args.stage == 5 else ""))
     elif args.resume:
         checkpoint = preloaded_checkpoint
         accelerator.unwrap_model(model).load_state_dict(checkpoint['model_state_dict'])
@@ -670,13 +689,8 @@ def train(args):
             with accelerator.accumulate(model):
                 # prepare() wraps a replicated model's forward in autocast; a pipelined model is not prepared
                 with accelerator.autocast():
-                    output = model(batch['input_ids'])
-                logits = output['logits']
-                lm_loss = F.cross_entropy(
-                    logits.float().view(-1, logits.size(-1)),
-                    batch['labels'].view(-1),
-                    ignore_index=-100
-                )
+                    output = model(batch['input_ids'], labels=batch['labels'])
+                lm_loss = output['loss_sum'] / output['n_tokens'].clamp(min=1)
                 accelerator.backward(lm_loss + output['load_balance_loss'])
 
                 if accelerator.sync_gradients:
@@ -756,6 +770,9 @@ STAGE1_ONLY_FLAGS = {
     'val_split': None, 'mixed_precision': None, 'deepspeed': False, 'cpu_offload': False,
     'use_8bit_optimizer': False, 'gradient_checkpointing': False, 'auto_batch': False, 'pipeline': False,
     'tokenizer': 'bpe', 'vocab_size': 32768, 'tokenizer_train_docs': 100_000,
+    'init_from': None, 'local_window': None, 'global_layers': None, 'rope_factor': None,
+    'rope_original_context': None, 'moe_chunk': 0, 'loss_chunk': 0, 'activation_offload': False,
+    'residual_dtype': 'fp32',
 }
 
 
@@ -779,11 +796,25 @@ def validate_sft_args(args):
 
 
 def validate_pipeline_args(args):
-    """--pipeline splits one model over the local GPUs in a single process."""
+    """--pipeline splits one model over the local GPUs in a single process; long-context flags."""
     if args.pipeline and args.deepspeed:
         return "--pipeline splits one model over the GPUs; --deepspeed replicates it. Choose one"
     if args.pipeline and not torch.cuda.is_available():
         return "--pipeline needs CUDA GPUs"
+    if args.init_from:
+        if args.resume:
+            return "--init-from starts a new schedule from a checkpoint's weights; --resume continues one. Choose one"
+        if not os.path.exists(args.init_from):
+            return f"Checkpoint not found: {args.init_from}"
+        if not args.tokenizer_path:
+            sibling = os.path.join(os.path.dirname(args.init_from), 'tokenizer')
+            if not os.path.isdir(sibling):
+                return f"--tokenizer-path required with --init-from (none found at {sibling})"
+            args.tokenizer_path = sibling
+    if args.activation_offload and not args.gradient_checkpointing:
+        return "--activation-offload moves checkpoint boundaries; add --gradient-checkpointing"
+    if args.activation_offload and (args.deepspeed or args.pipeline):
+        return "--activation-offload runs in a single process on one GPU"
     return None
 
 
@@ -1055,6 +1086,28 @@ Examples:
                         help='Split the layers over all visible GPUs by free VRAM (single process, no torchrun). '
                              'Fits a larger model than one GPU holds; the GPUs run one after another. '
                              'Sizes the batch like --auto-batch')
+    # Long context
+    parser.add_argument('--init-from', type=str,
+                        help='Start a new schedule from this checkpoint\'s weights (context extension); '
+                             'the tokenizer next to it is used unless --tokenizer-path is given')
+    parser.add_argument('--local-window', type=int,
+                        help='Sliding-window size of local attention layers (0 = every layer sees the whole '
+                             'window). Up to this length the model equals the plain one, so a 2K-trained '
+                             'checkpoint keeps its weights')
+    parser.add_argument('--global-layers', type=lambda v: tuple(int(i) for i in v.split(',') if i),
+                        help='Comma-separated layers that keep full attention, e.g. 4,9,14,19')
+    parser.add_argument('--rope-factor', type=float,
+                        help='YaRN factor for the global layers: target context / --rope-original-context')
+    parser.add_argument('--rope-original-context', type=int,
+                        help='Context length the checkpoint was pretrained at (default: 2048)')
+    parser.add_argument('--moe-chunk', type=int, default=0,
+                        help='Tokens per checkpointed expert pass (0 = whole sequence); 4096 bounds MoE memory')
+    parser.add_argument('--loss-chunk', type=int, default=0,
+                        help='Tokens per head/cross-entropy pass (0 = whole sequence); 1024 bounds the logits')
+    parser.add_argument('--activation-offload', action='store_true',
+                        help='Keep gradient-checkpoint boundaries in pinned host RAM (single GPU)')
+    parser.add_argument('--residual-dtype', choices=['fp32', 'bf16'], default='fp32',
+                        help='Storage dtype of the residual stream; bf16 halves the boundaries (default: fp32)')
     parser.add_argument('--auto-batch', action='store_true',
                         help='Automatically set batch size based on VRAM estimation '
                              '(always active for multi-GPU; this flag enables it for single-GPU too). '

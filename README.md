@@ -594,6 +594,29 @@ uv run train.py --stage 1 data/evo.txt --tokenizer mantis --val-split 0.1
 
 ---
 
+## Long Context (256K)
+
+Context extension is a second Stage 1 run that starts from the pretrained weights (`--init-from`, a new schedule) with a local/global attention layout: every layer attends to the last `--local-window` tokens except `--global-layers`, which see the whole window with YaRN-scaled RoPE (`--rope-factor` = target length / `--rope-original-context`). Up to the window the layout computes the same function as the plain model, so the checkpoint carries over unchanged. Per-sequence memory is bounded by `--moe-chunk`, `--loss-chunk`, `--activation-offload` and `--residual-dtype bf16` (single GPU); measured on an RTX 3060, the tiny preset with a 32K vocabulary trains at 262,144 tokens in 6.4 GB.
+
+```bash
+# 2K-pretrained medium -> 256K on one 48 GB GPU. Stage it (32K, 128K, 256K), rope factor = length / 2048,
+# each stage an --init-from of the previous one
+uv run train.py --stage 1 data/long_docs.jsonl --init-from checkpoints/medium/best_model.pt \
+    --seq-len 262144 --local-window 2048 --global-layers 4,9,14,19 --rope-factor 128 --rope-original-context 2048 \
+    --mixed-precision bf16 --gradient-checkpointing --use-8bit-optimizer --residual-dtype bf16 \
+    --moe-chunk 4096 --loss-chunk 1024 --activation-offload --batch-size 1 --gradient-accumulation-steps 4 \
+    --learning-rate 5e-6 --warmup-steps 50 --val-split 0.05 --output-dir checkpoints/medium-256k
+
+# Needle-in-a-haystack by length and depth; --rope-factor tries a longer window at inference only (1M = 512)
+uv run scripts/eval_long_context.py checkpoints/medium-256k/best_model.pt --lengths 32768 262144 --samples 5
+```
+
+JSONL data (one `{"text": ...}` per line) keeps a book or a repository as one document; blank-line text files split at paragraphs. HF streaming datasets are one document per example already. `--resume` refuses a changed layout; use `--init-from` for each stage. Generation encodes prompts `prefill_chunk` tokens at a time with last-position logits only, so a 256K prompt costs the KV cache (global layers) and the hidden states, not a logits matrix.
+
+The design targets one 48 GB GPU: local layers cost linear memory, the four global layers keep full causal attention (about 3.4 PFLOP per 256K sequence for `medium`), checkpoint boundaries live in host RAM. Quality at 256K is not measured yet; run the needle evaluation after each stage.
+
+---
+
 ## Troubleshooting
 
 ### Out of Memory (OOM)
@@ -673,7 +696,7 @@ web/                  # Simulation playground (Flask server, React client)
 
 **Current Limitations**:
 - No trained weights (architecture only); no benchmark, throughput or calibration result exists
-- True attention is limited to the preset window (8K); memory extends what the generator can see only as far as retrieval recall and the evidence budget allow
+- True attention is limited to the model window (2K-8K presets; 256K after context extension, not yet evaluated); memory extends what the generator can see only as far as retrieval recall and the evidence budget allow
 - Episodic memory needs a CUDA-capable GPU (mamba-ssm). Stage 2 always needs one. Stage 3 and the full engine need one only when they load a Stage 2 memory checkpoint
 - The BPE tokenizer is trained per run from a document sample; two runs on different data are not token-compatible
 - Retention is by retrieval hits and overflow, not learned from what later queries need; no atomic facts or conflict resolution

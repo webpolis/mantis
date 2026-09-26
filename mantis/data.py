@@ -14,11 +14,23 @@ import math
 from array import array
 from typing import Iterable, Iterator, List, Tuple
 
+import json
+
 import numpy as np
 
 
 def iter_documents(path: str) -> Iterator[str]:
-    """Yield blank-line-separated documents from a UTF-8 text file."""
+    """
+    Yield the documents of a UTF-8 text file (blank-line separated) or of a
+    JSONL file (one {"text": ...} object per line, so a document may span
+    blank lines: books, papers, repositories).
+    """
+    if str(path).endswith('.jsonl'):
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    yield json.loads(line)['text']
+        return
     lines: List[str] = []
     with open(path, 'r', encoding='utf-8') as f:
         for line in f:
